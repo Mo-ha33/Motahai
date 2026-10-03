@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+*.env
+node_modules/
+.wrangler/
+dist/
+# demo runs write evidence to the repo root; curated runs live in docs/evidence/
+/demo-evidence-*.json
+# rendered capability-URL configs contain the secret
+*.conf.rendered
+mcp-capability.conf

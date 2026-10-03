@@ -1,0 +1,108 @@
+# Hermes MCP Gateway — Tool Access Policy
+# Enforced by policy_guard.py inside the FastAPI JSON-RPC handler.
+# Deploy to: /home/deploy/.hermes/gateway/tool-policy.yaml  (chmod 640, owner deploy)
+#
+# Secrets are NOT in this file. Each principal points to an env var holding the
+# SHA-256 hex of its bearer token. Generate a token + hash with:
+#   python3 -c "import secrets,hashlib;t=secrets.token_urlsafe(32);print(t);print(hashlib.sha256(t.encode()).hexdigest())"
+# Put the TOKEN in Wesam's connector config, the HASH in /home/deploy/.hermes/.env.
+
+version: 1
+
+defaults:
+  max_request_bytes: 262144          # 256 KB JSON-RPC body
+  max_output_tokens: 1500            # SOUL budget
+  inject_max_output_tokens: false    # live hermes_* tools have no such argument (verified schemas)
+  audit_log: /home/deploy/.hermes/logs/mcp-audit.jsonl
+
+# ── Roles ────────────────────────────────────────────────────────────────────
+roles:
+  # Every Wesam agent. Advice, research, read-only knowledge, code review.
+  advisor:
+    tools:
+      - hermes_consult
+      - hermes_audit_code
+      - hermes_skills_list
+      - hermes_skill_get
+      - hermes_memory_read
+      - hermes_session_search
+      - hermes_web_search
+      - hermes_web_extract
+    daily_token_budget: 400000
+
+  # Agents that need evidence collection: allowlisted skills + sandboxed browser.
+  operator_agent:
+    inherits: advisor
+    tools:
+      - hermes_run_task
+      - hermes_skill_execute
+      - hermes_browser_navigate
+      - hermes_browser_snapshot
+      - hermes_browser_screenshot
+      - hermes_browser_scroll
+      - hermes_browser_click
+      - hermes_browser_type
+      - hermes_browser_evaluate
+      - hermes_browser_close
+    daily_token_budget: 1500000
+
+  # Humans only (via SSH tunnel to loopback, never through the public endpoint).
+  human_operator:
+    inherits: operator_agent
+    tools:
+      - hermes_terminal_exec
+      - hermes_skill_create
+      - hermes_memory_update
+    daily_token_budget: 3000000
+    loopback_only: true               # rejected on any request that came through the public Nginx edge
+
+# ── Principals (one token per Wesam agent → per-agent audit trail & limits) ──
+principals:
+  - {name: lead-orchestrator,     role: operator_agent, token_sha256_env: MCP_TOK_ORCH}
+  - {name: sanitation-auditor,    role: operator_agent, token_sha256_env: MCP_TOK_AUDITOR}
+  - {name: schema-validator,      role: operator_agent, token_sha256_env: MCP_TOK_SCHEMA}
+  - {name: tag-architect,         role: advisor,        token_sha256_env: MCP_TOK_ARCHITECT}
+  - {name: server-side-specialist, role: operator_agent, token_sha256_env: MCP_TOK_SSIDE}
+  - {name: qa-consent-inspector,  role: operator_agent, token_sha256_env: MCP_TOK_QA}
+  - {name: autofix-engineer,      role: advisor,        token_sha256_env: MCP_TOK_AUTOFIX}
+  - {name: drift-sentinel,        role: operator_agent, token_sha256_env: MCP_TOK_SENTINEL}
+  - {name: operator-human,        role: human_operator, token_sha256_env: MCP_TOK_HUMAN}
+
+# ── Per-tool limits ──────────────────────────────────────────────────────────
+# rate: requests per minute per principal (token bucket, burst = rate)
+# concurrency: simultaneous calls per principal; global_concurrency: across all
+# timeout_s: hard wall-clock limit enforced by the gateway
+tools:
+  # Live schemas (2026-10): consult{prompt, context?, model?, reasoning_effort?},
+  # run_task{task, skills?[], model?}, audit_code{code, file_path?, focus_areas?[]}.
+  # allowed_values pins what callers may choose — keeps one agent from picking a costly
+  # model or max reasoning. Extend the model lists as you add router/provider models.
+  hermes_consult:          {rate: 20, concurrency: 2, global_concurrency: 6, timeout_s: 90,
+                            allowed_values: {model: [gemini-flash-latest, hermes-auto],
+                                             reasoning_effort: [none, low, medium, high]}}
+  hermes_audit_code:       {rate: 10, concurrency: 1, global_concurrency: 4, timeout_s: 150}
+  hermes_run_task:         {rate: 4,  concurrency: 1, global_concurrency: 3, timeout_s: 300,
+                            allowed_values: {model: [gemini-flash-latest, hermes-auto]},
+                            allowed_skills: [gtm-container-linter, datalayer-schema-validator,
+                                             consent-mode-auditor, capi-dedup-debugger,
+                                             shopify-pixel-patcher]}
+  hermes_skill_execute:    {rate: 10, concurrency: 1, global_concurrency: 4, timeout_s: 180,
+                            allowed_skills: [gtm-container-linter, datalayer-schema-validator,
+                                             consent-mode-auditor, capi-dedup-debugger,
+                                             shopify-pixel-patcher]}
+  hermes_web_search:       {rate: 20, concurrency: 2, global_concurrency: 6, timeout_s: 30}
+  hermes_web_extract:      {rate: 20, concurrency: 2, global_concurrency: 6, timeout_s: 45, url_arg: url}
+  hermes_browser_navigate: {rate: 20, concurrency: 1, global_concurrency: 2, timeout_s: 60, url_arg: url}
+  hermes_browser_evaluate: {rate: 20, concurrency: 1, global_concurrency: 2, timeout_s: 30, max_script_chars: 4000}
+  hermes_terminal_exec:    {rate: 10, concurrency: 1, global_concurrency: 1, timeout_s: 120}
+  "*":                     {rate: 30, concurrency: 2, global_concurrency: 8, timeout_s: 60}
+
+# ── Egress rules for URL-taking tools (SSRF protection) ──────────────────────
+# Hermes shares the VPS with the co-hosted app (databases, internal services, Hermes dashboard
+# on loopback). A browser told to open http://127.0.0.1:58763 would hand over the box.
+egress:
+  allowed_schemes: [https]
+  block_private_ips: true             # loopback, RFC1918, link-local, CGNAT, metadata
+  denied_hosts: [localhost, metadata.google.internal]
+  # Optional allowlist. Empty = any public host. Recommended: client domains + vendor docs.
+  allowed_host_suffixes: []

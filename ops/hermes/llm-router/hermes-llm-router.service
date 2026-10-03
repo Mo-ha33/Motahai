@@ -1,0 +1,56 @@
+# /etc/systemd/system/hermes-llm-router.service
+# Loopback-only OpenAI-compatible router in front of NVIDIA -> OpenRouter -> Gemini.
+#
+# Runs as a systemd DynamicUser, NOT as the Hermes user: Hermes has a terminal tool, and
+# if it shared a uid with the router it could simply `cat` all three provider keys.
+#
+#   sudo mkdir -p /opt/hermes-llm-router /etc/hermes-llm-router
+#   sudo cp router.py providers.yaml requirements.txt /opt/hermes-llm-router/
+#   sudo python3 -m venv /opt/hermes-llm-router/venv
+#   sudo /opt/hermes-llm-router/venv/bin/pip install -r /opt/hermes-llm-router/requirements.txt
+#   sudo install -m 600 -o root -g root /dev/null /etc/hermes-llm-router/router.env
+#   sudoedit /etc/hermes-llm-router/router.env      # keys below — never via shell history
+#   sudo cp hermes-llm-router.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hermes-llm-router
+#
+# /etc/hermes-llm-router/router.env  (root:root 0600 — systemd reads it before dropping privileges)
+#   ROUTER_API_KEY=<random >=24 chars; Hermes uses it as the provider key>
+#   NVIDIA_API_KEY=...
+#   OPENROUTER_API_KEY=...
+#   GEMINI_API_KEY=...
+
+[Unit]
+Description=Hermes LLM router (NVIDIA -> OpenRouter -> Gemini)
+After=network-online.target
+Wants=network-online.target
+Before=hermes.service hermes-mcp.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=hermes-llm-router
+WorkingDirectory=/opt/hermes-llm-router
+EnvironmentFile=/etc/hermes-llm-router/router.env
+Environment=ROUTER_CONFIG=/opt/hermes-llm-router/providers.yaml
+# Port 47311: loopback only. Not 8642 — that is Hermes's own default API port.
+ExecStart=/opt/hermes-llm-router/venv/bin/uvicorn router:app --host 127.0.0.1 --port 47311 --workers 1 --no-access-log
+Restart=always
+RestartSec=2
+
+MemoryMax=256M
+CPUQuota=50%
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# Workforce engine + Hermes ops (router, gateway, linter tests).
+# The linter itself is stdlib-only; see ops/hermes/llm-router/requirements.txt for the router's own pins.
+fastapi>=0.115
+starlette>=1.0,<2
+uvicorn>=0.30,<1
+httpx>=0.27,<1
+pydantic>=2
+pyyaml>=6,<7
+pytest>=8
+pytest-asyncio>=0.23

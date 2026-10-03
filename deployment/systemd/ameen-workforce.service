@@ -1,0 +1,27 @@
+[Unit]
+Description=Ameen Digital AI Workforce Engine (Wesam Platform & Hermes Integration)
+After=network.target nginx.service hermes-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ameen-workforce
+EnvironmentFile=-/opt/ameen-workforce/.env
+ExecStart=/opt/ameen-workforce/venv/bin/python3 -m uvicorn src.ameen_workforce.service:app --host 127.0.0.1 --port 58770 --workers 2
+Restart=always
+RestartSec=5s
+
+# Security and Sandbox Controls
+LimitNOFILE=65535
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+# Logging to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ameen-workforce
+
+[Install]
+WantedBy=multi-user.target

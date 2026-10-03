@@ -1,0 +1,70 @@
+{
+  "exportFormatVersion": 2,
+  "containerVersion": {
+    "containerVersionId": "42",
+    "container": {"containerId": "100000001", "publicId": "GTM-SAMPLE1"},
+    "builtInVariable": [{"type": "PAGE_URL", "name": "Page URL"}, {"type": "EVENT", "name": "Event"}],
+    "tag": [
+      {"tagId": "1", "name": "Google Tag - G-AAA", "type": "googtag",
+       "parameter": [{"type": "template", "key": "tagId", "value": "G-AAA111"}],
+       "firingTriggerId": ["2147479573"]},
+      {"tagId": "2", "name": "GA4 Config legacy - G-AAA", "type": "gaawc",
+       "parameter": [{"type": "template", "key": "measurementId", "value": "G-AAA111"}],
+       "firingTriggerId": ["2147479553"]},
+      {"tagId": "3", "name": "GA4 - purchase", "type": "gaawe",
+       "parameter": [{"type": "template", "key": "eventName", "value": "purchase"},
+                     {"type": "template", "key": "measurementIdOverride", "value": "G-AAA111"}],
+       "firingTriggerId": ["10"]},
+      {"tagId": "4", "name": "Meta Pixel - Purchase", "type": "html",
+       "parameter": [{"type": "template", "key": "html",
+         "value": "<script>fbq('init','123456789012');fbq('track','Purchase',{value:{{DLV - value}},currency:'EGP'});</script>"}],
+       "firingTriggerId": ["10"]},
+      {"tagId": "5", "name": "Meta Pixel - Base", "type": "html",
+       "parameter": [{"type": "template", "key": "html",
+         "value": "<script>fbq('init','123456789012');fbq('track','PageView');var t='EAABsbCS1iHgBAOZBxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';</script>"}],
+       "firingTriggerId": ["2147479553"]},
+      {"tagId": "6", "name": "UA - Pageview", "type": "ua", "parameter": [], "firingTriggerId": ["2147479553"]},
+      {"tagId": "7", "name": "Orphan Tag", "type": "html",
+       "parameter": [{"type": "template", "key": "html", "value": "<script>document.write('x')</script>"}],
+       "firingTriggerId": []},
+      {"tagId": "8", "name": "Old paused", "type": "html", "paused": true,
+       "parameter": [{"type": "template", "key": "html", "value": "<p></p>"}], "firingTriggerId": ["10"]},
+      {"tagId": "9", "name": "GA4 - add_to_cart", "type": "gaawe",
+       "parameter": [{"type": "template", "key": "eventName", "value": "add_to_cart"},
+                     {"type": "template", "key": "sendEcommerceData", "value": "true"},
+                     {"type": "template", "key": "x", "value": "{{Undefined Var}}"}],
+       "firingTriggerId": ["11"]},
+      {"tagId": "10", "name": "GA4 - add_to_cart copy", "type": "gaawe",
+       "parameter": [{"type": "template", "key": "eventName", "value": "add_to_cart"},
+                     {"type": "template", "key": "sendEcommerceData", "value": "true"},
+                     {"type": "template", "key": "x", "value": "{{Undefined Var}}"}],
+       "firingTriggerId": ["11"]},
+      {"tagId": "11", "name": "Setup helper", "type": "gaawe",
+       "parameter": [{"type": "template", "key": "eventName", "value": "helper"}], "firingTriggerId": [],
+       "setupTag": []},
+      {"tagId": "12", "name": "Uses helper", "type": "gaawe",
+       "parameter": [{"type": "template", "key": "eventName", "value": "x"}], "firingTriggerId": ["99999"],
+       "setupTag": [{"tagName": "Setup helper", "stopOnSetupFailure": true}]}
+    ],
+    "trigger": [
+      {"triggerId": "10", "name": "CE - purchase", "type": "customEvent",
+       "customEventFilter": [{"type": "equals", "parameter": [
+         {"type": "template", "key": "arg0", "value": "{{_event}}"},
+         {"type": "template", "key": "arg1", "value": "purchase"}]}]},
+      {"triggerId": "11", "name": "CE - add_to_cart", "type": "customEvent",
+       "customEventFilter": [{"type": "equals", "parameter": [
+         {"type": "template", "key": "arg0", "value": "{{_event}}"},
+         {"type": "template", "key": "arg1", "value": "add_to_cart"}]}]},
+      {"triggerId": "12", "name": "CE - add_to_cart dup", "type": "customEvent",
+       "customEventFilter": [{"type": "equals", "parameter": [
+         {"type": "template", "key": "arg0", "value": "{{_event}}"},
+         {"type": "template", "key": "arg1", "value": "add_to_cart"}]}]}
+    ],
+    "variable": [
+      {"variableId": "1", "name": "DLV - value", "type": "v",
+       "parameter": [{"type": "template", "key": "name", "value": "ecommerce.value"}]},
+      {"variableId": "2", "name": "DLV - unused", "type": "v",
+       "parameter": [{"type": "template", "key": "name", "value": "foo"}]}
+    ]
+  }
+}

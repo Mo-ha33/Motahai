@@ -1,0 +1,17 @@
+{
+  "name": "cloudflare-browser-mcp",
+  "version": "1.0.0",
+  "description": "Cloudflare Browser Rendering MCP Server for AI Agents",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/playwright-mcp": "^0.0.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "wrangler": "^4.145.0"
+  }
+}

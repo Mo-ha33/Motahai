@@ -1,0 +1,72 @@
+# hermes-llm-router — production config
+# Deploy: /opt/hermes-llm-router/providers.yaml
+# Keys are NOT here: each provider names the env var that holds its key
+# (/etc/hermes-llm-router/router.env, root:root 0600, loaded by systemd).
+
+public_model: hermes-auto          # the model name Hermes is configured with
+# What Hermes is told the context window is (GET /v1/models). Hermes starts compressing
+# history as it approaches this. Prompts between the NVIDIA window and this value are routed
+# straight to Gemini; above it, Hermes compresses instead of paying for 1M-token calls.
+advertised_context: 200000
+overall_deadline_s: 270            # whole cascade; Hermes's own request timeout must be longer
+sticky_seconds: 600                # keep a session on its fallback provider (tool-loop consistency)
+breaker_threshold: 3               # consecutive 5xx/timeouts/invalid outputs before cooldown
+bytes_per_token: 3.2               # pessimistic estimator (Arabic-safe); lower = more cautious
+state_file: /var/lib/hermes-llm-router/state.json   # systemd StateDirectory
+
+providers:
+  # ── Tier 1: NVIDIA (build.nvidia.com hosted API) ────────────────────────────
+  # Pick the model with tool_conformance.py. Do NOT use DeepSeek-R1 for the agent loop
+  # (not in NIM's tool-calling list; long <think> output). 2026 catalog candidates
+  # worth testing: nvidia/nemotron-3-super-120b-a12b, openai/gpt-oss-120b,
+  # deepseek-ai/deepseek-v3.2 (or newer), qwen/qwen3-*; baseline: meta/llama-3.3-70b-instruct.
+  - name: nvidia
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
+    model: nvidia/nemotron-3-super-120b-a12b
+    context_window: 131072         # set from the model card of the model you pick
+    max_output_tokens: 8192
+    rpm: 35                        # free tier is ~40 RPM — stay under it, spill early
+    max_concurrency: 3
+    timeout_s: 120
+    supports_tools: true
+    # Reasoning models on NIM take a top-level reasoning_effort (low|medium|high|max).
+    # Hermes doesn't send it to NIM yet (hermes-agent issue #19883); the router can:
+    # extra_body: {reasoning_effort: medium}
+
+  # ── Tier 2: OpenRouter ──────────────────────────────────────────────────────
+  # `:free` variants: ~20 RPM and a small daily cap (much higher after a credit
+  # purchase) and may log prompts. Hermes prompts contain client data → keep
+  # data_collection: deny, which also removes many free endpoints. A cheap PAID model
+  # here is what makes Tier 2 a real tier.
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY
+    model: openai/gpt-oss-120b
+    context_window: 131072
+    max_output_tokens: 8192
+    rpm: 18                        # raise for paid models
+    max_concurrency: 4
+    timeout_s: 120
+    extra_body:
+      provider:
+        require_parameters: true   # only route to hosts that support `tools`
+        data_collection: deny
+    extra_headers:
+      X-Title: Hermes Agent
+
+  # ── Tier 3: Google Gemini (OpenAI-compatible endpoint) ──────────────────────
+  # Use a billing-enabled project: free-tier quotas are too small for agents and
+  # free-tier data may be used to improve Google products.
+  - name: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    key_env: GEMINI_API_KEY
+    model: gemini-2.5-flash        # check lifecycle: GET /v1beta/models; 3.x if 2.5 is retired
+    context_window: 1048576
+    max_output_tokens: 8192
+    max_concurrency: 6
+    timeout_s: 150
+    # true for Gemini 3.x (required for tool loops, else HTTP 400 "missing thought_signature");
+    # false for 2.5 (Hermes itself gates signatures to 3+ — hermes-agent PR #124090).
+    gemini_thought_signatures: false
+    strip_schema_keys: ["$schema"] # add keys here if Gemini rejects a tool schema (drill step 6)

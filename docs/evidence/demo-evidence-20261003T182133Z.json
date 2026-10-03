@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-10-03T18:21:33+00:00",
+  "linter_version": "1.0.0",
+  "summary": {
+    "PASS": 3,
+    "FAIL": 0,
+    "WARN": 0,
+    "SKIP": 0
+  },
+  "checks": [
+    {
+      "proof": "3",
+      "check": "Broken container → exact counts, health 0/100",
+      "status": "PASS",
+      "evidence": "counts={'critical': 1, 'high': 8, 'medium': 8, 'low': 4, 'info': 0} health=0 fp=0bc56e871d2b9885",
+      "response_sha256": "",
+      "latency_ms": null,
+      "at": "2026-10-03T18:21:33+00:00"
+    },
+    {
+      "proof": "3",
+      "check": "Fixed container → 0 findings, health 100/100",
+      "status": "PASS",
+      "evidence": "findings=0 health=100",
+      "response_sha256": "",
+      "latency_ms": null,
+      "at": "2026-10-03T18:21:33+00:00"
+    },
+    {
+      "proof": "3",
+      "check": "Live mutation (delete eventID) → exactly the expected new findings",
+      "status": "PASS",
+      "evidence": "new findings: ['meta.pixel_no_event_id', 'variable.unused']",
+      "response_sha256": "",
+      "latency_ms": null,
+      "at": "2026-10-03T18:21:33+00:00"
+    }
+  ]
+}

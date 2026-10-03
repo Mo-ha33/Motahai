@@ -1,0 +1,43 @@
+{
+  "exportFormatVersion": 2,
+  "containerVersion": {
+    "containerVersionId": "43",
+    "container": {"containerId": "100000001", "publicId": "GTM-SAMPLE1"},
+    "builtInVariable": [{"type": "EVENT", "name": "Event"}],
+    "tag": [
+      {"tagId": "1", "name": "CMP - Consent defaults (Consent Mode v2)", "type": "cvt_cookiebot_cmp",
+       "parameter": [{"type": "template", "key": "adStorage", "value": "denied"}],
+       "firingTriggerId": ["2147479572"]},
+      {"tagId": "2", "name": "Google Tag - G-AAA", "type": "googtag",
+       "parameter": [{"type": "template", "key": "tagId", "value": "G-AAA111"}],
+       "firingTriggerId": ["2147479573"]},
+      {"tagId": "3", "name": "GA4 - purchase", "type": "gaawe",
+       "parameter": [{"type": "template", "key": "eventName", "value": "purchase"},
+                     {"type": "template", "key": "sendEcommerceData", "value": "true"},
+                     {"type": "template", "key": "measurementIdOverride", "value": "G-AAA111"}],
+       "firingTriggerId": ["10"]},
+      {"tagId": "4", "name": "Meta Pixel - Base", "type": "html",
+       "consentSettings": {"consentStatus": "needed", "consentType": {"type": "list", "list": [{"type": "template", "value": "ad_storage"}]}},
+       "parameter": [{"type": "template", "key": "html",
+         "value": "<script>fbq('init','123456789012');fbq('track','PageView');</script>"}],
+       "firingTriggerId": ["2147479553"]},
+      {"tagId": "5", "name": "Meta Pixel - Purchase", "type": "html",
+       "consentSettings": {"consentStatus": "needed", "consentType": {"type": "list", "list": [{"type": "template", "value": "ad_storage"}]}},
+       "parameter": [{"type": "template", "key": "html",
+         "value": "<script>fbq('track','Purchase',{value:{{DLV - value}},currency:'EGP'},{eventID:{{DLV - event_id}}});</script>"}],
+       "firingTriggerId": ["10"]}
+    ],
+    "trigger": [
+      {"triggerId": "10", "name": "CE - purchase", "type": "customEvent",
+       "customEventFilter": [{"type": "equals", "parameter": [
+         {"type": "template", "key": "arg0", "value": "{{_event}}"},
+         {"type": "template", "key": "arg1", "value": "purchase"}]}]}
+    ],
+    "variable": [
+      {"variableId": "1", "name": "DLV - value", "type": "v",
+       "parameter": [{"type": "template", "key": "name", "value": "ecommerce.value"}]},
+      {"variableId": "2", "name": "DLV - event_id", "type": "v",
+       "parameter": [{"type": "template", "key": "name", "value": "event_id"}]}
+    ]
+  }
+}

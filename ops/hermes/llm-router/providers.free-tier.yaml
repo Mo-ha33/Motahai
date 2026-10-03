@@ -1,0 +1,89 @@
+# hermes-llm-router — ZERO-COST profile (free tiers only)
+# Use: ROUTER_CONFIG=/opt/hermes-llm-router/providers.free-tier.yaml
+#
+# Honest limits: free tiers cannot GUARANTEE zero 429s. This profile makes a 429 on one
+# provider invisible to callers, keeps scarce quota in reserve, and (stale_if_error)
+# answers an identical, previously-answered request from cache — labelled — when every
+# provider is exhausted at once. Check each provider's current free limits before the
+# demo (they change): AI Studio → Rate limits page; build.nvidia.com → account credits;
+# OpenRouter → GET https://openrouter.ai/api/v1/key.
+#
+# Order rationale (generous + steady first, scarce last):
+#   1. NVIDIA      ~40 req/min on the hosted free tier — carries normal traffic
+#   2. Gemini      per-MODEL daily quotas (you hit "limit: 20"/day on flash) — two models =
+#                  two separate quotas; kept in reserve instead of being burnt by morning tests
+#   3. OpenRouter  :free models, ~20 req/min and a small DAILY cap without credits — last resort
+#
+# Privacy: free tiers (Gemini free, OpenRouter :free) may use prompts for training. Fine for
+# demo fixtures; do NOT send real client containers or customer data through this profile.
+
+public_model: hermes-auto
+advertised_context: 120000         # smallest window below (NVIDIA/OpenRouter 128k) minus margin
+overall_deadline_s: 120            # free endpoints are slow when busy; fail over, don't wait
+sticky_seconds: 600
+breaker_threshold: 2               # free endpoints flap — bench sooner
+bytes_per_token: 3.2
+state_file: /var/lib/hermes-llm-router/state.json
+
+# Demo insurance: if ALL providers are rate-limited at once, replay the last good answer to
+# the IDENTICAL request (same messages) — served with header x-router-cache: stale.
+# Rehearse your demo prompts once the day before so they are cached. 0 disables.
+stale_if_error_s: 172800           # 48 h
+stale_cache_dir: /var/lib/hermes-llm-router/stale-cache
+stale_cache_max: 500
+
+providers:
+  - name: nvidia
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
+    model: meta/llama-3.3-70b-instruct      # tool-calling capable on NIM; NOT deepseek-r1 (no tools, <think> noise)
+    context_window: 131072
+    max_output_tokens: 2048
+    rpm: 35                                  # stay under the ~40 RPM free limit; spill early
+    max_concurrency: 2
+    timeout_s: 60
+
+  - name: gemini-flash
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    key_env: GEMINI_API_KEY
+    model: gemini-flash-latest
+    context_window: 1048576
+    max_output_tokens: 2048
+    rpm: 8                                   # free-tier per-minute limits are low; check AI Studio
+    max_concurrency: 2
+    timeout_s: 60
+    gemini_thought_signatures: false         # set true if the alias points at a Gemini 3.x model and tool loops 400
+    strip_schema_keys: ["$schema"]
+
+  - name: gemini-flash-lite                  # separate model = separate free daily quota
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    key_env: GEMINI_API_KEY
+    model: gemini-flash-lite-latest
+    context_window: 1048576
+    max_output_tokens: 2048
+    rpm: 12
+    max_concurrency: 2
+    timeout_s: 60
+    gemini_thought_signatures: false
+    strip_schema_keys: ["$schema"]
+
+  - name: openrouter-free
+    base_url: https://openrouter.ai/api/v1
+    key_env: OPENROUTER_API_KEY
+    model: meta-llama/llama-3.3-70b-instruct:free
+    context_window: 131072
+    max_output_tokens: 2048
+    rpm: 15
+    max_concurrency: 2
+    timeout_s: 60
+    extra_body:
+      # OpenRouter tries these in order inside ONE request (its own fallback). [VERIFY]
+      # current :free slugs with GET https://openrouter.ai/api/v1/models before the demo.
+      models:
+        - meta-llama/llama-3.3-70b-instruct:free
+        - deepseek/deepseek-chat-v3-0324:free
+        - qwen/qwen-2.5-72b-instruct:free
+      provider:
+        require_parameters: true
+    extra_headers:
+      X-Title: Hermes Agent
