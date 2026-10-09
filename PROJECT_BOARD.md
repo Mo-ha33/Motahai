@@ -28,9 +28,9 @@
 | TASK-003 | Enforce HITL approval gate on live GTM publish | Sonnet 5.5 | P0 | DONE | hitl, gtm, safety | Enforced Rule D-003: hermes_gtm_cloud_publish halts and requires hitl_approval_token (updated 2026-10-09 20:34) |
 | TASK-004 | Remove fake-HTML fallback in browser_service.py | Haiku 5.5 | P0 | DONE | audit, accuracy | Removed fake HTML fallback; failed site fetches now report explicit ERROR (updated 2026-10-09 20:33) |
 | TASK-005 | Label canned metrics in workflow_engine as simulated | Haiku 5.5 | P0 | DONE | telemetry, honesty | Labeled mock CAPI parity and ROAS metrics as simulated: True (updated 2026-10-09 20:34) |
-| TASK-010 | Tracking Asset Matrix & Client Delivery Sheet | Sonnet 5.5 | P0 | BACKLOG | core, tariq, sheet | Intake assets, organize credentials, deliver clean sheet |
+| TASK-010 | Tracking Asset Matrix & Client Delivery Sheet | Sonnet 5.5 | P0 | DONE | core, tariq, sheet | Implemented TrackingAssetMatrixBuilder producing client-facing sheets (updated 2026-10-09 20:37) |
 | TASK-011 | Frictionless 1-Click Client Onboarding Flow | Sonnet 5.5 | P0 | BACKLOG | ux, onboarding | Shopify collaborator & 1-click Google service invite |
-| TASK-020 | Production Meta CAPI Sender (graph.facebook.com) | Sonnet 5.5 | P0 | BACKLOG | capi, meta, core | Real server-side CAPI sender with retry & SHA-256 |
+| TASK-020 | Production Meta CAPI Sender (graph.facebook.com) | Sonnet 5.5 | P0 | DONE | capi, meta, core | Implemented MetaCAPISender with Graph API v20.0 and SHA-256 hashing (updated 2026-10-09 20:37) |
 | TASK-021 | Implement Rule D-005 (COD OrderPlaced vs Purchase) | Sonnet 5.5 | P0 | BACKLOG | cod, capi, rules | Browser sends OrderPlaced; Server sends Purchase on delivery |
 | TASK-022 | Zero-Effort Shopify/Salla Delivery Webhook Listener | Sonnet 5.5 | P0 | BACKLOG | cod, webhook | Trigger CAPI purchase upon order status = delivered |
 | TASK-030 | 24/7 Automated Drift Sentinel & Container Monitor | Gemini 3.8 | P1 | BACKLOG | monitoring, cron | Periodic container fingerprinting & beacon check |
