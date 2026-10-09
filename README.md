@@ -71,7 +71,7 @@ flowchart LR
 
 **How it fits together**
 
-1. **Wesam.ai** hosts the 8 AI employees (instructions, workflows, chat). Wesam's MCP connector is shared by the
+1. **Wesam.ai** hosts the 9 AI employees (instructions, workflows, chat). Wesam's MCP connector is shared by the
    whole workspace, so **every agent sees the same 18 Hermes tools** in its tool list.
 2. **Hermes** is the technical supervisor ("CTO / Senior Tracking Architect"). It runs on our VPS, loads
    [`SOUL.md`](ops/hermes/home/SOUL.md) (identity, engineering standards, refusal rules) and
@@ -115,6 +115,7 @@ Request/verdict contracts and JSON-RPC recipes are in the [agent SOP](ops/hermes
 | Growth BI Analyst | `hermes_memory_read`, `hermes_consult` | Attribution rules and known data-quality incidents |
 | GTM Strategy & Acquisition Lead | `hermes_consult`, `hermes_web_search` | Channel and platform constraints |
 | CRO & Experimentation Engineer | `hermes_consult` | Experiment tracking design that won't break dedup |
+| Ziad (AI Creative Video Director) | `video_produce_package`, `video_job_wait`, `hermes_consult` | 120 BPM video manifests, syllable checks, and automated animatics |
 
 Container audits go through `hermes_run_task` / `hermes_skill_execute` with the `gtm-container-linter`
 skill: SOUL §4 makes Hermes answer `NEEDS_EVIDENCE` to any audit request that has no linter report.

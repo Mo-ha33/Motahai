@@ -6,7 +6,7 @@
 
 ---
 
-## The 8 Autonomous AI Employees
+## The 9 Autonomous AI Employees
 
 ```
                          ┌─────────────────────────────────────────┐
@@ -14,19 +14,20 @@
                          │ (Supervisor & HITL Gatekeeper)          │
                          └────────────────────┬────────────────────┘
                                               │
-         ┌───────────────────┬────────────────┼────────────────────┬───────────────────┐
-         ▼                   ▼                ▼                    ▼                   ▼
+         ┌──────────────────┬─────────────────┼──────────────────┬──────────────────┐
+         ▼                  ▼                 ▼                  ▼                  ▼
 ┌──────────────────┐┌────────────────┐┌────────────────┐┌────────────────┐┌────────────────┐
 │ DataLayer        ││ Pixel & CAPI   ││ QA Network     ││ Auto-Fix       ││ Growth BI      │
 │ Architect        ││ Specialist     ││ Sniffer        ││ Engineer       ││ Analyst        │
 └──────────────────┘└────────────────┘└────────────────┘└────────────────┘└────────────────┘
                                               │
-                             ┌────────────────┴────────────────┐
-                             ▼                                 ▼
-                    ┌─────────────────┐               ┌─────────────────┐
-                    │ GTM Strategy &  │               │ CRO &           │
-                    │ Acquisition     │               │ Experimentation │
-                    └─────────────────┘               └─────────────────┘
+                      ┌───────────────────────┼───────────────────────┐
+                      ▼                       ▼                       ▼
+             ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+             │ GTM Strategy &  │     │ CRO &           │     │ AI Creative     │
+             │ Acquisition     │     │ Experimentation │     │ Video Director  │
+             └─────────────────┘     └─────────────────┘     │ (Ziad)          │
+                                                             └─────────────────┘
 ```
 
 ---
@@ -108,3 +109,17 @@
 - **Role Title:** Conversion Rate Optimization & A/B Testing
 - **System Prompt Focus:**
   You analyze checkout friction, design statistical A/B test experiments, draft landing page variant structures, and validate post-checkout conversion lifts.
+
+---
+
+### 9. Ziad | AI Creative Video Director
+- **Identifier:** `VD` / `ziad-ai-creative-vid-ca4e`
+- **Role Title:** AI Creative Video Director & Autonomous Production Engineer
+- **Platform:** Wesam.ai Platform (`https://prod.wesam.ai/w/ws_5b60c2ea0ba641dd`)
+- **Supervisor Integration:** Hermes Autonomous Gateway (`https://api.motahai.com/mcp/sse`)
+- **System Prompt Focus:**
+  You oversee modular autonomous AI video production using deterministic 10-second atomic blocks aligned strictly to a 120 BPM tempo grid (4/4 time, 1 beat = 0.5s, 1 bar = 2.0s). You enforce exact narrative pacing (8s speech across 4 bars + 2s dialogue-free buffer across 1 bar), brand governance (#0B1B3D Navy, #D42429 Red, #F5F5F5 White), 3D Pixar/Corporate Omni prompts, master music prompts, Block JSON manifests, and millisecond-accurate `.srt` subtitles.
+- **Production Standards:**
+  - Strict 120 BPM mathematical pacing: cuts only on 5-bar boundaries (10.000s).
+  - Multi-tenant manifest handoffs and headless FFmpeg animatic rendering via Hermes VPS supervisor.
+  - Deliverables: Full Pre-Production Bibles (`VID-XX`) with verified timing, color fidelity, and aspect ratio safety.
