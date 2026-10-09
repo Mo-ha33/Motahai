@@ -44,6 +44,13 @@
 | S1-5 | Scheduler + churn early-warning checks (unread digests, token expiry/Meta 190, webhook failures, 48h silence) | Haiku 5.5 | P1 | BACKLOG | monitoring, cron | Sprint S1 step 4. See TASK-030. |
 | S1-6 | Platform API lookups (TikTok/Snap macros, Meta partner sharing, Shopify/Salla webhooks, WhatsApp templates) | Haiku 5.5 | P1 | DONE | research, integrations | docs/research/S1-6_platform_lookups.md; open: custom-event optimization unconfirmed, Salla signature/COD enum inferred. (updated 2026-10-09 21:06) |
 | S1-7 | Board hygiene | Haiku 5.5 | P2 | DONE | board, hygiene | Review 2026-10-09 board update. |
+| S2-1 | event_time = order placed, settlement window, late_delivery terminal state | Sonnet 5.5 | P0 | IN_PROGRESS | cod, capi, d005 | Today event_time = delivery time (attribution loss). Wave 1, agent A. |
+| S2-2 | ConfirmedOrder event + confirmation sources (Shopify tag, Salla status, WhatsApp, manual) | Sonnet 5.5 | P0 | BACKLOG | cod, capi, d005 | Primary optimization signal. Wave 2 (after S2-1/S2-3; sources from S2 lookups). |
+| S2-3 | Match keys: encrypted checkout IP/UA (D-006), event_source_url, external_id, hashed fn/ln/ct/country/zp | Sonnet 5.5 | P0 | IN_PROGRESS | capi, emq | Delayed sends currently lack IP/UA. Wave 1, agent A. |
+| S2-4 | partially_refunded -> DeliveredPurchase with net collected value | Sonnet 5.5 | P0 | IN_PROGRESS | cod, capi, bug | Currently suppressed (bug). Wave 1, agent A. |
+| S2-5 | Courier fallback: aggregator tracking (OTO/Torod), Bosta webhook, remittance CSV import | Sonnet 5.5 | P1 | BACKLOG | cod, couriers | Wave 2, after S2 lookups. |
+| S2-6 | Refuser exclusion + delivered-buyer seed audience CSV exports | Haiku 5.5 | P1 | IN_PROGRESS | audiences, retention | Per merchant only (no cross-merchant list). Wave 1, agent B. |
+| S2-7 | Pilot validation plan: required CAPI fields, custom-conversion optimization, ROAS bidding, A/B test | Haiku 5.5 | P1 | IN_PROGRESS | research, pilot | Wave 1, agent C (with courier + confirmation lookups). |
 | S1-8 | Ed25519 asymmetric HITL signing + user separation | Sonnet 5.5 | P1 | BACKLOG | hitl, security | MCP server holds only the public key; issuing service runs as a separate Linux user, so an agent with shell on the VPS (hermes_run_task) cannot mint D-003 tokens. |
 
 ---

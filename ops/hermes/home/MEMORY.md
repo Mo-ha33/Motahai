@@ -29,7 +29,8 @@
 - D-002: Browser + server share one `event_id`: purchase = `purchase_<order_id>` (deterministic); other events = UUID generated once in the dataLayer push. [src: gtm-patterns P2 | 2026-10-03]
 - D-003: Hermes never publishes GTM versions or Shopify theme changes; humans publish after QA. Enforced in code: publish tools require a signed, single-use, container+workspace-bound approval token a human mints via POST /approvals/gtm-publish. [src: SOUL §4, hitl_tokens.py | 2026-10-09]
 - D-004: Container audits require a `gtm-container-linter` report as evidence. [src: SOUL §4 | 2026-10-03]
-- D-005: COD conversion = custom event `DeliveredPurchase`, `event_id` = `delivered_<order_id>`, sent server-side only when delivered/paid; prepaid sent when paid. The merchant's native Shopify/Salla Meta `Purchase` is left untouched ("Coexist"); Option B take-over is a future opt-in. [src: capi_service.py | 2026-10-09]
+- D-005: Signal ladder, Coexist (native `Purchase` untouched). `ConfirmedOrder` (`confirmed_<order_id>`, on phone/WhatsApp/tag confirmation) = optimization signal. `DeliveredPurchase` (`delivered_<order_id>`, net cash collected, after settlement window, event_time = order placed; none after placed+6.5d) = truth/ROAS. Buyers optimize on the deepest step with ~50/ad set/week. [src: S2 design | 2026-10-10]
+- D-006: Checkout IP/UA stored Fernet-encrypted; purged after successful CAPI send or 14 days. [src: operator | 2026-10-10]
 
 ## Last updated
-2026-10-09 — D-003 enforced by signed tokens; D-005 added (operator)
+2026-10-10 — D-005 signal ladder, D-006 (operator)
