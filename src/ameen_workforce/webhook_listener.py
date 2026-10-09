@@ -20,10 +20,14 @@ Shopify delivery signals:
 """
 
 import ipaddress
+import json
 import logging
 import re
 from typing import Dict, Any, Optional
-from .capi_service import DELIVERED_EVENT_NAME, capi_sender, hash_match_value
+from .capi_service import (
+    CONFIRMED_EVENT, CONFIRMED_EVENT_NAME, CONFIRMED_STATUSES, DELIVERED_EVENT, DELIVERED_EVENT_NAME,
+    EventType, capi_sender, hash_match_value
+)
 
 logger = logging.getLogger("ameen_workforce.webhooks")
 
@@ -36,6 +40,20 @@ FULFILLMENT_PLATFORM = "shopify_fulfillment"
 SALLA_DELIVERED_SLUGS = ("delivered", "completed", "تم التوصيل", "مكتمل")
 SALLA_CANCELLED_SLUGS = ("canceled", "cancelled", "ملغي", "ملغى")
 SALLA_PAID_SLUGS = ("in_progress", "processing", "shipping", "shipped", "delivering")
+SALLA_CONFIRMED_SLUGS = ("confirmed", "in_review", "under_review", "مؤكد", "قيد المراجعة", "تحت المراجعة")
+
+# Courier platforms & status mappings (S2-5)
+BOSTA_PLATFORM = "bosta"
+OTO_PLATFORM = "oto"
+
+BOSTA_DELIVERED_STATES = (45, "45", "delivered")
+BOSTA_CANCELLED_STATES = (46, 48, 49, 60, "46", "48", "49", "60", "canceled", "cancelled", "returned")
+BOSTA_FAILED_STATES = (47, 100, 101, "47", "100", "101", "exception", "failed", "damaged", "lost")
+
+OTO_DELIVERED_STATUSES = ("delivered", "completed", "تم التوصيل", "مكتمل")
+OTO_CANCELLED_STATUSES = ("cancelled", "canceled", "returned", "rejected", "ملغي", "ملغى")
+OTO_FAILED_STATUSES = ("failed", "shipmenterror", "undelivered", "delivery_failed", "error")
+
 
 # --- Attribution capture (S1-3) -------------------------------------------------------------------------
 # The storefront script (storefront/shopify/assets/motahai-capture.js) writes hidden cart attributes named
@@ -100,6 +118,62 @@ def extract_shopify_attribution(payload: Dict[str, Any]) -> Dict[str, Optional[s
                     found.setdefault(key, item.get("value"))
                 break
     return sanitize_attribution(found)
+
+def extract_salla_attribution(payload: Dict[str, Any]) -> Optional[Dict[str, Optional[str]]]:
+    """
+    S2-8: Reads attribution fields from Salla payload:
+    - Direct `attribution` dictionary
+    - `source_details` dictionary (UTMs, etc.)
+    - `notes`, `note`, `customer_note` or `custom_fields` (plain text lines, JSON string, or list of {name/key, value})
+    Returns sanitized attribution dictionary if ANY field matches, else None.
+    """
+    found: Dict[str, Any] = {}
+    data = payload.get("data") or payload
+    if not isinstance(data, dict):
+        return None
+
+    # 1. Direct attribution dict
+    if isinstance(data.get("attribution"), dict):
+        for k, v in data["attribution"].items():
+            if k in ATTRIBUTION_FIELDS and v:
+                found.setdefault(k, v)
+
+    # 2. Salla source_details (standard Salla traffic tracking object)
+    src = data.get("source_details")
+    if isinstance(src, dict):
+        for k in ATTRIBUTION_FIELDS:
+            if src.get(k):
+                found.setdefault(k, src.get(k))
+        if not found.get("ad_id") and src.get("mt_ad"):
+            found["ad_id"] = src.get("mt_ad")
+
+    # 3. Notes / custom fields
+    notes_raw = data.get("note") or data.get("notes") or data.get("customer_note") or data.get("custom_fields")
+    if isinstance(notes_raw, str):
+        try:
+            parsed_json = json.loads(notes_raw)
+            if isinstance(parsed_json, dict):
+                for k, v in parsed_json.items():
+                    norm_k = str(k).lower().removeprefix("_mt_").removeprefix("mt_")
+                    if norm_k in ATTRIBUTION_FIELDS and v:
+                        found.setdefault(norm_k, v)
+        except Exception:
+            for line in notes_raw.splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    norm_k = k.strip().lower().removeprefix("_mt_").removeprefix("mt_")
+                    if norm_k in ATTRIBUTION_FIELDS and v.strip():
+                        found.setdefault(norm_k, v.strip())
+    elif isinstance(notes_raw, list):
+        for item in notes_raw:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("key") or "").strip().lower()
+                norm_name = name.removeprefix("_mt_").removeprefix("mt_")
+                if norm_name in ATTRIBUTION_FIELDS and item.get("value"):
+                    found.setdefault(norm_name, item.get("value"))
+
+    sanitized = sanitize_attribution(found)
+    return sanitized if any(sanitized.values()) else None
 
 def sanitize_client_ip(value: Any) -> Optional[str]:
     """A valid IPv4/IPv6 address string, else None."""
@@ -255,9 +329,23 @@ class OrderWebhookProcessor:
         phone = customer.get("phone") or (payload.get("shipping_address") or {}).get("phone")
         
         total_price = shopify_net_total(payload)
+        order_total = float(payload.get("total_price") or 0.0)
         currency = payload.get("currency") or "EGP"
         client_details = payload.get("client_details")
         client_details = client_details if isinstance(client_details, dict) else {}
+
+        # S2-2 ConfirmedOrder: trigger on tag containing 'confirmed' (or explicit confirmed status)
+        raw_tags = payload.get("tags")
+        is_confirmed = False
+        if isinstance(raw_tags, str):
+            tag_items = [t.strip().lower() for t in raw_tags.split(",") if t.strip()]
+            is_confirmed = any("confirmed" in t for t in tag_items)
+        elif isinstance(raw_tags, list):
+            is_confirmed = any("confirmed" in str(t).strip().lower() for t in raw_tags if str(t).strip())
+        if not is_confirmed and isinstance(payload.get("tag_list"), list):
+            is_confirmed = any("confirmed" in str(t).strip().lower() for t in payload.get("tag_list") if str(t).strip())
+        if not is_confirmed and str(payload.get("status") or "").lower() == "confirmed":
+            is_confirmed = True
 
         return {
             "platform": "shopify",
@@ -265,6 +353,9 @@ class OrderWebhookProcessor:
             "status": effective_status,
             "is_cod": is_cod,
             "total_price": total_price,
+            "order_total": order_total,
+            "is_confirmed": is_confirmed,
+            "updated_at": payload.get("updated_at"),
             "currency": currency,
             "email": email,
             "phone": phone,
@@ -345,7 +436,27 @@ class OrderWebhookProcessor:
         # TODO(S2-4, Salla): no refunded/net amount is known for Salla `amounts` yet; partial refunds are not netted
         # (statuses restored/refunded/returned are still suppressed). Verify the payload of order.refunded on a real store.
         total_price = float((amounts.get("total") or {}).get("amount") or data.get("total") or 0.0)
+        order_total = total_price
         currency = (amounts.get("total") or {}).get("currency") or data.get("currency") or "SAR"
+
+        # S2-2 ConfirmedOrder: trigger on Salla status ('confirmed' / 'in_review') or tag containing 'confirmed'
+        is_confirmed = status_slug in SALLA_CONFIRMED_SLUGS
+        raw_tags = data.get("tags")
+        if not is_confirmed:
+            if isinstance(raw_tags, list):
+                is_confirmed = any("confirmed" in str(t).strip().lower() for t in raw_tags if str(t).strip())
+            elif isinstance(raw_tags, str):
+                is_confirmed = any("confirmed" in t.strip().lower() for t in raw_tags.split(",") if t.strip())
+
+        attribution = extract_salla_attribution(payload)
+        src = data.get("source_details") if isinstance(data.get("source_details"), dict) else {}
+        client_ip = sanitize_client_ip(
+            src.get("ip") or data.get("client_ip") or payload.get("client_ip")
+        )
+        user_agent = sanitize_user_agent(
+            src.get("user-agent") or src.get("user_agent")
+            or data.get("user_agent") or payload.get("user_agent")
+        )
 
         return {
             "platform": "salla",
@@ -353,13 +464,16 @@ class OrderWebhookProcessor:
             "status": effective_status,
             "is_cod": is_cod,
             "total_price": total_price,
+            "order_total": order_total,
+            "is_confirmed": is_confirmed,
+            "updated_at": data.get("updated_at"),
             "currency": currency,
             "email": email,
             "phone": phone,
-            # No known way yet for a Salla app to attach attribution to an order (see storefront/salla/README.md).
-            "attribution": None,
-            "client_ip": None,
-            "user_agent": None,
+            # S2-8: Salla attribution parity with Shopify (from source_details, notes, or client capture)
+            "attribution": attribution,
+            "client_ip": client_ip,
+            "user_agent": user_agent,
             # INFERRED Salla fields (verify on a real store): customer.id/first_name/last_name/city/country_code and
             # shipping.address.{city,postal_code,country_code}. Missing ones are simply None.
             "external_id": _id_str(customer.get("id")),
@@ -373,6 +487,114 @@ class OrderWebhookProcessor:
             }
         }
 
+    @staticmethod
+    def parse_bosta_delivery(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Parses Bosta delivery webhook (S2-5).
+        Delivered when state = 45 (or state name 'delivered' / isConfirmedDelivery True).
+        Carrier payload carries order reference (businessReference or orderId) and trackingNumber/cod,
+        but not customer PII/email/phone, so needs_order_context is True.
+        """
+        data = payload.get("data") or payload.get("delivery") or payload
+        order_id = str(
+            data.get("businessReference")
+            or data.get("business_reference")
+            or data.get("orderId")
+            or data.get("order_id")
+            or data.get("reference")
+            or data.get("_id")
+            or data.get("trackingNumber")
+            or ""
+        )
+        state_raw = data.get("state")
+        if isinstance(state_raw, dict):
+            state_raw = state_raw.get("code") or state_raw.get("value")
+        if state_raw is None:
+            state_raw = data.get("status")
+
+        state_str = str(state_raw).strip().lower() if state_raw is not None else ""
+        if state_raw in BOSTA_DELIVERED_STATES or state_str in BOSTA_DELIVERED_STATES:
+            effective_status = "delivered"
+        elif state_raw in BOSTA_CANCELLED_STATES or state_str in BOSTA_CANCELLED_STATES:
+            effective_status = "cancelled"
+        elif state_raw in BOSTA_FAILED_STATES or state_str in BOSTA_FAILED_STATES:
+            effective_status = "failed_delivery"
+        else:
+            effective_status = "shipped"
+
+        cod_val = data.get("cod")
+        cod_amount = _money(cod_val) if cod_val is not None else None
+
+        return {
+            "platform": BOSTA_PLATFORM,
+            "order_id": order_id,
+            "fulfillment_id": str(data.get("trackingNumber") or data.get("_id") or ""),
+            "status": effective_status,
+            "state": state_raw,
+            "cod_amount": cod_amount,
+            "tracking_number": str(data.get("trackingNumber") or ""),
+            "is_confirmed_delivery": bool(data.get("isConfirmedDelivery") or data.get("is_confirmed_delivery")),
+            "is_cod": True if cod_amount is not None else None,
+            "total_price": cod_amount,
+            "currency": None,
+            "email": None,
+            "phone": None,
+            "attribution": None,
+            "client_ip": None,
+            "user_agent": None,
+            "external_id": None,
+            "address": None,
+            "needs_order_context": True,
+        }
+
+    @staticmethod
+    def parse_oto_order_status(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Parses OTO orderStatus webhook (S2-5).
+        Delivered when status = 'delivered'.
+        Carrier payload carries orderId and tracking info, so needs_order_context is True.
+        """
+        data = payload.get("data") or payload
+        order_id = str(
+            data.get("orderId")
+            or data.get("order_id")
+            or data.get("reference_id")
+            or data.get("orderNumber")
+            or ""
+        )
+        status_raw = str(data.get("status") or data.get("dcStatus") or "").strip().lower()
+
+        if status_raw in OTO_DELIVERED_STATUSES:
+            effective_status = "delivered"
+        elif status_raw in OTO_CANCELLED_STATUSES:
+            effective_status = "cancelled"
+        elif status_raw in OTO_FAILED_STATUSES:
+            effective_status = "failed_delivery"
+        else:
+            effective_status = "shipped"
+
+        return {
+            "platform": OTO_PLATFORM,
+            "order_id": order_id,
+            "fulfillment_id": str(data.get("trackingNumber") or data.get("dcTrackingNumber") or ""),
+            "status": effective_status,
+            "raw_status": status_raw,
+            "tracking_number": str(data.get("trackingNumber") or ""),
+            "delivery_company": data.get("deliveryCompany"),
+            "timestamp": data.get("timestamp"),
+            "is_cod": None,
+            "total_price": None,
+            "currency": None,
+            "email": None,
+            "phone": None,
+            "attribution": None,
+            "client_ip": None,
+            "user_agent": None,
+            "external_id": None,
+            "address": None,
+            "needs_order_context": True,
+        }
+
     async def handle_order_update(
         self,
         platform: str,
@@ -380,17 +602,12 @@ class OrderWebhookProcessor:
         pixel_id: Optional[str] = None,
         access_token: Optional[str] = None,
         test_event_code: Optional[str] = None,
-        order_context: Optional[Dict[str, Any]] = None
+        order_context: Optional[Dict[str, Any]] = None,
+        event_type: Optional[EventType] = None
     ) -> Dict[str, Any]:
         """
-        Ingests the platform webhook, applies Rule D-005, and dispatches the custom 'DeliveredPurchase'
-        to Meta CAPI if eligible. LEGACY STATELESS PATH: no settlement window, no placed-time event_time/cutoff and no
-        stored checkout context; the persistent order_pipeline.process_webhook is the production path. Platforms: "shopify" (orders/*), "shopify_fulfillment"
-        (fulfillments/update), "salla".
-
-        order_context: for "shopify_fulfillment" only. The stored order (keys total_price, currency,
-        is_cod, email, phone) that S1-1 persistence will join by order_id. Without it a delivered
-        fulfillment yields NEEDS_ORDER_CONTEXT because the payload carries no order value.
+        Ingests the platform webhook, applies Rule D-005, and dispatches custom CAPI events
+        ('DeliveredPurchase' or 'ConfirmedOrder') to Meta CAPI if eligible.
         """
         if platform == "shopify":
             parsed = self.parse_shopify_order(payload)
@@ -401,18 +618,36 @@ class OrderWebhookProcessor:
                     "total_price", "currency", "is_cod", "email", "phone")}, "needs_order_context": False}
         elif platform == "salla":
             parsed = self.parse_salla_order(payload)
+        elif platform in ("bosta", BOSTA_PLATFORM):
+            parsed = self.parse_bosta_delivery(payload)
+            if order_context and order_context.get("total_price") is not None:
+                parsed = {**parsed, **{k: v for k, v in order_context.items() if k in (
+                    "total_price", "currency", "is_cod", "email", "phone")}, "needs_order_context": False}
+        elif platform in ("oto", OTO_PLATFORM):
+            parsed = self.parse_oto_order_status(payload)
+            if order_context and order_context.get("total_price") is not None:
+                parsed = {**parsed, **{k: v for k, v in order_context.items() if k in (
+                    "total_price", "currency", "is_cod", "email", "phone")}, "needs_order_context": False}
         else:
             return {"status": "error", "message": f"Unsupported platform: {platform}"}
 
         if parsed.get("needs_order_context"):
-            # Fulfillment-only record: nothing can be emitted without the order's value/currency.
+            # Fulfillment/courier record: nothing can be emitted without the order's value/currency.
             decision = fulfillment_context_decision(parsed)
             return {"status": "processed", "parsed_order": parsed, "d005_decision": decision}
+
+        if event_type is None:
+            if parsed.get("is_confirmed") and parsed.get("status") not in ("delivered", "paid"):
+                event_type = CONFIRMED_EVENT
+            else:
+                event_type = DELIVERED_EVENT
+
+        event_value = parsed.get("order_total", parsed["total_price"]) if event_type == CONFIRMED_EVENT else parsed["total_price"]
 
         decision = capi_sender.process_cod_order_event(
             order_id=parsed["order_id"],
             status=parsed["status"],
-            value=parsed["total_price"],
+            value=event_value,
             currency=parsed["currency"],
             is_cod=bool(parsed["is_cod"]),
             email=parsed["email"],
@@ -422,7 +657,9 @@ class OrderWebhookProcessor:
             fbc=(parsed.get("attribution") or {}).get("fbc"),
             client_ip=parsed.get("client_ip"),
             user_agent=parsed.get("user_agent"),
-            match_hashes=match_hashes_from_parsed(parsed)
+            match_hashes=match_hashes_from_parsed(parsed),
+            event_type=event_type,
+            is_confirmed=bool(parsed.get("is_confirmed"))
         )
 
         if decision["action"] == "READY_TO_EMIT" and pixel_id and access_token:

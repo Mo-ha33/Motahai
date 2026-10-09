@@ -33,10 +33,16 @@ logger = logging.getLogger("ameen_workforce.capi")
 
 META_GRAPH_API_VERSION = "v20.0"
 
-# Rule D-005 (Coexist): custom event, never the standard Purchase the native integration sends.
+# Rule D-005 (Coexist): custom events, never the standard Purchase the native integration sends.
 DELIVERED_EVENT_NAME = "DeliveredPurchase"
+CONFIRMED_EVENT_NAME = "ConfirmedOrder"
 # Statuses that mean revenue is real: COD cash collected / delivered, or prepaid and paid.
 CONVERTING_STATUSES = frozenset({"delivered", "paid"})
+# Statuses that indicate customer confirmation (call, WhatsApp bot, or merchant tag/status)
+CONFIRMED_STATUSES = frozenset({
+    "confirmed", "in_review", "under_review",
+    "مؤكد", "قيد المراجعة", "تحت المراجعة"
+})
 # Meta rejects the WHOLE request if any event_time is older than 7 days.
 MAX_EVENT_AGE_SECONDS = 7 * 24 * 3600
 MAX_EVENT_FUTURE_SECONDS = 10 * 60
@@ -54,7 +60,9 @@ NON_REVENUE_STATUSES = frozenset({
 class EventType:
     """
     One CAPI event kind on the D-005 signal ladder. Event name/id/eligibility live here (not as scattered string
-    literals) so a second event type (ConfirmedOrder, S2-2) is added by declaring another EventType.
+    literals).
+    - Step 2: ConfirmedOrder (S2-2) -> Fired when customer confirms via call, WhatsApp bot, or merchant tag.
+    - Step 3: DeliveredPurchase (S2-1) -> Fired when delivered & cash collected.
     """
     name: str
     id_prefix: str
@@ -65,7 +73,11 @@ class EventType:
 
 
 DELIVERED_EVENT = EventType(DELIVERED_EVENT_NAME, "delivered_", CONVERTING_STATUSES)
-EVENT_TYPES: Dict[str, EventType] = {DELIVERED_EVENT.name: DELIVERED_EVENT}
+CONFIRMED_EVENT = EventType(CONFIRMED_EVENT_NAME, "confirmed_", CONFIRMED_STATUSES)
+EVENT_TYPES: Dict[str, EventType] = {
+    DELIVERED_EVENT.name: DELIVERED_EVENT,
+    CONFIRMED_EVENT.name: CONFIRMED_EVENT,
+}
 
 def quality_flags_for(payload: Dict[str, Any]) -> Optional[str]:
     """
@@ -309,11 +321,13 @@ class MetaCAPISender:
         status: str,
         value: float,
         is_cod: bool = True,
-        event_type: EventType = DELIVERED_EVENT
+        event_type: EventType = DELIVERED_EVENT,
+        is_confirmed: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Status/value part of Rule D-005. Returns a SUPPRESSED or DEFERRED decision, or None when the order is
         eligible for `event_type` (no payload is built here).
+        is_confirmed=True satisfies eligibility for ConfirmedOrder (e.g. via merchant tag 'confirmed').
         """
         norm_status = status.strip().lower()
         if norm_status in NON_REVENUE_STATUSES:
@@ -323,14 +337,17 @@ class MetaCAPISender:
                 "order_id": order_id,
                 "current_status": status
             }
-        if norm_status not in event_type.converting_statuses:
+        is_eligible_status = (norm_status in event_type.converting_statuses) or (event_type == CONFIRMED_EVENT and is_confirmed)
+        if not is_eligible_status:
+            if event_type == CONFIRMED_EVENT:
+                reason = "Rule D-005: order is not confirmed yet. Conversion held until confirmation."
+            elif is_cod:
+                reason = "Rule D-005: COD order is not delivered/paid yet. Conversion held until delivery."
+            else:
+                reason = "Rule D-005: prepaid order is not paid yet. Conversion held until payment."
             return {
                 "action": "DEFERRED",
-                "reason": (
-                    "Rule D-005: COD order is not delivered/paid yet. Conversion held until delivery."
-                    if is_cod else
-                    "Rule D-005: prepaid order is not paid yet. Conversion held until payment."
-                ),
+                "reason": reason,
                 "order_id": order_id,
                 "current_status": status,
                 "held_event": event_type.name
@@ -365,31 +382,27 @@ class MetaCAPISender:
         event_source_url: Optional[str] = None,
         placed_at: Optional[int] = None,
         now: Optional[float] = None,
-        event_type: EventType = DELIVERED_EVENT
+        event_type: EventType = DELIVERED_EVENT,
+        is_confirmed: bool = False
     ) -> Dict[str, Any]:
         """
-        Implements Rule D-005 (Coexist): decides whether to send the custom 'DeliveredPurchase' (or another EventType).
+        Implements Rule D-005 (Coexist): decides whether to send the custom 'DeliveredPurchase' or 'ConfirmedOrder'.
         - cancelled / fully refunded / voided (any payment method), or a net value <= 0: SUPPRESSED, never emitted.
           A partially refunded order is NOT suppressed: `value` is the net collected amount.
-        - COD and status not 'delivered'/'paid' (incl. 'shipped'/'fulfilled'): DEFERRED until delivery.
-        - Prepaid and status not 'paid'/'delivered': DEFERRED until payment.
-        - placed_at (unix seconds, the order's placed time) given and now >= placed_at + LATE_DELIVERY_CUTOFF:
+        - COD and status not 'delivered'/'paid' (incl. 'shipped'/'fulfilled'): DEFERRED until delivery (for DeliveredPurchase).
+        - Prepaid and status not 'paid'/'delivered': DEFERRED until payment (for DeliveredPurchase).
+        - Not confirmed and event_type is ConfirmedOrder: DEFERRED until confirmed.
+        - For DeliveredPurchase: placed_at given and now >= placed_at + LATE_DELIVERY_CUTOFF:
           LATE_DELIVERY (S2-1), never sent, so the upload stays inside Meta's 7-day limit.
         - Explicit event_time older than 7 days or >10 min in the future: STALE (Meta would reject the whole request).
-        - Otherwise READY_TO_EMIT with event_id = <prefix><order_id> and event_time = event_time (the pipeline passes the
-          order's placed time; default now for the stateless path).
-        The standard 'Purchase' is left to the merchant's native Shopify/Salla integration.
-        fbp / fbc / client_ip / user_agent improve match quality and go into user_data unhashed (as Meta requires).
-        client_ip / user_agent come from the encrypted checkout_context (D-006) and are never taken from the webhook
-        server's own connection. match_hashes / event_source_url: see build_event_payload. `now` (unix seconds)
-        overrides the clock for the cutoff and staleness checks.
+        - Otherwise READY_TO_EMIT with event_id = <prefix><order_id> and event_time = event_time.
         """
         event_id = event_type.event_id(order_id)
-        held = self.check_eligibility(order_id, status, value, is_cod, event_type)
+        held = self.check_eligibility(order_id, status, value, is_cod, event_type, is_confirmed=is_confirmed)
         if held is not None:
             return held
 
-        if placed_at is not None and (time.time() if now is None else now) >= placed_at + LATE_DELIVERY_CUTOFF.total_seconds():
+        if event_type == DELIVERED_EVENT and placed_at is not None and (time.time() if now is None else now) >= placed_at + LATE_DELIVERY_CUTOFF.total_seconds():
             return {
                 "action": "LATE_DELIVERY",
                 "reason": "Rule D-005: order was placed too long ago (past the placed+6.5d cutoff); Meta would reject "
@@ -406,7 +419,6 @@ class MetaCAPISender:
                 "current_status": status
             }
 
-        # Delivered (COD) or paid (prepaid) -> emit the custom conversion
         payload = self.build_event_payload(
             event_name=event_type.name,
             event_id=event_id,
@@ -435,5 +447,57 @@ class MetaCAPISender:
             "order_id": order_id,
             "payload": payload
         }
+
+    def process_confirmed_order_event(
+        self,
+        order_id: str,
+        status: str,
+        value: float,
+        currency: str,
+        is_cod: bool = True,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+        test_event_code: Optional[str] = None,
+        event_time: Optional[int] = None,
+        email_hash: Optional[str] = None,
+        phone_hash: Optional[str] = None,
+        fbp: Optional[str] = None,
+        fbc: Optional[str] = None,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        match_hashes: Optional[Dict[str, Optional[str]]] = None,
+        event_source_url: Optional[str] = None,
+        now: Optional[float] = None,
+        is_confirmed: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Processes ConfirmedOrder event (Step 2 on the 3-step signal ladder).
+        Fired when customer confirms via call, WhatsApp bot, or merchant tag.
+        event_id = confirmed_<order_id>, event_time = confirmation timestamp (now or webhook time),
+        value = full order total.
+        """
+        return self.process_cod_order_event(
+            order_id=order_id,
+            status=status,
+            value=value,
+            currency=currency,
+            is_cod=is_cod,
+            email=email,
+            phone=phone,
+            test_event_code=test_event_code,
+            event_time=event_time,
+            email_hash=email_hash,
+            phone_hash=phone_hash,
+            fbp=fbp,
+            fbc=fbc,
+            client_ip=client_ip,
+            user_agent=user_agent,
+            match_hashes=match_hashes,
+            event_source_url=event_source_url,
+            placed_at=None,
+            now=now,
+            event_type=CONFIRMED_EVENT,
+            is_confirmed=is_confirmed
+        )
 
 capi_sender = MetaCAPISender()

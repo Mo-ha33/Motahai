@@ -147,6 +147,10 @@ class Order(Base):
     country_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # S2-1: when we FIRST saw the order delivered (COD) / paid (prepaid). Starts the settlement window.
     delivered_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # S2-2: when the customer confirmed the order (call, WhatsApp, or merchant tag 'confirmed')
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # S2-2: full order total before refunds (for ConfirmedOrder value)
+    order_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 

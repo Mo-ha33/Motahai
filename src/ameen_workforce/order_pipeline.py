@@ -43,7 +43,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .capi_service import (
-    DELIVERED_EVENT, EVENT_TYPES, LATE_DELIVERY_CUTOFF, MATCH_KEYS, EventType, capi_sender, hash_email, hash_phone,
+    CONFIRMED_EVENT, CONFIRMED_EVENT_NAME, CONFIRMED_STATUSES, DELIVERED_EVENT, DELIVERED_EVENT_NAME,
+    EVENT_TYPES, LATE_DELIVERY_CUTOFF, MATCH_KEYS, NON_REVENUE_STATUSES, EventType, capi_sender, hash_email, hash_phone,
     quality_flags_for
 )
 from .checkout_context import (  # noqa: F401  (purge_expired_checkout_context is re-exported for the scheduler)
@@ -84,7 +85,12 @@ def _parse(platform: str, topic: str, payload: Dict[str, Any]) -> Optional[Dict[
         return OrderWebhookProcessor.parse_shopify_order(payload)
     if platform == "salla":
         return OrderWebhookProcessor.parse_salla_order(payload)
+    if platform in ("bosta", "courier_bosta"):
+        return OrderWebhookProcessor.parse_bosta_delivery(payload)
+    if platform in ("oto", "courier_oto"):
+        return OrderWebhookProcessor.parse_oto_order_status(payload)
     return None
+
 
 
 def _parse_platform_time(value: Any) -> Optional[datetime]:
@@ -176,18 +182,36 @@ def event_source_url_for(tenant: Tenant) -> Optional[str]:
 
 def _decide(session: Session, sender, tenant: Tenant, order: Order, now: datetime,
             event_type: EventType = DELIVERED_EVENT, event_time: Optional[int] = None,
-            with_context: bool = False) -> Dict[str, Any]:
+            with_context: bool = False, is_confirmed: bool = False) -> Dict[str, Any]:
     """
     D-005 decision for a stored order, using stored hashes and stored fbp/fbc (raw PII is not available and not
-    needed). event_time defaults to the order's placed time. with_context=True (send time only) decrypts the stored
-    checkout IP/UA (D-006) into the payload; scheduling decisions never touch the ciphertext.
+    needed). event_time defaults to the order's placed time for DeliveredPurchase, or confirmation time for ConfirmedOrder.
+    with_context=True (send time only) decrypts the stored checkout IP/UA (D-006) into the payload; scheduling decisions
+    never touch the ciphertext.
     """
     placed = int(order_placed_at(order).timestamp())
     ip, ua = load_checkout_context(session, order.id, now) if with_context else (None, None)
+
+    if event_type == CONFIRMED_EVENT:
+        order_val = float(getattr(order, "order_total", None) or order.value)
+        if event_time is None:
+            if getattr(order, "confirmed_at", None):
+                event_time = int(order.confirmed_at.timestamp())
+            else:
+                event_time = int(now.timestamp())
+        placed_cutoff = None
+        is_conf = is_confirmed or bool(getattr(order, "confirmed_at", None) or order.current_status in CONFIRMED_STATUSES)
+    else:
+        order_val = float(order.value)
+        if event_time is None:
+            event_time = placed
+        placed_cutoff = placed
+        is_conf = False
+
     return sender.process_cod_order_event(
         order_id=order.platform_order_id,
         status=order.current_status,
-        value=float(order.value),
+        value=order_val,
         currency=order.currency,
         is_cod=order.is_cod,
         email_hash=order.email_hash,
@@ -198,17 +222,18 @@ def _decide(session: Session, sender, tenant: Tenant, order: Order, now: datetim
         user_agent=ua,
         match_hashes={key: getattr(order, f"{key}_hash") for key in MATCH_KEYS},
         event_source_url=event_source_url_for(tenant),
-        event_time=placed if event_time is None else event_time,
-        placed_at=placed,
+        event_time=event_time,
+        placed_at=placed_cutoff,
         now=now.timestamp(),
-        event_type=event_type
+        event_type=event_type,
+        is_confirmed=is_conf
     )
 
 
 async def _send(session: Session, tenant: Tenant, event: CapiEvent, payload: Dict[str, Any], sender) -> str:
     """
     Sends a claimed event according to the tenant mode and records the outcome. Returns the new status.
-    A SUCCESSFUL live send purges the order's encrypted checkout IP/UA (D-006); shadow never dispatches, so it keeps it.
+    A SUCCESSFUL live send purges the order's encrypted checkout IP/UA (D-006) on final delivery; shadow never dispatches, so it keeps it.
     Records capi_events.quality_flags (missing client_user_agent / event_source_url) for every send attempt.
     """
     event.quality_flags = quality_flags_for(payload)
@@ -241,7 +266,8 @@ async def _send(session: Session, tenant: Tenant, event: CapiEvent, payload: Dic
         event.status, event.error_type, event.http_code = "sent", None, 200
         event.fbtrace_id = result.get("fbtrace_id")
         event.sent_at = utcnow()
-        purge_checkout_context(session, event.order_id)
+        if event.event_name == DELIVERED_EVENT_NAME:
+            purge_checkout_context(session, event.order_id)
     else:
         event.status = "failed"
         event.http_code = result.get("http_code")
@@ -293,7 +319,8 @@ async def process_webhook(
     sender=capi_sender,
     event_time: Optional[int] = None,
     signature_ok: Optional[bool] = None,
-    now: Optional[datetime] = None
+    now: Optional[datetime] = None,
+    event_type: Optional[EventType] = None
 ) -> Dict[str, Any]:
     """
     Ingests one webhook for `tenant`. platform: "shopify" | "salla"; topic e.g. "orders/updated",
@@ -340,7 +367,7 @@ async def process_webhook(
             _finish(session, delivery, False, "missing_order_id")
             return _result("UNSUPPORTED")
         return await _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender,
-                                     event_time, now or utcnow())
+                                     event_time, now or utcnow(), event_type=event_type)
     except Exception as e:
         session.rollback()
         logger.error("Webhook processing failed (%s/%s): %s", platform, topic, type(e).__name__)
@@ -349,13 +376,70 @@ async def process_webhook(
         raise
 
 
+async def emit_confirmed_order(
+    session: Session,
+    tenant: Tenant,
+    platform_order_id: str,
+    sender=capi_sender,
+    event_time: Optional[int] = None,
+    now: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """
+    Direct trigger for ConfirmedOrder (Step 2 on the 3-step signal ladder).
+    Fired when customer confirms via call, WhatsApp bot, or manual merchant action.
+    Guarantees idempotency via CapiEvent UNIQUE(tenant, order, event_name).
+    """
+    now = now or utcnow()
+    order = session.scalar(
+        select(Order).where(Order.tenant_id == tenant.id, Order.platform_order_id == str(platform_order_id))
+    )
+    if order is None:
+        return {"status": "error", "message": "order_not_found", "order_id": str(platform_order_id)}
+
+    if order.confirmed_at is None:
+        order.confirmed_at = now
+        session.commit()
+
+    decision = _decide(session, sender, tenant, order, now, CONFIRMED_EVENT, event_time=event_time, is_confirmed=True)
+    action = decision["action"]
+    if action not in ("READY_TO_EMIT", "STALE"):
+        return _result(action, order.platform_order_id, None, decision)
+
+    event_id = CONFIRMED_EVENT.event_id(order.platform_order_id)
+    if action == "STALE":
+        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=CONFIRMED_EVENT.name, event_id=event_id,
+                          event_time=decision["payload"]["data"][0]["event_time"] if "payload" in decision else int(now.timestamp()),
+                          status="stale", error_type="event_time_out_of_window")
+    else:
+        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=CONFIRMED_EVENT.name,
+                          event_id=decision["event_id"], event_time=decision["payload"]["data"][0]["event_time"],
+                          status="scheduled", due_at=now)
+    session.add(claim)
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        return _result("ALREADY_EMITTED", order.platform_order_id, None, decision)
+
+    if action == "STALE":
+        return _result(action, order.platform_order_id, claim.status, decision)
+
+    capi_status = await _dispatch_scheduled(session, tenant, claim, order, sender, now)
+    return _result(
+        {"sent": "SENT", "shadow": "SHADOW", "late_delivery": "LATE_DELIVERY", "stale": "STALE"}.get(capi_status, "FAILED"),
+        order.platform_order_id, capi_status, decision
+    )
+
+
 def _has_final_event(session: Session, order_id: int) -> bool:
     return session.scalar(select(CapiEvent.id).where(
-        CapiEvent.order_id == order_id, CapiEvent.status.in_(_FINAL_EVENT_STATUSES)).limit(1)) is not None
+        CapiEvent.order_id == order_id,
+        CapiEvent.event_name == DELIVERED_EVENT_NAME,
+        CapiEvent.status.in_(_FINAL_EVENT_STATUSES)).limit(1)) is not None
 
 
 async def _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender, event_time, now,
-                          event_type: EventType = DELIVERED_EVENT):
+                          event_type: Optional[EventType] = None):
     from_fulfillment = bool(parsed.get("needs_order_context"))
     order = session.scalar(select(Order).where(
         Order.tenant_id == tenant.id, Order.platform_order_id == parsed["order_id"]))
@@ -379,6 +463,8 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
     if not from_fulfillment:
         order.is_cod = bool(parsed["is_cod"])
         order.value = parsed["total_price"]  # NET collected value (total minus successful refund transactions), S2-4
+        if hasattr(order, "order_total") and parsed.get("order_total") is not None:
+            order.order_total = parsed["order_total"]
         order.currency = parsed["currency"]
         order.created_at_platform = order.created_at_platform or _platform_created_at(platform, payload)
         # Platforms can redact customer fields on later updates: never overwrite a hash with nothing.
@@ -388,7 +474,18 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
             if hashed:
                 setattr(order, f"{key}_hash", hashed)
         _merge_attribution(order, parsed.get("attribution"))
-    if new_status in event_type.converting_statuses and order.delivered_at is None:
+    else:
+        if parsed.get("cod_amount") is not None and order.value <= 0.0:
+            order.value = float(parsed["cod_amount"])
+        if parsed.get("is_cod") is True and not order.is_cod:
+            order.is_cod = True
+
+    is_confirmed = bool(parsed.get("is_confirmed") or new_status in CONFIRMED_STATUSES)
+    if is_confirmed and getattr(order, "confirmed_at", None) is None:
+        platform_time = _parse_platform_time(parsed.get("updated_at")) if parsed.get("updated_at") else None
+        order.confirmed_at = platform_time or now
+
+    if new_status in DELIVERED_EVENT.converting_statuses and order.delivered_at is None:
         order.delivered_at = now  # first time we saw delivered/paid: starts the settlement window
     session.flush()
     if not from_fulfillment and (parsed.get("client_ip") or parsed.get("user_agent")) \
@@ -399,21 +496,102 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
                                      payload_sha256=digest))
     session.commit()
 
-    decision = _decide(session, sender, tenant, order, now, event_type, event_time=event_time)
+    target_event = event_type
+    if target_event is None:
+        if is_confirmed and new_status not in _REVENUE_STATUSES:
+            target_event = CONFIRMED_EVENT
+        else:
+            target_event = DELIVERED_EVENT
+
+    # If the order is confirmed AND delivered, and ConfirmedOrder hasn't been emitted yet, emit ConfirmedOrder first.
+    if is_confirmed and target_event == DELIVERED_EVENT and new_status not in NON_REVENUE_STATUSES:
+        has_confirmed = session.scalar(select(CapiEvent.id).where(
+            CapiEvent.tenant_id == tenant.id,
+            CapiEvent.order_id == order.id,
+            CapiEvent.event_name == CONFIRMED_EVENT.name
+        ).limit(1)) is not None
+        if not has_confirmed:
+            conf_time = event_time
+            if conf_time is None:
+                if parsed.get("updated_at"):
+                    pt = _parse_platform_time(parsed["updated_at"])
+                    conf_time = int(pt.timestamp()) if pt else int(now.timestamp())
+                elif order.confirmed_at:
+                    conf_time = int(order.confirmed_at.timestamp())
+                else:
+                    conf_time = int(now.timestamp())
+            conf_decision = _decide(session, sender, tenant, order, now, CONFIRMED_EVENT, event_time=conf_time, is_confirmed=True)
+            if conf_decision["action"] == "READY_TO_EMIT":
+                conf_claim = CapiEvent(
+                    tenant_id=tenant.id, order_id=order.id, event_name=CONFIRMED_EVENT.name,
+                    event_id=CONFIRMED_EVENT.event_id(order.platform_order_id),
+                    event_time=conf_decision["payload"]["data"][0]["event_time"],
+                    status="scheduled", due_at=now
+                )
+                session.add(conf_claim)
+                try:
+                    session.commit()
+                    await _dispatch_scheduled(session, tenant, conf_claim, order, sender, now)
+                except IntegrityError:
+                    session.rollback()
+
+    if target_event == CONFIRMED_EVENT:
+        conf_time = event_time
+        if conf_time is None:
+            if parsed.get("updated_at"):
+                pt = _parse_platform_time(parsed["updated_at"])
+                conf_time = int(pt.timestamp()) if pt else int(now.timestamp())
+            elif order.confirmed_at:
+                conf_time = int(order.confirmed_at.timestamp())
+            else:
+                conf_time = int(now.timestamp())
+
+        decision = _decide(session, sender, tenant, order, now, CONFIRMED_EVENT, event_time=conf_time, is_confirmed=is_confirmed)
+        action = decision["action"]
+        if action not in ("READY_TO_EMIT", "STALE"):
+            _finish(session, delivery, True)
+            return _result(action, order.platform_order_id, None, decision)
+
+        event_id = CONFIRMED_EVENT.event_id(order.platform_order_id)
+        if action == "STALE":
+            claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=CONFIRMED_EVENT.name, event_id=event_id,
+                              event_time=conf_time, status="stale", error_type="event_time_out_of_window")
+        else:
+            claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=CONFIRMED_EVENT.name,
+                              event_id=decision["event_id"], event_time=decision["payload"]["data"][0]["event_time"],
+                              status="scheduled", due_at=now)
+        session.add(claim)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            _finish(session, delivery, True)
+            return _result("ALREADY_EMITTED", order.platform_order_id, None, decision)
+
+        if action == "STALE":
+            _finish(session, delivery, True)
+            return _result(action, order.platform_order_id, claim.status, decision)
+
+        capi_status = await _dispatch_scheduled(session, tenant, claim, order, sender, now)
+        _finish(session, delivery, True)
+        return _result({"sent": "SENT", "shadow": "SHADOW", "late_delivery": "LATE_DELIVERY", "stale": "STALE"}
+                       .get(capi_status, "FAILED"), order.platform_order_id, capi_status, decision)
+
+    decision = _decide(session, sender, tenant, order, now, DELIVERED_EVENT, event_time=event_time)
     action = decision["action"]
     if action not in ("READY_TO_EMIT", "STALE", "LATE_DELIVERY"):
         _finish(session, delivery, True)
         return _result(action, order.platform_order_id, None, decision)
 
     placed_epoch = int(order_placed_at(order).timestamp())
-    event_id = event_type.event_id(order.platform_order_id)
+    event_id = DELIVERED_EVENT.event_id(order.platform_order_id)
     due_at = None
     if action == "STALE":
-        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=event_type.name, event_id=event_id,
+        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=DELIVERED_EVENT.name, event_id=event_id,
                           event_time=placed_epoch if event_time is None else event_time, status="stale",
                           error_type="event_time_out_of_window")
     elif action == "LATE_DELIVERY":
-        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=event_type.name, event_id=event_id,
+        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=DELIVERED_EVENT.name, event_id=event_id,
                           event_time=placed_epoch, status="late_delivery", error_type="past_cutoff")
     else:
         due_at = compute_due_at(order.delivered_at or now, order_placed_at(order), settlement_hours_for(tenant))

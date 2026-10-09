@@ -242,6 +242,21 @@ def test_storefront_capture_script_js_tests():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_salla_storefront_capture_script_js_tests():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed; storefront/salla/test_capture.mjs not run")
+    result = subprocess.run([node, "storefront/salla/test_capture.mjs"], cwd=ROOT, capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_capture_script_stays_small():
     script = (ROOT / "storefront/shopify/assets/motahai-capture.js").read_text(encoding="utf-8")
     assert len(script.encode("utf-8")) < 6000  # source with comments; ~3.6 KB without them
+
+
+def test_salla_capture_script_stays_small():
+    script = (ROOT / "storefront/salla_capture.js").read_text(encoding="utf-8")
+    assert len(script.encode("utf-8")) < 10000
+
