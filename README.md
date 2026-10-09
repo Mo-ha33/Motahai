@@ -205,7 +205,40 @@ and tool-catalogue checks) need the secret URL and are described in [`ops/hermes
 - **Host hardening** is tracked as a checklist in [`ops/hermes/README.md`](ops/hermes/README.md#d0-threat-model).
   Host-specific values (IPs, ports, secrets) are kept out of this repository by design.
 
+---
+
+## Commercial Packaging & Pricing
+
+Motahai operates on a 3-tier commercial model with an 80%+ gross margin target:
+
+| Tier | Package | Monthly Price | Scope |
+|---|---|---|---|
+| **Tier 1** | **The Solo Fixer** (باقة الموظف المنقذ) | **$99 / mo** (399 SAR / 4,950 EGP) | 1 AI Employee (Auto-Fix Engineer) for single domains & dropshippers |
+| **Tier 2** | **The Core Growth Trio** (باقة فريق التتبع والأداء) | **$449 / mo** (1,699 SAR / 22,500 EGP) | 3 AI Employees (Lead Orchestrator + Auto-Fix + CAPI Specialist) |
+| **Tier 3** | **Autonomous Department** (باقة القسم المؤتمت بالكامل) | **$1,499 / mo** (5,699 SAR / 74,900 EGP) | Full 8-Agent Swarm with real-time beacon sniffer & BI |
+
+📖 **Explore Commercial Docs:**
+- [Full Pricing & Packaging Playbook](docs/commercial/MOTAHAI_PRICING_PLAYBOOK.md)
+- [Unit Economics & Financial Model](docs/commercial/01_unit_economics_model.md)
+- [Packaging & Expansion Loops](docs/commercial/05_packaging_and_expansion_loops.md)
+- [Sales Battlecards & Discovery Scripts](docs/commercial/06_sales_battlecards_and_scripts.md)
+
+---
+
+## Autonomous Video Production Pipeline
+
+In addition to GTM tracking, the workforce integrates an enterprise video generation extension:
+- **10-Second Modular Blocks:** Calibrated to 18–20 words per block with a 2-second audio buffer.
+- **Brand Governance:** Strict HEX palette enforcement and 3D character consistency.
+- **Production Artifacts:** Automated generation of Omni visual prompts, BPM-curved audio prompts, per-block JSON manifests, and synchronized `.srt` subtitles.
+
+📖 Read the full [Video Production Pipeline Specification](docs/VIDEO_PRODUCTION_PIPELINE.md).
+
+---
+
 ## Further reading
 
 - [Architecture & HITL state machine](docs/ARCHITECTURE.md) · [Agent specifications](docs/AGENTS_SPECIFICATION.md) · [Runbook](docs/RUNBOOK.md)
 - [Hermes supervisor blueprint & security policy](ops/hermes/README.md) · [LLM router decision record](ops/hermes/llm-router/README.md)
+- [Commercial Playbook](docs/commercial/MOTAHAI_PRICING_PLAYBOOK.md) · [Video Production Pipeline](docs/VIDEO_PRODUCTION_PIPELINE.md)
+
