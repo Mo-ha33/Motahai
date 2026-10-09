@@ -19,6 +19,7 @@ Shopify delivery signals:
   yields NEEDS_ORDER_CONTEXT.
 """
 
+import ipaddress
 import logging
 import re
 from typing import Dict, Any, Optional
@@ -35,6 +36,86 @@ FULFILLMENT_PLATFORM = "shopify_fulfillment"
 SALLA_DELIVERED_SLUGS = ("delivered", "completed", "تم التوصيل", "مكتمل")
 SALLA_CANCELLED_SLUGS = ("canceled", "cancelled", "ملغي", "ملغى")
 SALLA_PAID_SLUGS = ("in_progress", "processing", "shipping", "shipped", "delivering")
+
+# --- Attribution capture (S1-3) -------------------------------------------------------------------------
+# The storefront script (storefront/shopify/assets/motahai-capture.js) writes hidden cart attributes named
+# `_mt_<field>`; Shopify copies cart attributes to the order's `note_attributes` ([{name, value}]).
+# Everything arriving this way is attacker-controllable (anyone can POST /cart/update.js), so every value is
+# validated: a value that does not match its pattern is DROPPED (never truncated into something plausible).
+ATTRIBUTION_FIELDS = ("utm_source", "utm_medium", "utm_campaign", "utm_content",
+                      "ad_id", "fbp", "fbc", "ttclid", "sccid")
+NOTE_ATTRIBUTE_PREFIXES = ("_mt_", "mt_")
+MAX_UTM_LEN = 255
+MAX_USER_AGENT_LEN = 512
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_AD_ID = re.compile(r"^[0-9]{1,64}$")
+# Meta cookie formats are fb.<subdomainIndex>.<creationTimeMs>.<id>; matched loosely, case preserved.
+_FBP = re.compile(r"^fb\.[0-9]{1,2}\.[0-9]{10,14}\.[0-9]{1,24}$")
+_FBC = re.compile(r"^fb\.[0-9]{1,2}\.[0-9]{10,14}\.[A-Za-z0-9_\-]{1,200}$")
+_CLICK_ID = re.compile(r"^[A-Za-z0-9_.~:\-]{1,255}$")
+
+def _clean_text(value: Any, max_len: int) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = _CONTROL_CHARS.sub("", value).strip()
+    return cleaned if cleaned and len(cleaned) <= max_len else None
+
+def _matching(value: Any, pattern: "re.Pattern[str]") -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned if pattern.match(cleaned) else None
+
+def sanitize_attribution(raw: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    """
+    Validates raw attribution values (keys from ATTRIBUTION_FIELDS) and returns ALL keys, junk or missing as None.
+    utm_*: control chars removed, <= 255 chars; ad_id: digits only (<= 64); fbp/fbc: Meta cookie shape;
+    ttclid/sccid: URL-safe token <= 255 chars.
+    """
+    raw = raw or {}
+    return {
+        "utm_source": _clean_text(raw.get("utm_source"), MAX_UTM_LEN),
+        "utm_medium": _clean_text(raw.get("utm_medium"), MAX_UTM_LEN),
+        "utm_campaign": _clean_text(raw.get("utm_campaign"), MAX_UTM_LEN),
+        "utm_content": _clean_text(raw.get("utm_content"), MAX_UTM_LEN),
+        "ad_id": _matching(raw.get("ad_id"), _AD_ID),
+        "fbp": _matching(raw.get("fbp"), _FBP),
+        "fbc": _matching(raw.get("fbc"), _FBC),
+        "ttclid": _matching(raw.get("ttclid"), _CLICK_ID),
+        "sccid": _matching(raw.get("sccid"), _CLICK_ID),
+    }
+
+def extract_shopify_attribution(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Reads the `_mt_*` entries of `note_attributes` (list of {name, value}) and sanitizes them. First occurrence wins."""
+    found: Dict[str, Any] = {}
+    notes = payload.get("note_attributes")
+    for item in notes if isinstance(notes, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        name = item["name"].strip().lower()
+        for prefix in NOTE_ATTRIBUTE_PREFIXES:
+            if name.startswith(prefix):
+                key = name[len(prefix):]
+                if key in ATTRIBUTION_FIELDS:
+                    found.setdefault(key, item.get("value"))
+                break
+    return sanitize_attribution(found)
+
+def sanitize_client_ip(value: Any) -> Optional[str]:
+    """A valid IPv4/IPv6 address string, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+def sanitize_user_agent(value: Any) -> Optional[str]:
+    """Control characters removed, truncated to 512 chars (a truncated UA still matches), else None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = _CONTROL_CHARS.sub("", value).strip()[:MAX_USER_AGENT_LEN]
+    return cleaned or None
 
 def is_cod_gateway(name: Any) -> bool:
     """
@@ -116,6 +197,8 @@ class OrderWebhookProcessor:
         
         total_price = float(payload.get("current_total_price") or payload.get("total_price") or 0.0)
         currency = payload.get("currency") or "EGP"
+        client_details = payload.get("client_details")
+        client_details = client_details if isinstance(client_details, dict) else {}
 
         return {
             "platform": "shopify",
@@ -125,7 +208,11 @@ class OrderWebhookProcessor:
             "total_price": total_price,
             "currency": currency,
             "email": email,
-            "phone": phone
+            "phone": phone,
+            # Attribution (S1-3). client_ip / user_agent are pass-through for the CAPI payload only: never stored.
+            "attribution": extract_shopify_attribution(payload),
+            "client_ip": sanitize_client_ip(client_details.get("browser_ip") or payload.get("browser_ip")),
+            "user_agent": sanitize_user_agent(client_details.get("user_agent"))
         }
 
     @staticmethod
@@ -158,6 +245,9 @@ class OrderWebhookProcessor:
             "currency": None,
             "email": None,
             "phone": None,
+            "attribution": None,
+            "client_ip": None,
+            "user_agent": None,
             "needs_order_context": True
         }
 
@@ -199,7 +289,11 @@ class OrderWebhookProcessor:
             "total_price": total_price,
             "currency": currency,
             "email": email,
-            "phone": phone
+            "phone": phone,
+            # No known way yet for a Salla app to attach attribution to an order (see storefront/salla/README.md).
+            "attribution": None,
+            "client_ip": None,
+            "user_agent": None
         }
 
     async def handle_order_update(
@@ -245,7 +339,11 @@ class OrderWebhookProcessor:
             is_cod=bool(parsed["is_cod"]),
             email=parsed["email"],
             phone=parsed["phone"],
-            test_event_code=test_event_code
+            test_event_code=test_event_code,
+            fbp=(parsed.get("attribution") or {}).get("fbp"),
+            fbc=(parsed.get("attribution") or {}).get("fbc"),
+            client_ip=parsed.get("client_ip"),
+            user_agent=parsed.get("user_agent")
         )
 
         if decision["action"] == "READY_TO_EMIT" and pixel_id and access_token:

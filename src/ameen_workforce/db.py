@@ -297,6 +297,11 @@ def _norm_domain(shop_domain: str) -> str:
 
 
 def get_tenant_by_shop_domain(session: Session, shop_domain: str) -> Optional[Tenant]:
+    """
+    Looks a tenant up by `tenants.shop_domain`. Convention: for Shopify tenants this is the *.myshopify.com domain
+    (matches the X-Shopify-Shop-Domain header); for Salla tenants it holds the Salla MERCHANT ID as a string (e.g.
+    "1234567"), because Salla webhook payloads identify the store by the top-level `merchant` field, not a domain.
+    """
     return session.scalar(select(Tenant).where(Tenant.shop_domain == _norm_domain(shop_domain)))
 
 

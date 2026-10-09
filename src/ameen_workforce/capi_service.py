@@ -224,7 +224,9 @@ class MetaCAPISender:
         email_hash: Optional[str] = None,
         phone_hash: Optional[str] = None,
         fbp: Optional[str] = None,
-        fbc: Optional[str] = None
+        fbc: Optional[str] = None,
+        client_ip: Optional[str] = None,
+        user_agent: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Implements Rule D-005 (Coexist): decides whether to send the custom 'DeliveredPurchase'.
@@ -234,6 +236,9 @@ class MetaCAPISender:
         - Explicit event_time older than 7 days or >10 min in the future: STALE (Meta would reject the whole request).
         - Otherwise READY_TO_EMIT 'DeliveredPurchase' with event_id = delivered_<order_id>.
         The standard 'Purchase' is left to the merchant's native Shopify/Salla integration.
+        fbp / fbc / client_ip / user_agent improve match quality and go into user_data unhashed (as Meta requires).
+        client_ip and user_agent are pass-through only (privacy): the caller has them only while handling a webhook
+        that carries them and never stores them, so retries and fulfillment-triggered sends omit them.
         """
         event_id = f"delivered_{order_id}"
         norm_status = status.strip().lower()
@@ -278,6 +283,8 @@ class MetaCAPISender:
             phone=phone,
             fbp=fbp,
             fbc=fbc,
+            client_ip=client_ip,
+            user_agent=user_agent,
             test_event_code=test_event_code,
             event_time=event_time,
             email_hash=email_hash,

@@ -1,0 +1,14 @@
+{%- comment -%}
+  Motahai attribution capture (S1-3). App embed block: the merchant switches it on under
+  Online Store > Themes > Customize > App embeds. Loads the capture script deferred, once per page.
+  The script writes hidden cart attributes (_mt_*) and never reads or sends email/phone.
+{%- endcomment -%}
+<script src="{{ 'motahai-capture.js' | asset_url }}" defer></script>
+
+{% schema %}
+{
+  "name": "Motahai attribution",
+  "target": "body",
+  "settings": []
+}
+{% endschema %}

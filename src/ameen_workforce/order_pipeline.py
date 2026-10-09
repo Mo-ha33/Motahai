@@ -102,8 +102,29 @@ def _finish(session: Session, delivery: WebhookDelivery, ok: bool, error_type: O
     session.commit()
 
 
-def _decide(sender, order: Order, event_time: Optional[int]) -> Dict[str, Any]:
-    """D-005 decision for a stored order, using stored hashes (raw PII is not available and not needed)."""
+_ATTRIBUTION_COLUMNS = ("utm_source", "utm_medium", "utm_campaign", "utm_content",
+                        "ad_id", "fbp", "fbc", "ttclid", "sccid")
+
+
+def _merge_attribution(order: Order, attribution: Optional[Dict[str, Optional[str]]]) -> None:
+    """
+    Fills empty attribution columns from an (already sanitized) parsed["attribution"]. First non-empty value per
+    field wins: a later webhook never overwrites a stored value, and an empty/missing value never erases one.
+    (Deliberately simple: each field is kept independently, so fields may come from different webhooks.)
+    """
+    for column in _ATTRIBUTION_COLUMNS:
+        value = (attribution or {}).get(column)
+        if value and not getattr(order, column):
+            setattr(order, column, value)
+
+
+def _decide(sender, order: Order, event_time: Optional[int], client_ip: Optional[str] = None,
+            user_agent: Optional[str] = None) -> Dict[str, Any]:
+    """
+    D-005 decision for a stored order, using stored hashes and stored fbp/fbc (raw PII is not available and not
+    needed). client_ip / user_agent are NOT stored: they are only passed when the send happens while handling a
+    webhook that carries them (orders/* topics); retries and fulfillments/update sends go without them.
+    """
     return sender.process_cod_order_event(
         order_id=order.platform_order_id,
         status=order.current_status,
@@ -114,6 +135,8 @@ def _decide(sender, order: Order, event_time: Optional[int]) -> Dict[str, Any]:
         phone_hash=order.phone_hash,
         fbp=order.fbp,
         fbc=order.fbc,
+        client_ip=client_ip,
+        user_agent=user_agent,
         event_time=event_time
     )
 
@@ -165,7 +188,8 @@ async def process_webhook(
     payload: Dict[str, Any],
     delivery_id: Optional[str] = None,
     sender=capi_sender,
-    event_time: Optional[int] = None
+    event_time: Optional[int] = None,
+    signature_ok: Optional[bool] = None
 ) -> Dict[str, Any]:
     """
     Ingests one webhook for `tenant`. platform: "shopify" | "salla"; topic e.g. "orders/updated",
@@ -179,7 +203,7 @@ async def process_webhook(
     dedupe_key = f"{platform}:{delivery_id}" if delivery_id else f"{platform}:{topic}:{digest}"
     delivery = WebhookDelivery(
         tenant_id=tenant.id, platform=platform, topic=topic, delivery_id=delivery_id,
-        dedupe_key=dedupe_key, payload_sha256=digest
+        dedupe_key=dedupe_key, payload_sha256=digest, signature_ok=signature_ok
     )
     already_done = session.scalar(
         select(WebhookDelivery.id).where(
@@ -246,13 +270,14 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
         # Platforms can redact customer fields on later updates: never overwrite a hash with nothing.
         order.email_hash = hash_email(parsed["email"]) or order.email_hash
         order.phone_hash = hash_phone(parsed["phone"], parsed["currency"], tenant.country) or order.phone_hash
+        _merge_attribution(order, parsed.get("attribution"))
     session.flush()
     if new_status != previous_status:
         session.add(OrderStatusEvent(order_id=order.id, status=new_status, source="webhook", topic=topic,
                                      payload_sha256=digest))
     session.commit()
 
-    decision = _decide(sender, order, event_time)
+    decision = _decide(sender, order, event_time, parsed.get("client_ip"), parsed.get("user_agent"))
     action = decision["action"]
     if action not in ("READY_TO_EMIT", "STALE"):
         _finish(session, delivery, True)

@@ -11,6 +11,7 @@ import hmac
 import os
 import time
 import logging
+from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException, Request, Response, status, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +23,29 @@ from .hitl_escalation import hitl_manager
 from .workflow_engine import workforce_engine
 from .hermes_bridge import hermes_bridge
 from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
+from .db import init_db
+from .webhook_routes import router as webhook_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Creates tables (idempotent). A DB problem must not take the whole gateway down: the webhook routes will
+    # fail on their own and the non-persistent endpoints keep working.
+    try:
+        init_db()
+    except Exception as exc:
+        logger.error("Database initialisation failed: %s", type(exc).__name__)
+    yield
+
 app = FastAPI(
     title="Ameen Digital AI Workforce Engine",
     description="Operational Engine for AI Employees under Ameen Digital (agency.motahai.com) on Wesam.ai Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
+app.include_router(webhook_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [

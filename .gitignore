@@ -13,3 +13,6 @@ dist/
 # rendered capability-URL configs contain the secret
 *.conf.rendered
 mcp-capability.conf
+
+# local SQLite databases (default DATABASE_URL is sqlite:///./motahai.db)
+*.db
