@@ -4,8 +4,144 @@ Enables sub-agents, Antigravity, and developers to consult Hermes Agent, request
 strategic opinions/fatawa, dispatch tasks, and audit code.
 """
 
+import base64
+import hashlib
+import hmac
+import json
+import os
+import threading
+import time
 from typing import Dict, Any, Optional, List
 from ..executor import VPSExecutor
+
+GTM_SERVICE_ACCOUNT_PATH = "/home/deploy/secrets/gtm-service-account.json"
+DEFAULT_USED_NONCES_PATH = "/home/deploy/.hermes/hitl_used_nonces.json"
+
+# ---------------------------------------------------------------------------
+# Rule D-003 approval-token verifier.
+# Inlined (stdlib only) because this file is deployed alone into the VPS package and cannot
+# import ameen_workforce. Byte-for-byte identical to src/ameen_workforce/hitl_tokens.py, which
+# also issues the tokens (POST /approvals/gtm-publish). tests/test_hitl_tokens.py enforces parity.
+# ---------------------------------------------------------------------------
+# --- BEGIN VERIFIER (must stay identical to the copy inlined in consultation.py) ---
+_NONCE_LOCK = threading.Lock()
+
+
+def _signing_key() -> Optional[bytes]:
+    key = os.environ.get("HITL_SIGNING_KEY", "")
+    if len(key) < 32:
+        return None
+    return key.encode("utf-8")
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _consume_nonce(used_nonce_store, nonce: str, exp: int, now: float, record: bool = True) -> bool:
+    """Atomically records `nonce` as used. Returns False if it was already used or the store is unusable.
+    With record=False it only checks that the nonce is still unused (nothing is written)."""
+    with _NONCE_LOCK:
+        try:
+            if os.path.exists(used_nonce_store):
+                with open(used_nonce_store, "r", encoding="utf-8") as fh:
+                    used = json.load(fh)
+                if not isinstance(used, dict):
+                    return False
+            else:
+                used = {}
+            if nonce in used:
+                return False
+            if not record:
+                return True
+            used = {n: e for n, e in used.items() if isinstance(e, (int, float)) and e > now}
+            used[nonce] = exp
+            directory = os.path.dirname(os.path.abspath(used_nonce_store))
+            os.makedirs(directory, exist_ok=True)
+            tmp_path = f"{used_nonce_store}.{os.getpid()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(used, fh)
+            os.replace(tmp_path, used_nonce_store)
+            return True
+        except (OSError, ValueError):
+            return False
+
+
+def verify_publish_token(token, container_id, workspace_id, used_nonce_store, now=None, consume=True):
+    """Returns (ok, reason). With consume=True (default) an ok token's nonce is spent (single use);
+    consume=False validates everything without spending it (dry check before a later consume)."""
+    key = _signing_key()
+    if key is None:
+        return False, "signing_key_not_configured"
+    if not isinstance(token, str) or not token.strip():
+        return False, "token_missing"
+    now = time.time() if now is None else now
+    try:
+        payload_b64, sig_b64 = token.strip().split(".")
+        expected = hmac.new(key, payload_b64.encode("ascii"), hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
+            return False, "bad_signature"
+        claims = json.loads(_b64url_decode(payload_b64))
+        cid, wid, exp, nonce = claims["cid"], claims["wid"], claims["exp"], claims["nonce"]
+        if not (isinstance(cid, str) and isinstance(wid, str) and isinstance(nonce, str)
+                and isinstance(exp, int) and not isinstance(exp, bool) and nonce):
+            return False, "token_malformed"
+    except (ValueError, KeyError, TypeError):
+        return False, "token_malformed"
+    if now >= exp:
+        return False, "token_expired"
+    if cid != container_id:
+        return False, "container_mismatch"
+    if wid != workspace_id:
+        return False, "workspace_mismatch"
+    if not _consume_nonce(used_nonce_store, nonce, exp, now, record=consume):
+        return False, "nonce_reused_or_store_unavailable"
+    return True, "ok"
+# --- END VERIFIER ---
+
+
+def _used_nonces_path() -> str:
+    return os.environ.get("HITL_USED_NONCES_PATH") or DEFAULT_USED_NONCES_PATH
+
+
+_PENDING_CREDENTIALS = json.dumps({
+    "status": "pending_credentials",
+    "service_account_email": "tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com",
+    "message": "Service Account key not found at /home/deploy/secrets/gtm-service-account.json. Client should invite tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com with Publish permission in GTM Admin > User Management."
+})
+
+
+def _hitl_gate(tool: str, container_id: str, workspace_id: str, version_name: str, token: Optional[str], precheck=None) -> Optional[str]:
+    """Returns None if a valid human-issued approval token was presented (and is now spent), else a JSON refusal.
+
+    The refusal deliberately contains no token value, format hint or example: the agent must
+    not be able to self-approve. Only a human operator can obtain a token.
+    `precheck` (optional) returns a JSON response if the call cannot proceed for a non-approval reason
+    (e.g. missing credentials). It runs only AFTER the token validated and BEFORE it is consumed, so such
+    failures neither leak state to an unapproved caller nor burn a human-issued token.
+    """
+    nonces = _used_nonces_path()
+    ok, reason = verify_publish_token(token, container_id, workspace_id, nonces, consume=False)
+    if ok and precheck is not None:
+        early = precheck()
+        if early:
+            return early
+    if ok:
+        ok, reason = verify_publish_token(token, container_id, workspace_id, nonces)
+    if ok:
+        return None
+    return json.dumps({
+        "status": "AWAITING_HITL_APPROVAL",
+        "gate": "D-003",
+        "tool": tool,
+        "reason": "Live GTM container publishing requires explicit human supervisor sign-off before modifying production.",
+        "action_required": "A human operator must issue an approval token via POST /approvals/gtm-publish",
+        "approval_check": reason,
+        "proposed_container_id": container_id,
+        "proposed_workspace_id": workspace_id,
+        "proposed_version": version_name
+    })
+
 
 def register_consultation_tools(server):
     executor = server.executor
@@ -126,7 +262,8 @@ def register_consultation_tools(server):
     @server.tool(
         name="hermes_gtm_deploy",
         description=(
-            "Deploy and publish the configured tracking container (tags, triggers, variables) to Google Tag Manager and publish the live production version."
+            "Deploy and publish the configured tracking container (tags, triggers, variables) to Google Tag Manager "
+            "through the operator's local browser bridge. Requires a human-issued approval token (Rule D-003)."
         ),
         input_schema={
             "type": "object",
@@ -138,13 +275,23 @@ def register_consultation_tools(server):
                 "version_name": {
                     "type": "string",
                     "description": "Version name for GTM publish, e.g. v1.0.0 - Motahai Full-Funnel Tracking Release"
+                },
+                "hitl_approval_token": {
+                    "type": "string",
+                    "description": "Signed single-use approval token issued by a human operator for this container (workspace 'browser') (Rule D-003)"
                 }
             },
             "required": ["container_id"]
         }
     )
-    def hermes_gtm_deploy(container_id: str = "GTM-5C5N552P", version_name: str = "v1.0.0 - Motahai Full-Funnel Tracking Release") -> str:
-        import urllib.request, json
+    def hermes_gtm_deploy(container_id: str, version_name: str = "v1.0.0 - Motahai Full-Funnel Tracking Release", hitl_approval_token: Optional[str] = None) -> str:
+        import urllib.request
+
+        # Rule D-003: the local browser bridge publishes to production, so it is gated exactly like the cloud tool.
+        refusal = _hitl_gate("hermes_gtm_deploy", container_id, "browser", version_name, hitl_approval_token)
+        if refusal:
+            return refusal
+
         try:
             data = json.dumps({"container_id": container_id, "version_name": version_name}).encode("utf-8")
             req = urllib.request.Request("http://127.0.0.1:8765/gtm-deploy", data=data, headers={"Content-Type": "application/json"})
@@ -181,36 +328,23 @@ def register_consultation_tools(server):
                 },
                 "hitl_approval_token": {
                     "type": "string",
-                    "description": "Explicit Human-in-the-Loop approval token confirming client sign-off (Rule D-003)"
+                    "description": "Signed single-use approval token issued by a human operator for this container and workspace (Rule D-003)"
                 }
             },
             "required": ["account_id", "container_id"]
         }
     )
-    def hermes_gtm_cloud_publish(account_id: str, container_id: str, workspace_id: str = "2", version_name: str = "v1.0.0 - Cloud Autonomous Release", hitl_approval_token: str = None) -> str:
-        import os, json
-        
-        # Rule D-003: Enforce HITL approval gate before live release
-        if not hitl_approval_token:
-            return json.dumps({
-                "status": "AWAITING_HITL_APPROVAL",
-                "gate": "D-003",
-                "reason": "Live GTM container publishing requires explicit human supervisor sign-off before modifying production.",
-                "action_required": "Provide hitl_approval_token='SUPERVISOR_APPROVED' to confirm human authorization.",
-                "proposed_version": version_name
-            })
-            
-        secrets_path = "/home/deploy/secrets/gtm-service-account.json"
-        
-        if not os.path.exists(secrets_path):
-            return json.dumps({
-                "status": "pending_credentials",
-                "service_account_email": "tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com",
-                "message": "Service Account key not found at /home/deploy/secrets/gtm-service-account.json. Client should invite tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com with Publish permission in GTM Admin > User Management.",
-                "fallback_available": True,
-                "local_bridge_tool": "hermes_gtm_deploy"
-            })
-            
+    def hermes_gtm_cloud_publish(account_id: str, container_id: str, workspace_id: str = "2", version_name: str = "v1.0.0 - Cloud Autonomous Release", hitl_approval_token: Optional[str] = None) -> str:
+        # Rule D-003: Enforce HITL approval gate before live release. The token must be signed by a
+        # human operator, bound to this container + workspace, unexpired and unused.
+        # Credentials are checked inside the gate, BEFORE the nonce is consumed, so a missing
+        # service-account file does not burn a human-issued token.
+        secrets_path = GTM_SERVICE_ACCOUNT_PATH
+        refusal = _hitl_gate("hermes_gtm_cloud_publish", container_id, workspace_id, version_name, hitl_approval_token,
+                             precheck=lambda: None if os.path.exists(secrets_path) else _PENDING_CREDENTIALS)
+        if refusal:
+            return refusal
+
         try:
             from google.oauth2 import service_account
             from googleapiclient.discovery import build

@@ -7,10 +7,12 @@ Umbrella:      Ameen Digital (agency.motahai.com)
 Supervisor / Gateway: Hermes Agent (hermes.motahai.com)
 """
 
+import hmac
+import os
 import time
 import logging
 from typing import Dict, Any, Optional, List
-from fastapi import FastAPI, HTTPException, Request, Response, status, Header
+from fastapi import FastAPI, HTTPException, Request, Response, status, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -19,6 +21,7 @@ from .models import TaskItem, TaskStatus, AgentRole, EscalationNotice
 from .hitl_escalation import hitl_manager
 from .workflow_engine import workforce_engine
 from .hermes_bridge import hermes_bridge
+from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -63,6 +66,31 @@ class ResolveEscalationRequest(BaseModel):
     approved: bool
     supervisor_id: str
     note: str
+
+class GtmPublishApprovalRequest(BaseModel):
+    container_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    workspace_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+def require_operator(authorization: Optional[str] = Header(None)) -> None:
+    """
+    Authenticates a HUMAN operator for Rule D-003 approvals via env OPERATOR_API_KEY.
+    This key is deliberately separate from HERMES_API_KEY / any agent or webhook credential:
+    an agent that can call the tools must never be able to mint its own approval.
+    Used as a dependency so authentication runs before request-body validation.
+    Fails closed: if OPERATOR_API_KEY is unset (or equals HERMES_API_KEY) nobody is authenticated.
+    """
+    operator_key = os.environ.get("OPERATOR_API_KEY", "")
+    if not operator_key:
+        logger.error("OPERATOR_API_KEY is not configured; refusing all approval requests")
+        raise HTTPException(status_code=401, detail="Operator authentication required")
+    if settings.HERMES_API_KEY and hmac.compare_digest(operator_key.encode(), settings.HERMES_API_KEY.encode()):
+        logger.error("OPERATOR_API_KEY must differ from HERMES_API_KEY; refusing all approval requests")
+        raise HTTPException(status_code=401, detail="Operator authentication required")
+    presented = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        presented = authorization[7:].strip()
+    if not presented or not hmac.compare_digest(presented.encode(), operator_key.encode()):
+        raise HTTPException(status_code=401, detail="Operator authentication required", headers={"WWW-Authenticate": "Bearer"})
 
 # -----------------------------------------------------------------------------
 # Endpoints
@@ -146,6 +174,27 @@ async def resolve_escalation(escalation_id: str, req: ResolveEscalationRequest):
         "status": "RESOLVED",
         "escalation": resolved,
         "task_state": task.status if task else None
+    }
+
+@app.post("/approvals/gtm-publish")
+async def approve_gtm_publish(req: GtmPublishApprovalRequest, _operator: None = Depends(require_operator)):
+    """
+    Rule D-003: a human operator mints a signed, single-use approval token for ONE container + workspace.
+    The token is then handed to the publish tool (hitl_approval_token). Operator bearer key required.
+    """
+    try:
+        token = issue_publish_token(req.container_id, req.workspace_id, ttl_seconds=DEFAULT_TTL_SECONDS)
+    except RuntimeError as exc:
+        logger.error("Cannot issue approval token: %s", exc)
+        raise HTTPException(status_code=503, detail="Approval signing is not configured")
+    logger.info("D-003 approval issued for container=%s workspace=%s", req.container_id, req.workspace_id)
+    return {
+        "approval_token": token,
+        "gate": "D-003",
+        "container_id": req.container_id,
+        "workspace_id": req.workspace_id,
+        "expires_in_seconds": DEFAULT_TTL_SECONDS,
+        "single_use": True
     }
 
 @app.post("/webhook/hermes")

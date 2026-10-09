@@ -95,6 +95,17 @@ tools:
   hermes_browser_navigate: {rate: 20, concurrency: 1, global_concurrency: 2, timeout_s: 60, url_arg: url}
   hermes_browser_evaluate: {rate: 20, concurrency: 1, global_concurrency: 2, timeout_s: 30, max_script_chars: 4000}
   hermes_terminal_exec:    {rate: 10, concurrency: 1, global_concurrency: 1, timeout_s: 120}
+  # Rule D-003 — production GTM publishing. approval_required: the tool itself refuses unless the call
+  # carries `hitl_approval_token`, an HMAC-signed, single-use, 30-minute token bound to this exact
+  # container + workspace that a HUMAN operator mints via POST /approvals/gtm-publish (OPERATOR_API_KEY).
+  # Agents cannot mint it (HITL_SIGNING_KEY is never in an agent's environment). Intentionally NOT listed in
+  # any role above: grant a tool to a role only after the human-approval flow is wired for that role.
+  hermes_gtm_cloud_publish: {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 120,
+                             approval_required: {gate: D-003, mechanism: signed_single_use_token,
+                                                 arg: hitl_approval_token, issuer: "POST /approvals/gtm-publish"}}
+  hermes_gtm_deploy:       {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 60,
+                            approval_required: {gate: D-003, mechanism: signed_single_use_token,
+                                                arg: hitl_approval_token, issuer: "POST /approvals/gtm-publish"}}
   "*":                     {rate: 30, concurrency: 2, global_concurrency: 8, timeout_s: 60}
 
 # ── Egress rules for URL-taking tools (SSRF protection) ──────────────────────

@@ -1,3 +1,6 @@
+import os as _os, sys as _sys
+if _os.environ.get("ALLOW_LEGACY_PATCH") != "1":
+    _sys.exit("Obsolete: deploys ungated GTM tools; deploy consultation.py from repo instead")
 import re
 
 tool_code = '''

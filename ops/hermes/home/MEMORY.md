@@ -27,8 +27,9 @@
 ## Standing decisions (الفتاوى المعتمدة)
 - D-001: Purchase is deduped on Shopify order ID (`order.id` / `checkout.order.id`), never on cart token. [src: SOUL §3.1 | 2026-10-03]
 - D-002: Browser + server share one `event_id`: purchase = `purchase_<order_id>` (deterministic); other events = UUID generated once in the dataLayer push. [src: gtm-patterns P2 | 2026-10-03]
-- D-003: Hermes never publishes GTM versions or Shopify theme changes; humans publish after QA. [src: SOUL §4 | 2026-10-03]
+- D-003: Hermes never publishes GTM versions or Shopify theme changes; humans publish after QA. Enforced in code: publish tools require a signed, single-use, container+workspace-bound approval token a human mints via POST /approvals/gtm-publish. [src: SOUL §4, hitl_tokens.py | 2026-10-09]
 - D-004: Container audits require a `gtm-container-linter` report as evidence. [src: SOUL §4 | 2026-10-03]
+- D-005: COD conversion = custom event `DeliveredPurchase`, `event_id` = `delivered_<order_id>`, sent server-side only when delivered/paid; prepaid sent when paid. The merchant's native Shopify/Salla Meta `Purchase` is left untouched ("Coexist"); Option B take-over is a future opt-in. [src: capi_service.py | 2026-10-09]
 
 ## Last updated
-2026-10-03 — initial schema (operator)
+2026-10-09 — D-003 enforced by signed tokens; D-005 added (operator)
