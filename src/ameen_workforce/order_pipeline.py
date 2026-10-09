@@ -1,23 +1,35 @@
 """
-order_pipeline.py — Persistent, idempotent webhook -> Rule D-005 -> Meta CAPI pipeline (S1-1).
+order_pipeline.py — Persistent, idempotent webhook -> Rule D-005 -> Meta CAPI pipeline (S1-1, S2-1/3/4).
 
 process_webhook() flow:
   1. Record a webhook_deliveries row. An identical redelivery (same delivery id, or same platform+topic+payload
      hash) that was already processed OK returns DUPLICATE_DELIVERY and is not reprocessed.
-  2. Parse with the existing parsers, upsert the order (HASHES ONLY: no raw email/phone is stored) and append an
-     order_status_events row when the status changed. fulfillments/update joins to the stored order for
+  2. Parse with the existing parsers, upsert the order (HASHES ONLY: no raw email/phone/name/address is stored) and
+     append an order_status_events row when the status changed. fulfillments/update joins to the stored order for
      value/currency/customer hashes; an unknown order returns NEEDS_ORDER_CONTEXT (the S1-5 sweep backfills).
-  3. Ask Rule D-005 for a decision. READY_TO_EMIT claims the idempotency key by INSERTing the capi_events row
-     (UNIQUE tenant+order+event_name); a constraint violation means ALREADY_EMITTED and nothing is sent.
-     Shadow tenants stop at status `shadow`; live tenants fetch the encrypted token and call Meta.
-  4. Mark the delivery processed_ok / error_type.
+     The first orders/* webhook carrying client_details also stores the checkout IP/UA ENCRYPTED (D-006).
+  3. Ask Rule D-005 for a decision. READY_TO_EMIT does NOT send at once: it records `orders.delivered_at` (first time
+     we saw delivered/paid) and claims the idempotency key by INSERTing the capi_events row with status `scheduled`
+     and due_at = min(delivered_at + settlement, placed_at + LATE_DELIVERY_CUTOFF - 1h) (UNIQUE tenant+order+event_name;
+     a violation means ALREADY_EMITTED). Settlement is tenants.settlement_hours, default 12h. If due_at has already
+     passed the event is dispatched IN-LINE in the same call (so a 0h tenant behaves as "send immediately" and an
+     order close to the cutoff is not delayed until the next timer tick); otherwise the S1-5 scheduler's call to
+     send_due_events() sends it.
+  4. send_due_events() sends `scheduled` rows once due. At send time it re-evaluates the CURRENT order (cancelled or
+     fully refunded since -> `stale`/no_longer_eligible; past the cutoff -> `late_delivery`), rebuilds the payload with
+     the CURRENT net value and the decrypted checkout IP/UA, then honors shadow/live and credentials like before.
+  5. Mark the delivery processed_ok / error_type.
+
+event_time is the order's PLACED time: orders.created_at_platform, else (documented fallback) the order row's
+first-seen timestamp orders.created_at. Meta's 7-day upload limit is protected by LATE_DELIVERY_CUTOFF (6.5 days after
+placement): later conversions are never sent (`late_delivery`, terminal, holds the idempotency key). The older
+`stale` guard (explicit event_time older than 7 days) stays as a second line of defense.
 
 Transactions: this module COMMITS on the session it is given (delivery row, order upsert, idempotency claim and
 send result are separate commits so a failed claim never rolls back the order). Pass a dedicated session.
 
-STALE decision (event_time older than 7 days): a capi_events row with status `stale` is written. It is terminal
-and auditable ("N conversions were too old for Meta"), and it holds the idempotency key so it is never retried.
-A failed send is retryable via retry_failed_events().
+STALE: a capi_events row with status `stale` is written. It is terminal and auditable ("N conversions were too old for
+Meta"), and it holds the idempotency key so it is never retried. A failed send is retryable via retry_failed_events().
 """
 
 import hashlib
@@ -26,14 +38,20 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .capi_service import DELIVERED_EVENT_NAME, capi_sender, hash_email, hash_phone
+from .capi_service import (
+    DELIVERED_EVENT, EVENT_TYPES, LATE_DELIVERY_CUTOFF, MATCH_KEYS, EventType, capi_sender, hash_email, hash_phone,
+    quality_flags_for
+)
+from .checkout_context import (  # noqa: F401  (purge_expired_checkout_context is re-exported for the scheduler)
+    capture_checkout_context, load_checkout_context, purge_checkout_context, purge_expired_checkout_context
+)
 from .credentials import CredentialError, get_credential
 from .db import CapiEvent, Order, OrderStatusEvent, Tenant, WebhookDelivery, utcnow
-from .webhook_listener import OrderWebhookProcessor, fulfillment_context_decision
+from .webhook_listener import OrderWebhookProcessor, fulfillment_context_decision, match_hashes_from_parsed
 
 logger = logging.getLogger("ameen_workforce.pipeline")
 
@@ -41,10 +59,16 @@ META_CAPI_TOKEN_KIND = "meta_capi_token"
 DEFAULT_MAX_ATTEMPTS = 5
 # A `pending` claim older than this is an orphan (process died between claim and send); the retry sweep picks it up.
 PENDING_ORPHAN_SECONDS = 600
+# S2-1: hours between an order becoming delivered/paid and the send (override per tenant: tenants.settlement_hours).
+DEFAULT_SETTLEMENT_HOURS = 12.0
+# due_at never goes past placed_at + LATE_DELIVERY_CUTOFF - this margin, so a due send still lands before the cutoff.
+DUE_SAFETY_MARGIN = timedelta(hours=1)
 
 _REVENUE_STATUSES = frozenset({"delivered", "paid"})
 # Late/out-of-order webhooks must not walk a delivered/paid order back to an earlier state.
 _REGRESSIVE_STATUSES = frozenset({"pending", "shipped", "paid_unfulfilled"})
+# capi_events statuses after which checkout IP/UA must not be (re)captured for the order.
+_FINAL_EVENT_STATUSES = ("sent", "shadow", "stale", "late_delivery")
 
 
 def payload_sha256(payload: Dict[str, Any]) -> str:
@@ -89,8 +113,10 @@ def _next_status(current: Optional[str], new: str, from_fulfillment: bool) -> st
 
 
 def _result(action: str, order_id: str = "", capi_status: Optional[str] = None,
-            decision: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            decision: Optional[Dict[str, Any]] = None, due_at: Optional[datetime] = None) -> Dict[str, Any]:
     out: Dict[str, Any] = {"status": "processed", "action": action, "order_id": order_id, "capi_status": capi_status}
+    if due_at is not None:
+        out["due_at"] = due_at.isoformat()
     if decision is not None:
         out["d005_decision"] = {k: v for k, v in decision.items() if k != "payload"}  # payload carries hashes
     return out
@@ -118,13 +144,46 @@ def _merge_attribution(order: Order, attribution: Optional[Dict[str, Optional[st
             setattr(order, column, value)
 
 
-def _decide(sender, order: Order, event_time: Optional[int], client_ip: Optional[str] = None,
-            user_agent: Optional[str] = None) -> Dict[str, Any]:
+# --- S2-1 timing -------------------------------------------------------------------------------------------
+
+def order_placed_at(order: Order) -> datetime:
+    """
+    When the customer placed the order = the CAPI event_time. orders.created_at_platform (the platform's own
+    timestamp); if the platform did not give a parseable one, the order row's first-seen timestamp (orders.created_at).
+    """
+    return order.created_at_platform or order.created_at
+
+
+def settlement_hours_for(tenant: Tenant) -> float:
+    hours = getattr(tenant, "settlement_hours", None)
+    return DEFAULT_SETTLEMENT_HOURS if hours is None else float(hours)
+
+
+def compute_due_at(delivered_at: datetime, placed_at: datetime, settlement_hours: float) -> datetime:
+    """min(delivered_at + settlement, placed_at + LATE_DELIVERY_CUTOFF - 1h): never later than the safe send deadline."""
+    return min(delivered_at + timedelta(hours=settlement_hours),
+               placed_at + LATE_DELIVERY_CUTOFF - DUE_SAFETY_MARGIN)
+
+
+def event_source_url_for(tenant: Tenant) -> Optional[str]:
+    """tenants.storefront_url; else https://<shop_domain>/ for Shopify; for Salla only an explicit storefront_url."""
+    if tenant.storefront_url:
+        return tenant.storefront_url
+    if tenant.platform == "shopify" and tenant.shop_domain:
+        return f"https://{tenant.shop_domain}/"
+    return None
+
+
+def _decide(session: Session, sender, tenant: Tenant, order: Order, now: datetime,
+            event_type: EventType = DELIVERED_EVENT, event_time: Optional[int] = None,
+            with_context: bool = False) -> Dict[str, Any]:
     """
     D-005 decision for a stored order, using stored hashes and stored fbp/fbc (raw PII is not available and not
-    needed). client_ip / user_agent are NOT stored: they are only passed when the send happens while handling a
-    webhook that carries them (orders/* topics); retries and fulfillments/update sends go without them.
+    needed). event_time defaults to the order's placed time. with_context=True (send time only) decrypts the stored
+    checkout IP/UA (D-006) into the payload; scheduling decisions never touch the ciphertext.
     """
+    placed = int(order_placed_at(order).timestamp())
+    ip, ua = load_checkout_context(session, order.id, now) if with_context else (None, None)
     return sender.process_cod_order_event(
         order_id=order.platform_order_id,
         status=order.current_status,
@@ -135,14 +194,24 @@ def _decide(sender, order: Order, event_time: Optional[int], client_ip: Optional
         phone_hash=order.phone_hash,
         fbp=order.fbp,
         fbc=order.fbc,
-        client_ip=client_ip,
-        user_agent=user_agent,
-        event_time=event_time
+        client_ip=ip,
+        user_agent=ua,
+        match_hashes={key: getattr(order, f"{key}_hash") for key in MATCH_KEYS},
+        event_source_url=event_source_url_for(tenant),
+        event_time=placed if event_time is None else event_time,
+        placed_at=placed,
+        now=now.timestamp(),
+        event_type=event_type
     )
 
 
 async def _send(session: Session, tenant: Tenant, event: CapiEvent, payload: Dict[str, Any], sender) -> str:
-    """Sends a claimed event according to the tenant mode and records the outcome. Returns the new status."""
+    """
+    Sends a claimed event according to the tenant mode and records the outcome. Returns the new status.
+    A SUCCESSFUL live send purges the order's encrypted checkout IP/UA (D-006); shadow never dispatches, so it keeps it.
+    Records capi_events.quality_flags (missing client_user_agent / event_source_url) for every send attempt.
+    """
+    event.quality_flags = quality_flags_for(payload)
     if tenant.mode != "live":
         event.status = "shadow"
         session.commit()
@@ -172,12 +241,46 @@ async def _send(session: Session, tenant: Tenant, event: CapiEvent, payload: Dic
         event.status, event.error_type, event.http_code = "sent", None, 200
         event.fbtrace_id = result.get("fbtrace_id")
         event.sent_at = utcnow()
+        purge_checkout_context(session, event.order_id)
     else:
         event.status = "failed"
         event.http_code = result.get("http_code")
         event.error_type = result.get("error") or "meta_api_error"  # exception type name, or Meta rejected it
     session.commit()
     return event.status
+
+
+async def _resolve(session: Session, tenant: Tenant, event: CapiEvent, decision: Dict[str, Any], sender) -> str:
+    """Applies a send-time decision to a claimed event: send it, or end it as late_delivery / stale. Returns the status."""
+    action = decision["action"]
+    if action == "READY_TO_EMIT":
+        return await _send(session, tenant, event, decision["payload"], sender)
+    if action == "LATE_DELIVERY":
+        event.status, event.error_type = "late_delivery", "past_cutoff"
+    elif action == "STALE":
+        event.status, event.error_type = "stale", "event_time_out_of_window"
+    else:  # SUPPRESSED / DEFERRED: cancelled, refunded or zero-value since the event was scheduled
+        event.status, event.error_type = "stale", "no_longer_eligible"
+    session.commit()
+    return event.status
+
+
+async def _dispatch_scheduled(session: Session, tenant: Tenant, event: CapiEvent, order: Order, sender,
+                              now: datetime) -> Optional[str]:
+    """
+    Claims a `scheduled` row (atomic scheduled -> pending, so two sweeps never send the same event), re-evaluates the
+    order as it is NOW and sends/ends it. Returns the resulting status, or None if another worker claimed the row.
+    """
+    claimed = session.execute(
+        update(CapiEvent).where(CapiEvent.id == event.id, CapiEvent.status == "scheduled")
+        .values(status="pending", claimed_at=now))
+    session.commit()
+    if claimed.rowcount != 1:
+        return None
+    session.refresh(event)
+    decision = _decide(session, sender, tenant, order, now, EVENT_TYPES[event.event_name],
+                       event_time=event.event_time, with_context=True)
+    return await _resolve(session, tenant, event, decision, sender)
 
 
 async def process_webhook(
@@ -189,15 +292,19 @@ async def process_webhook(
     delivery_id: Optional[str] = None,
     sender=capi_sender,
     event_time: Optional[int] = None,
-    signature_ok: Optional[bool] = None
+    signature_ok: Optional[bool] = None,
+    now: Optional[datetime] = None
 ) -> Dict[str, Any]:
     """
     Ingests one webhook for `tenant`. platform: "shopify" | "salla"; topic e.g. "orders/updated",
     "fulfillments/update". delivery_id: platform delivery id (Shopify X-Shopify-Webhook-Id) if available.
-    event_time (unix seconds): when the conversion happened; default now. Returns {"status", "action", ...}
+    event_time (unix seconds): explicit override of the conversion time (default: the order's placed time; mainly for
+    tests). now: clock override (default utcnow) for delivered_at/due_at. Returns {"status", "action", ...}
     where action is one of DUPLICATE_DELIVERY, TENANT_INACTIVE, UNSUPPORTED, NEEDS_ORDER_CONTEXT, DEFERRED,
-    SUPPRESSED, ALREADY_EMITTED, STALE, SHADOW, SENT, FAILED. Unexpected errors are recorded on the delivery
-    (error_type, processed_ok False) and re-raised so the caller can answer 5xx and the platform retries.
+    SUPPRESSED, ALREADY_EMITTED, STALE, LATE_DELIVERY, SCHEDULED, SHADOW, SENT, FAILED. SCHEDULED means the conversion
+    waits for its settlement window (result carries due_at); send_due_events() sends it. Unexpected errors are
+    recorded on the delivery (error_type, processed_ok False) and re-raised so the caller can answer 5xx and the
+    platform retries.
     """
     digest = payload_sha256(payload)
     dedupe_key = f"{platform}:{delivery_id}" if delivery_id else f"{platform}:{topic}:{digest}"
@@ -232,7 +339,8 @@ async def process_webhook(
         if not parsed["order_id"]:
             _finish(session, delivery, False, "missing_order_id")
             return _result("UNSUPPORTED")
-        return await _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender, event_time)
+        return await _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender,
+                                     event_time, now or utcnow())
     except Exception as e:
         session.rollback()
         logger.error("Webhook processing failed (%s/%s): %s", platform, topic, type(e).__name__)
@@ -241,7 +349,13 @@ async def process_webhook(
         raise
 
 
-async def _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender, event_time):
+def _has_final_event(session: Session, order_id: int) -> bool:
+    return session.scalar(select(CapiEvent.id).where(
+        CapiEvent.order_id == order_id, CapiEvent.status.in_(_FINAL_EVENT_STATUSES)).limit(1)) is not None
+
+
+async def _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender, event_time, now,
+                          event_type: EventType = DELIVERED_EVENT):
     from_fulfillment = bool(parsed.get("needs_order_context"))
     order = session.scalar(select(Order).where(
         Order.tenant_id == tenant.id, Order.platform_order_id == parsed["order_id"]))
@@ -264,35 +378,48 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
     order.current_status = new_status
     if not from_fulfillment:
         order.is_cod = bool(parsed["is_cod"])
-        order.value = parsed["total_price"]
+        order.value = parsed["total_price"]  # NET collected value (total minus successful refund transactions), S2-4
         order.currency = parsed["currency"]
         order.created_at_platform = order.created_at_platform or _platform_created_at(platform, payload)
         # Platforms can redact customer fields on later updates: never overwrite a hash with nothing.
         order.email_hash = hash_email(parsed["email"]) or order.email_hash
         order.phone_hash = hash_phone(parsed["phone"], parsed["currency"], tenant.country) or order.phone_hash
+        for key, hashed in match_hashes_from_parsed(parsed).items():  # external_id + address keys, hashes only
+            if hashed:
+                setattr(order, f"{key}_hash", hashed)
         _merge_attribution(order, parsed.get("attribution"))
+    if new_status in event_type.converting_statuses and order.delivered_at is None:
+        order.delivered_at = now  # first time we saw delivered/paid: starts the settlement window
     session.flush()
+    if not from_fulfillment and (parsed.get("client_ip") or parsed.get("user_agent")) \
+            and not _has_final_event(session, order.id):
+        capture_checkout_context(session, order.id, parsed.get("client_ip"), parsed.get("user_agent"), now)  # D-006
     if new_status != previous_status:
         session.add(OrderStatusEvent(order_id=order.id, status=new_status, source="webhook", topic=topic,
                                      payload_sha256=digest))
     session.commit()
 
-    decision = _decide(sender, order, event_time, parsed.get("client_ip"), parsed.get("user_agent"))
+    decision = _decide(session, sender, tenant, order, now, event_type, event_time=event_time)
     action = decision["action"]
-    if action not in ("READY_TO_EMIT", "STALE"):
+    if action not in ("READY_TO_EMIT", "STALE", "LATE_DELIVERY"):
         _finish(session, delivery, True)
         return _result(action, order.platform_order_id, None, decision)
 
+    placed_epoch = int(order_placed_at(order).timestamp())
+    event_id = event_type.event_id(order.platform_order_id)
+    due_at = None
     if action == "STALE":
-        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=DELIVERED_EVENT_NAME,
-                          event_id=f"delivered_{order.platform_order_id}", event_time=event_time, status="stale",
+        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=event_type.name, event_id=event_id,
+                          event_time=placed_epoch if event_time is None else event_time, status="stale",
                           error_type="event_time_out_of_window")
-        claim_payload = None
+    elif action == "LATE_DELIVERY":
+        claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=event_type.name, event_id=event_id,
+                          event_time=placed_epoch, status="late_delivery", error_type="past_cutoff")
     else:
+        due_at = compute_due_at(order.delivered_at or now, order_placed_at(order), settlement_hours_for(tenant))
         claim = CapiEvent(tenant_id=tenant.id, order_id=order.id, event_name=decision["event_name"],
-                          event_id=decision["event_id"],
-                          event_time=decision["payload"]["data"][0]["event_time"], status="pending")
-        claim_payload = decision["payload"]
+                          event_id=decision["event_id"], event_time=decision["payload"]["data"][0]["event_time"],
+                          status="scheduled", due_at=due_at)
     session.add(claim)
     try:
         session.commit()  # the UNIQUE(tenant, order, event_name) constraint is the idempotency claim
@@ -301,51 +428,90 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
         _finish(session, delivery, True)
         return _result("ALREADY_EMITTED", order.platform_order_id, None, decision)
 
-    if action == "STALE":
+    if action in ("STALE", "LATE_DELIVERY"):
         _finish(session, delivery, True)
-        return _result("STALE", order.platform_order_id, "stale", decision)
+        return _result(action, order.platform_order_id, claim.status, decision)
 
-    capi_status = await _send(session, tenant, claim, claim_payload, sender)
+    if due_at > now:
+        _finish(session, delivery, True)
+        return _result("SCHEDULED", order.platform_order_id, "scheduled", decision, due_at)
+
+    # Already due (settlement 0h, or close to the cutoff): dispatch in-line through the same path as send_due_events.
+    capi_status = await _dispatch_scheduled(session, tenant, claim, order, sender, now)
     _finish(session, delivery, True)
-    return _result({"sent": "SENT", "shadow": "SHADOW"}.get(capi_status, "FAILED"),
-                   order.platform_order_id, capi_status, decision)
+    return _result({"sent": "SENT", "shadow": "SHADOW", "late_delivery": "LATE_DELIVERY", "stale": "STALE"}
+                   .get(capi_status, "FAILED"), order.platform_order_id, capi_status, decision)
+
+
+async def send_due_events(
+    session: Session,
+    now: Optional[datetime] = None,
+    sender=capi_sender,
+    limit: int = 500
+) -> Dict[str, int]:
+    """
+    Sends `scheduled` capi_events whose due_at has passed (SQL-filtered on the (status, due_at) index, oldest first,
+    at most `limit` per call). Each row is claimed atomically (scheduled -> pending), then the order is re-evaluated as
+    it is NOW: cancelled / fully refunded / zero net value since -> `stale` (error_type no_longer_eligible); past the
+    placed+6.5d cutoff -> `late_delivery`; otherwise the payload is rebuilt with the CURRENT net value, the stored
+    hashes and the decrypted checkout IP/UA, and sent (live) or recorded as `shadow` (shadow tenants), exactly like a
+    first send. Rows of missing/inactive tenants are left scheduled. The S1-5 scheduler calls this on a timer.
+    Returns counts: due, sent, shadow, failed, stale, late_delivery, skipped (inactive tenant / lost the claim).
+    """
+    now = now or utcnow()
+    rows = session.scalars(
+        select(CapiEvent).where(CapiEvent.status == "scheduled", CapiEvent.due_at <= now)
+        .order_by(CapiEvent.due_at, CapiEvent.id).limit(limit)
+    ).all()
+    counts = {"due": len(rows), "sent": 0, "shadow": 0, "failed": 0, "stale": 0, "late_delivery": 0, "skipped": 0}
+    for event in rows:
+        tenant = session.get(Tenant, event.tenant_id)
+        order = session.get(Order, event.order_id)
+        if tenant is None or order is None or not tenant.active:
+            counts["skipped"] += 1
+            continue
+        status = await _dispatch_scheduled(session, tenant, event, order, sender, now)
+        counts["skipped" if status is None else status if status in counts else "failed"] += 1
+    return counts
 
 
 async def retry_failed_events(
     session: Session,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-    sender=capi_sender
+    sender=capi_sender,
+    now: Optional[datetime] = None
 ) -> Dict[str, int]:
     """
     Resends capi_events with status `failed` and attempts < max_attempts (plus orphaned `pending` claims older
-    than PENDING_ORPHAN_SECONDS), for live tenants only. The payload is rebuilt from the stored order and the
-    original event_time, so a retry past Meta's 7-day window becomes `stale`, and an order that has since been
-    cancelled/refunded is not sent (`stale`, error_type no_longer_eligible). Rows failing for a missing
+    than PENDING_ORPHAN_SECONDS since they were claimed), for live tenants only. The payload is rebuilt from the
+    stored order with the stored event_time (the order's placed time) and the decrypted checkout IP/UA, so a retry
+    past the placed+6.5d cutoff becomes `late_delivery`, past Meta's 7-day window `stale`, and an order that has since
+    been cancelled/refunded is not sent (`stale`, error_type no_longer_eligible). Rows failing for a missing
     credential/dataset id do not consume attempts, so they resume once the tenant is fixed.
-    Returns counts: retried, sent, failed, stale, skipped.
+    Returns counts: retried, sent, failed, stale, late_delivery, skipped.
     """
-    orphan_cutoff = utcnow() - timedelta(seconds=PENDING_ORPHAN_SECONDS)
+    now = now or utcnow()
+    orphan_cutoff = now - timedelta(seconds=PENDING_ORPHAN_SECONDS)
     candidates = session.scalars(
         select(CapiEvent).where(
             CapiEvent.attempts < max_attempts,
             or_(CapiEvent.status == "failed",
-                and_(CapiEvent.status == "pending", CapiEvent.created_at <= orphan_cutoff))
+                and_(CapiEvent.status == "pending",
+                     func.coalesce(CapiEvent.claimed_at, CapiEvent.created_at) <= orphan_cutoff))
         ).order_by(CapiEvent.id)
     ).all()
-    counts = {"retried": 0, "sent": 0, "failed": 0, "stale": 0, "skipped": 0}
+    counts = {"retried": 0, "sent": 0, "failed": 0, "stale": 0, "late_delivery": 0, "skipped": 0}
     for event in candidates:
         tenant = session.get(Tenant, event.tenant_id)
         order = session.get(Order, event.order_id)
         if tenant is None or order is None or tenant.mode != "live" or not tenant.active:
             counts["skipped"] += 1
             continue
-        decision = _decide(sender, order, event.event_time)
+        decision = _decide(session, sender, tenant, order, now, EVENT_TYPES[event.event_name],
+                           event_time=event.event_time, with_context=True)
         if decision["action"] != "READY_TO_EMIT":
-            event.status = "stale"
-            event.error_type = ("event_time_out_of_window" if decision["action"] == "STALE"
-                                else "no_longer_eligible")
-            session.commit()
-            counts["stale"] += 1
+            status = await _resolve(session, tenant, event, decision, sender)
+            counts["late_delivery" if status == "late_delivery" else "stale"] += 1
             continue
         counts["retried"] += 1
         status = await _send(session, tenant, event, decision["payload"], sender)

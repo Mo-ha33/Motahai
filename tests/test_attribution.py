@@ -5,6 +5,7 @@ match-quality fields (fbp/fbc/IP/UA), privacy (IP/UA never stored) and the store
 
 import shutil
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,8 @@ ATTRS = {
     "ad_id": "120002", "fbp": FBP, "fbc": FBC, "ttclid": "TT_click-1", "sccid": "SC.click~1",
 }
 ROOT = Path(__file__).resolve().parent.parent
+# Placed shortly before the test runs: a fixed date would eventually fall past the placed+6.5d send cutoff.
+PLACED_AT = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
 
 def notes(**fields):
@@ -37,7 +40,7 @@ def shopify_order(**overrides):
     order = {
         "id": 555001, "financial_status": "paid", "fulfillment_status": "fulfilled",
         "payment_gateway_names": ["Cash on Delivery (COD)"], "total_price": "850.00", "currency": "EGP",
-        "created_at": "2026-10-09T10:00:00+02:00",
+        "created_at": PLACED_AT,
         "customer": {"email": "buyer@example.com", "phone": "01012345678"},
         "note_attributes": notes(**ATTRS),
         "client_details": {"browser_ip": IP, "user_agent": UA, "accept_language": "ar"},
@@ -149,13 +152,14 @@ async def test_later_webhook_without_attributes_does_not_erase_stored_attributio
     order = db_session.scalar(select(Order))
     for column, value in ATTRS.items():
         assert getattr(order, column) == value, column
-    # the delivering webhook carries no attributes either: the send still uses the stored fbp/fbc
+    # the delivering webhook carries no attributes either: the send still uses the stored fbp/fbc, and the checkout
+    # IP/UA captured by the FIRST webhook (kept encrypted, D-006)
     res = await deliver(db_session, live_tenant, shopify_order(note_attributes=[], client_details=None,
                                                                total_price="850.02"), sender)
     assert res["action"] == "SENT"
     ud = user_data(sender)
     assert ud["fbp"] == FBP and ud["fbc"] == FBC
-    assert "client_ip_address" not in ud and "client_user_agent" not in ud
+    assert ud["client_ip_address"] == IP and ud["client_user_agent"] == UA
 
 
 @pytest.mark.asyncio
@@ -199,7 +203,7 @@ async def test_ip_and_user_agent_are_not_stored_in_any_column(db_session, live_t
 
 
 @pytest.mark.asyncio
-async def test_fulfillment_triggered_send_uses_stored_fbp_fbc_and_no_ip_ua(db_session, live_tenant):
+async def test_fulfillment_triggered_send_uses_stored_fbp_fbc_and_stored_ip_ua(db_session, live_tenant):
     sender = FakeSender()
     held = await deliver(db_session, live_tenant, shopify_order(financial_status="pending"), sender)
     assert held["action"] == "DEFERRED"  # COD shipped, not yet delivered
@@ -209,7 +213,8 @@ async def test_fulfillment_triggered_send_uses_stored_fbp_fbc_and_no_ip_ua(db_se
     assert res["action"] == "SENT"
     ud = user_data(sender)
     assert ud["fbp"] == FBP and ud["fbc"] == FBC
-    assert "client_ip_address" not in ud and "client_user_agent" not in ud
+    # the fulfillments/update payload has no client_details, but the order webhook's IP/UA were stored encrypted
+    assert ud["client_ip_address"] == IP and ud["client_user_agent"] == UA
 
 
 @pytest.mark.asyncio

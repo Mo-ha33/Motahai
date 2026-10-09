@@ -164,7 +164,6 @@ def test_shopify_webhook_parser():
     ({"cancelled_at": "2026-10-01T10:00:00Z"}, "cancelled"),
     ({"cancelled_at": "2026-10-01T10:00:00Z", "financial_status": "paid"}, "cancelled"),
     ({"financial_status": "refunded"}, "refunded"),
-    ({"financial_status": "partially_refunded"}, "refunded"),
     ({"financial_status": "voided"}, "voided"),
 ])
 def test_shopify_cancelled_refunded_never_delivered(overrides, expected):

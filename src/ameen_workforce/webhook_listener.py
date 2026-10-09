@@ -23,7 +23,7 @@ import ipaddress
 import logging
 import re
 from typing import Dict, Any, Optional
-from .capi_service import capi_sender
+from .capi_service import DELIVERED_EVENT_NAME, capi_sender, hash_match_value
 
 logger = logging.getLogger("ameen_workforce.webhooks")
 
@@ -151,8 +151,65 @@ def fulfillment_context_decision(parsed: Dict[str, Any]) -> Dict[str, Any]:
         "reason": "Rule D-005: fulfillment not delivered yet. Conversion held until delivery.",
         "order_id": parsed["order_id"],
         "current_status": parsed["status"],
-        "held_event": "DeliveredPurchase"
+        "held_event": DELIVERED_EVENT_NAME
     }
+
+# --- Net value and match keys (S2-3 / S2-4) ---------------------------------------------------------------
+def _money(value: Any) -> float:
+    """Tolerant money parse for optional fields (junk counts as 0); never used for the order total itself."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+def shopify_net_total(payload: Dict[str, Any]) -> float:
+    """
+    Net amount collected for a Shopify order (S2-4), computed from the refunds: total_price minus the sum of
+    `refunds[].transactions[]` with kind "refund" and status "success" (compared case-insensitively: REST "refund" /
+    GraphQL "REFUND"), never below 0. WHY not current_total_price: Shopify documents currentTotalPriceSet as the price
+    "after returns, includes taxes and discounts" but does not state that refunds or edits are included, so it is used
+    ONLY as a fallback when the payload has no `refunds` array at all (then total_price if that is missing too).
+    """
+    refunds = payload.get("refunds")
+    if not isinstance(refunds, list):
+        current = payload.get("current_total_price")
+        if current not in (None, ""):
+            return float(current)
+        return float(payload.get("total_price") or 0.0)
+    total = float(payload.get("total_price") or 0.0)
+    refunded = 0.0
+    for refund in refunds:
+        transactions = refund.get("transactions") if isinstance(refund, dict) else None
+        for txn in transactions if isinstance(transactions, list) else []:
+            if (isinstance(txn, dict) and str(txn.get("kind") or "").lower() == "refund"
+                    and str(txn.get("status") or "").lower() == "success"):
+                refunded += _money(txn.get("amount"))
+    return max(total - refunded, 0.0)
+
+def _shopify_address(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """RAW address fields (hashed immediately by the pipeline, never stored): shipping address, else billing."""
+    chosen: Dict[str, Any] = {}
+    for key in ("shipping_address", "billing_address"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict) and any(candidate.get(f) for f in ("first_name", "last_name", "city", "zip")):
+            chosen = candidate
+            break
+    code = chosen.get("province_code")
+    state = code if isinstance(code, str) and re.fullmatch(r"[A-Za-z]{2}", code.strip()) else chosen.get("province")
+    return {"fn": chosen.get("first_name"), "ln": chosen.get("last_name"), "ct": chosen.get("city"),
+            "st": state, "zp": chosen.get("zip"), "country": chosen.get("country_code")}
+
+def _id_str(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, bool) or value == "":
+        return None
+    return str(value)
+
+def match_hashes_from_parsed(parsed: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """SHA-256 match keys (external_id, fn, ln, ct, st, zp, country) for a parsed order; empty ones are None."""
+    address = parsed.get("address") or {}
+    hashes = {key: hash_match_value(key, address.get(key)) for key in ("fn", "ln", "ct", "st", "zp", "country")}
+    hashes["external_id"] = hash_match_value("external_id", parsed.get("external_id"))
+    return hashes
 
 class OrderWebhookProcessor:
     @staticmethod
@@ -162,6 +219,8 @@ class OrderWebhookProcessor:
         Status: cancelled | voided | refunded (never emit), delivered (COD, paid and fulfilled),
         paid_unfulfilled (COD, paid but not fulfilled: held), paid (prepaid, paid),
         shipped (fulfilled but not paid), pending.
+        `partially_refunded` counts as paid (a partial refund implies the order was paid): the order stays eligible
+        and total_price is the NET collected value (see shopify_net_total). Only a full `refunded` is suppressed.
         """
         order_id = str(payload.get("id") or payload.get("order_number") or "")
         financial_status = (payload.get("financial_status") or "").lower()
@@ -172,10 +231,10 @@ class OrderWebhookProcessor:
         is_cod = any(is_cod_gateway(g) for g in gateways)
         
         # Shopify 'fulfilled' = handed to the courier (shipped), NOT delivered.
-        is_paid = financial_status == "paid"
+        is_paid = financial_status in ("paid", "partially_refunded")
         if payload.get("cancelled_at"):
             effective_status = "cancelled"
-        elif financial_status in ("refunded", "partially_refunded"):
+        elif financial_status == "refunded":
             effective_status = "refunded"
         elif financial_status == "voided":
             effective_status = "voided"
@@ -195,7 +254,7 @@ class OrderWebhookProcessor:
         email = customer.get("email") or payload.get("email")
         phone = customer.get("phone") or (payload.get("shipping_address") or {}).get("phone")
         
-        total_price = float(payload.get("current_total_price") or payload.get("total_price") or 0.0)
+        total_price = shopify_net_total(payload)
         currency = payload.get("currency") or "EGP"
         client_details = payload.get("client_details")
         client_details = client_details if isinstance(client_details, dict) else {}
@@ -212,7 +271,10 @@ class OrderWebhookProcessor:
             # Attribution (S1-3). client_ip / user_agent are pass-through for the CAPI payload only: never stored.
             "attribution": extract_shopify_attribution(payload),
             "client_ip": sanitize_client_ip(client_details.get("browser_ip") or payload.get("browser_ip")),
-            "user_agent": sanitize_user_agent(client_details.get("user_agent"))
+            "user_agent": sanitize_user_agent(client_details.get("user_agent")),
+            # Match keys (S2-3), RAW and in-flight only: the pipeline stores their hashes, never these values.
+            "external_id": _id_str(customer.get("id")),
+            "address": _shopify_address(payload)
         }
 
     @staticmethod
@@ -248,6 +310,8 @@ class OrderWebhookProcessor:
             "attribution": None,
             "client_ip": None,
             "user_agent": None,
+            "external_id": None,
+            "address": None,
             "needs_order_context": True
         }
 
@@ -278,6 +342,8 @@ class OrderWebhookProcessor:
         phone = customer.get("mobile")
 
         amounts = data.get("amounts") or {}
+        # TODO(S2-4, Salla): no refunded/net amount is known for Salla `amounts` yet; partial refunds are not netted
+        # (statuses restored/refunded/returned are still suppressed). Verify the payload of order.refunded on a real store.
         total_price = float((amounts.get("total") or {}).get("amount") or data.get("total") or 0.0)
         currency = (amounts.get("total") or {}).get("currency") or data.get("currency") or "SAR"
 
@@ -293,7 +359,18 @@ class OrderWebhookProcessor:
             # No known way yet for a Salla app to attach attribution to an order (see storefront/salla/README.md).
             "attribution": None,
             "client_ip": None,
-            "user_agent": None
+            "user_agent": None,
+            # INFERRED Salla fields (verify on a real store): customer.id/first_name/last_name/city/country_code and
+            # shipping.address.{city,postal_code,country_code}. Missing ones are simply None.
+            "external_id": _id_str(customer.get("id")),
+            "address": {
+                "fn": customer.get("first_name"), "ln": customer.get("last_name"),
+                "ct": ((data.get("shipping") or {}).get("address") or {}).get("city") or customer.get("city"),
+                "st": None,
+                "zp": ((data.get("shipping") or {}).get("address") or {}).get("postal_code"),
+                "country": ((data.get("shipping") or {}).get("address") or {}).get("country_code")
+                           or customer.get("country_code"),
+            }
         }
 
     async def handle_order_update(
@@ -307,7 +384,8 @@ class OrderWebhookProcessor:
     ) -> Dict[str, Any]:
         """
         Ingests the platform webhook, applies Rule D-005, and dispatches the custom 'DeliveredPurchase'
-        to Meta CAPI if eligible. Platforms: "shopify" (orders/*), "shopify_fulfillment"
+        to Meta CAPI if eligible. LEGACY STATELESS PATH: no settlement window, no placed-time event_time/cutoff and no
+        stored checkout context; the persistent order_pipeline.process_webhook is the production path. Platforms: "shopify" (orders/*), "shopify_fulfillment"
         (fulfillments/update), "salla".
 
         order_context: for "shopify_fulfillment" only. The stored order (keys total_price, currency,
@@ -343,7 +421,8 @@ class OrderWebhookProcessor:
             fbp=(parsed.get("attribution") or {}).get("fbp"),
             fbc=(parsed.get("attribution") or {}).get("fbc"),
             client_ip=parsed.get("client_ip"),
-            user_agent=parsed.get("user_agent")
+            user_agent=parsed.get("user_agent"),
+            match_hashes=match_hashes_from_parsed(parsed)
         )
 
         if decision["action"] == "READY_TO_EMIT" and pixel_id and access_token:

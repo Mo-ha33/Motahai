@@ -1,4 +1,9 @@
-"""Shared fixtures: in-memory SQLite DB, Fernet key, tenants."""
+"""
+Shared fixtures: in-memory SQLite DB, Fernet key, tenants.
+
+shadow_tenant / live_tenant use settlement_hours=0 so an eligible order is dispatched in-line (the pre-S2 "send at
+once" behavior the older tests assert). tests/test_s2_engine.py builds default-settlement (12h) tenants itself.
+"""
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -27,12 +32,12 @@ def fernet_key(monkeypatch):
 @pytest.fixture
 def shadow_tenant(db_session):
     return create_tenant(db_session, name="Shadow Shop", platform="shopify", shop_domain="shadow.myshopify.com",
-                         meta_dataset_id="111")
+                         meta_dataset_id="111", settlement_hours=0)
 
 
 @pytest.fixture
 def live_tenant(db_session, fernet_key):
     tenant = create_tenant(db_session, name="Live Shop", platform="shopify", shop_domain="live.myshopify.com",
-                           meta_dataset_id="222", mode="live")
+                           meta_dataset_id="222", mode="live", settlement_hours=0)
     store_credential(db_session, tenant.id, "meta_capi_token", "SECRET-META-TOKEN-123")
     return tenant

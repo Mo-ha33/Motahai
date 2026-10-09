@@ -9,7 +9,9 @@ webhook payloads are never stored (only their SHA-256). Credentials live encrypt
 
 All timestamps are timezone-aware UTC. SQLite drops tzinfo on read, so UTCDateTime restores it.
 
-Schema is created with create_all() for now.
+Schema is created with create_all() for now. NOTE: create_all() never ALTERs an existing table, so the S2 columns
+(orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
+storefront_url) and the new checkout_context table need an Alembic migration before any non-empty database is upgraded.
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
@@ -32,7 +34,8 @@ DEFAULT_DATABASE_URL = "sqlite:///./motahai.db"
 
 PLATFORMS = ("shopify", "salla", "zid")
 TENANT_MODES = ("shadow", "live")
-CAPI_STATUSES = ("pending", "sent", "failed", "shadow", "stale")
+# scheduled = eligible, waiting for its settlement window (due_at); late_delivery = past the placed+6.5d cutoff, never sent.
+CAPI_STATUSES = ("pending", "scheduled", "sent", "failed", "shadow", "stale", "late_delivery")
 STATUS_SOURCES = ("webhook", "sweep", "manual")
 
 
@@ -81,6 +84,10 @@ class Tenant(Base):
     timezone: Mapped[str] = mapped_column(String(64), default="Africa/Cairo")
     mode: Mapped[str] = mapped_column(String(8), default="shadow")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # S2-1: hours between an order becoming delivered/paid and its CAPI send (NULL = order_pipeline default, 12h).
+    settlement_hours: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # S2-3: public storefront URL for event_source_url (NULL: Shopify falls back to https://<shop_domain>/).
+    storefront_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:
@@ -130,6 +137,16 @@ class Order(Base):
     # Customer identifiers: SHA-256 hex only. Raw email/phone are never stored.
     email_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     phone_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # S2-3 match keys, SHA-256 hex only (Meta-normalized before hashing). Column name is f"{key}_hash".
+    external_id_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    fn_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ln_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ct_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    st_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    zp_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    country_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # S2-1: when we FIRST saw the order delivered (COD) / paid (prepaid). Starts the settlement window.
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
 
@@ -154,8 +171,11 @@ class CapiEvent(Base):
     __tablename__ = "capi_events"
     __table_args__ = (
         UniqueConstraint("tenant_id", "order_id", "event_name", name="uq_capi_events_idempotency"),
-        CheckConstraint("status IN ('pending', 'sent', 'failed', 'shadow', 'stale')", name="ck_capi_events_status"),
+        CheckConstraint(
+            "status IN ('pending', 'scheduled', 'sent', 'failed', 'shadow', 'stale', 'late_delivery')",
+            name="ck_capi_events_status"),
         Index("ix_capi_events_status_created", "status", "created_at"),  # retry sweep
+        Index("ix_capi_events_status_due", "status", "due_at"),  # send_due_events
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -171,6 +191,30 @@ class CapiEvent(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     sent_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # S2-1: a `scheduled` row is sent once due_at has passed.
+    due_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # When a scheduled/failed row was last claimed for sending (orphan detection uses this, not created_at).
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # Comma-separated send-time data-quality flags, e.g. "missing_user_agent,missing_event_source_url" (see capi_service).
+    quality_flags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class CheckoutContext(Base):
+    """
+    D-006: the checkout client IP and user agent, Fernet-encrypted (credentials.encrypt_value), kept only until the
+    conversion is successfully sent live or expires_at (captured_at + 14 days), whichever comes first. Never plaintext.
+    """
+    __tablename__ = "checkout_context"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), unique=True)
+    ip_ciphertext: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ua_ciphertext: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime, index=True)
+
+    def __repr__(self) -> str:
+        return f"CheckoutContext(id={self.id!r}, order_id={self.order_id!r})"  # no ciphertext in reprs
 
 
 class WebhookDelivery(Base):
@@ -315,16 +359,23 @@ def create_tenant(
     currency: str = "EGP",
     timezone: str = "Africa/Cairo",
     mode: str = "shadow",
-    active: bool = True
+    active: bool = True,
+    settlement_hours: Optional[float] = None,
+    storefront_url: Optional[str] = None
 ) -> Tenant:
     """Creates and commits a tenant. New tenants default to shadow mode (no Meta calls) until flipped to live."""
     if platform not in PLATFORMS:
         raise ValueError(f"platform must be one of {PLATFORMS}")
     if mode not in TENANT_MODES:
         raise ValueError(f"mode must be one of {TENANT_MODES}")
+    if settlement_hours is not None and settlement_hours < 0:
+        raise ValueError("settlement_hours must be >= 0")
+    if storefront_url is not None and not storefront_url.strip().lower().startswith(("http://", "https://")):
+        raise ValueError("storefront_url must start with http:// or https://")
     tenant = Tenant(
         name=name, platform=platform, shop_domain=_norm_domain(shop_domain), meta_dataset_id=meta_dataset_id,
-        country=country.upper(), currency=currency.upper(), timezone=timezone, mode=mode, active=active
+        country=country.upper(), currency=currency.upper(), timezone=timezone, mode=mode, active=active,
+        settlement_hours=settlement_hours, storefront_url=storefront_url.strip() if storefront_url else None
     )
     session.add(tenant)
     session.commit()

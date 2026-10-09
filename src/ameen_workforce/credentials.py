@@ -3,6 +3,8 @@ credentials.py — Fernet-encrypted per-tenant secret storage (Meta CAPI token, 
 
 * Key: env MOTAHAI_FERNET_KEY (a Fernet key; generate with generate_key()). Missing/invalid => fail closed
   (CredentialConfigError). There is no plaintext fallback.
+* encrypt_value / decrypt_value expose the same Fernet machinery for other encrypted-at-rest data
+  (e.g. checkout_context IP/UA, D-006).
 * Plaintext is returned only by get_credential(); it is never logged, never put in exception messages, and
   never appears in a model repr. No HTTP route may return it.
 """
@@ -46,6 +48,20 @@ def _fernet() -> Fernet:
         raise CredentialConfigError(f"{FERNET_KEY_ENV} is not a valid Fernet key") from None
 
 
+def encrypt_value(plaintext: str) -> str:
+    """Fernet-encrypts `plaintext` with MOTAHAI_FERNET_KEY. Fails closed (CredentialConfigError) without a valid key."""
+    return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+
+
+def decrypt_value(ciphertext: str) -> str:
+    """Inverse of encrypt_value. Raises CredentialError (no secret material in the message) if it cannot be decrypted."""
+    fernet = _fernet()
+    try:
+        return fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+    except InvalidToken:
+        raise CredentialError("value cannot be decrypted (wrong key?)") from None
+
+
 def store_credential(
     session: Session,
     tenant_id: int,
@@ -56,7 +72,7 @@ def store_credential(
     """Encrypts and upserts the (tenant, kind) credential and commits. Returns the credential id (never the secret)."""
     if not plaintext:
         raise CredentialError("empty credential")
-    ciphertext = _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+    ciphertext = encrypt_value(plaintext)
     row = session.scalar(select(Credential).where(Credential.tenant_id == tenant_id, Credential.kind == kind))
     if row is None:
         row = Credential(tenant_id=tenant_id, kind=kind, ciphertext=ciphertext, expires_at=expires_at)

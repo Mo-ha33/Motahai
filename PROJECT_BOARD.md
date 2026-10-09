@@ -41,16 +41,17 @@
 | S1-2 | Webhook HTTP routes + Shopify HMAC / Salla signature verification | Sonnet 5.5 | P0 | DONE | webhook, security | Committed with S1-3. Follow-ups: rate-limit/prune bad-signature rows; verify Salla signature + merchant field on a real delivery. (updated 2026-10-09 21:59) |
 | S1-3 | Checkout capture: UTMs, ad_id, fbp/fbc/ttclid/ScCid + client_details into CAPI payload | Sonnet 5.5 | P0 | DONE | capi, attribution | Committed with S1-2. Verify _mt_ attrs reach note_attributes on a dev store; Salla attribution gap. (updated 2026-10-09 21:59) |
 | S1-4 | Sunday digest generator (reports/weekly_digest.py) | Sonnet 5.5 | P1 | BACKLOG | reporting | Sprint S1 step 4. Implements TASK-031. |
-| S1-5 | Scheduler + churn early-warning checks (unread digests, token expiry/Meta 190, webhook failures, 48h silence) | Haiku 5.5 | P1 | BACKLOG | monitoring, cron | Sprint S1 step 4. See TASK-030. |
+| S1-5 | Scheduler + churn early-warning checks (unread digests, token expiry/Meta 190, webhook failures, 48h silence) | Haiku 5.5 | P1 | IN_PROGRESS | monitoring, cron | S2 wave 2 dispatched 2026-10-10. (updated 2026-10-09 22:21) |
 | S1-6 | Platform API lookups (TikTok/Snap macros, Meta partner sharing, Shopify/Salla webhooks, WhatsApp templates) | Haiku 5.5 | P1 | DONE | research, integrations | docs/research/S1-6_platform_lookups.md; open: custom-event optimization unconfirmed, Salla signature/COD enum inferred. (updated 2026-10-09 21:06) |
 | S1-7 | Board hygiene | Haiku 5.5 | P2 | DONE | board, hygiene | Review 2026-10-09 board update. |
-| S2-1 | event_time = order placed, settlement window, late_delivery terminal state | Sonnet 5.5 | P0 | IN_PROGRESS | cod, capi, d005 | Today event_time = delivery time (attribution loss). Wave 1, agent A. |
-| S2-2 | ConfirmedOrder event + confirmation sources (Shopify tag, Salla status, WhatsApp, manual) | Sonnet 5.5 | P0 | BACKLOG | cod, capi, d005 | Primary optimization signal. Wave 2 (after S2-1/S2-3; sources from S2 lookups). |
-| S2-3 | Match keys: encrypted checkout IP/UA (D-006), event_source_url, external_id, hashed fn/ln/ct/country/zp | Sonnet 5.5 | P0 | IN_PROGRESS | capi, emq | Delayed sends currently lack IP/UA. Wave 1, agent A. |
-| S2-4 | partially_refunded -> DeliveredPurchase with net collected value | Sonnet 5.5 | P0 | IN_PROGRESS | cod, capi, bug | Currently suppressed (bug). Wave 1, agent A. |
-| S2-5 | Courier fallback: aggregator tracking (OTO/Torod), Bosta webhook, remittance CSV import | Sonnet 5.5 | P1 | BACKLOG | cod, couriers | Wave 2, after S2 lookups. |
-| S2-6 | Refuser exclusion + delivered-buyer seed audience CSV exports | Haiku 5.5 | P1 | IN_PROGRESS | audiences, retention | Per merchant only (no cross-merchant list). Wave 1, agent B. |
-| S2-7 | Pilot validation plan: required CAPI fields, custom-conversion optimization, ROAS bidding, A/B test | Haiku 5.5 | P1 | IN_PROGRESS | research, pilot | Wave 1, agent C (with courier + confirmation lookups). |
+| S2-1 | event_time = order placed, settlement window, late_delivery terminal state | Sonnet 5.5 | P0 | DONE | cod, capi, d005 | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
+| S2-2 | ConfirmedOrder event + confirmation sources (Shopify tag, Salla status, WhatsApp, manual) | Sonnet 5.5 | P0 | IN_PROGRESS | cod, capi, d005 | S2 wave 2 dispatched 2026-10-10. (updated 2026-10-09 22:21) |
+| S2-3 | Match keys: encrypted checkout IP/UA (D-006), event_source_url, external_id, hashed fn/ln/ct/country/zp | Sonnet 5.5 | P0 | DONE | capi, emq | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
+| S2-4 | partially_refunded -> DeliveredPurchase with net collected value | Sonnet 5.5 | P0 | DONE | cod, capi, bug | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
+| S2-5 | Courier fallback: aggregator tracking (OTO/Torod), Bosta webhook, remittance CSV import | Sonnet 5.5 | P1 | IN_PROGRESS | cod, couriers | S2 wave 2 dispatched 2026-10-10. (updated 2026-10-09 22:21) |
+| S2-6 | Refuser exclusion + delivered-buyer seed audience CSV exports | Haiku 5.5 | P1 | DONE | audiences, retention | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
+| S2-7 | Pilot validation plan: required CAPI fields, custom-conversion optimization, ROAS bidding, A/B test | Haiku 5.5 | P1 | DONE | research, pilot | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
+| S2-8 | Thank-you page capture (Salla App Snippet + Shopify checkout_completed): order_id + UA + IP + fbp/fbc → Core | Sonnet 5.5 | P1 | IN_PROGRESS | capture, salla, emq | Salla webhooks carry no UA/IP; Meta requires client_user_agent for website events. Wave 2. Also: handle_order_update made decision-only. |
 | S1-8 | Ed25519 asymmetric HITL signing + user separation | Sonnet 5.5 | P1 | BACKLOG | hitl, security | MCP server holds only the public key; issuing service runs as a separate Linux user, so an agent with shell on the VPS (hermes_run_task) cannot mint D-003 tokens. |
 
 ---

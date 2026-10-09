@@ -20,13 +20,15 @@ from src.ameen_workforce.order_pipeline import process_webhook, retry_failed_eve
 
 EMAIL = "Private.Customer@example.com"
 PHONE = "01012345678"
+# Placed shortly before the test runs: a fixed date would eventually fall past the placed+6.5d send cutoff.
+PLACED_AT = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
 
 def shopify_order(**overrides):
     order = {
         "id": 987654321, "financial_status": "pending", "fulfillment_status": None,
         "payment_gateway_names": ["Cash on Delivery (COD)"], "total_price": "850.00", "currency": "EGP",
-        "created_at": "2026-10-09T10:00:00+02:00",
+        "created_at": PLACED_AT,
         "customer": {"email": EMAIL, "phone": PHONE},
     }
     order.update(overrides)
@@ -147,7 +149,7 @@ async def test_live_tenant_uses_encrypted_token_and_records_fbtrace(db_session, 
 @pytest.mark.asyncio
 async def test_live_tenant_without_token_fails_without_calling_meta(db_session, fernet_key):
     tenant = create_tenant(db_session, name="NoTok", platform="shopify", shop_domain="notok.myshopify.com",
-                           meta_dataset_id="333", mode="live")
+                           meta_dataset_id="333", mode="live", settlement_hours=0)
     sender = FakeSender()
     res = await deliver(db_session, tenant, shopify_order(**DELIVERED), sender)
     assert res["action"] == "FAILED"
@@ -224,7 +226,7 @@ async def test_retry_picks_up_orphaned_pending_claim(db_session, live_tenant):
     await deliver(db_session, live_tenant, shopify_order(**DELIVERED), sender)
     event = events(db_session)[0]
     event.status, event.sent_at, event.attempts = "pending", None, 0
-    event.created_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    event.created_at = event.claimed_at = datetime.now(timezone.utc) - timedelta(hours=1)
     db_session.commit()
     counts = await retry_failed_events(db_session, sender=sender)
     assert counts["sent"] == 1
@@ -244,7 +246,7 @@ async def test_retry_only_loads_failed_or_orphaned_rows(db_session, live_tenant)
     assert sorted(e.status for e in events(db_session)) == ["failed", "sent", "sent", "sent", "sent", "sent", "stale"]
     sender.calls.clear()
     counts = await retry_failed_events(db_session, sender=sender)
-    assert counts == {"retried": 1, "sent": 1, "failed": 0, "stale": 0, "skipped": 0}
+    assert counts == {"retried": 1, "sent": 1, "failed": 0, "stale": 0, "late_delivery": 0, "skipped": 0}
     assert len(sender.calls) == 1 and sender.calls[0]["payload"]["data"][0]["event_id"] == "delivered_11"
 
 

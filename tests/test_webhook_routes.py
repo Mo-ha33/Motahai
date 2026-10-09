@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,13 +25,15 @@ SALLA_SECRET = "salla_TEST_WEBHOOK_SECRET_do_not_log"
 EMAIL = "Private.Customer@example.com"
 PHONE = "01012345678"
 SALLA_MERCHANT = 1234567
+# Placed shortly before the test runs: a fixed date would eventually fall past the placed+6.5d send cutoff.
+PLACED_AT = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
 
 
 def shopify_order(**overrides):
     order = {
         "id": 987654321, "financial_status": "paid", "fulfillment_status": "fulfilled",
         "payment_gateway_names": ["Cash on Delivery (COD)"], "total_price": "850.00", "currency": "EGP",
-        "created_at": "2026-10-09T10:00:00+02:00", "customer": {"email": EMAIL, "phone": PHONE},
+        "created_at": PLACED_AT, "customer": {"email": EMAIL, "phone": PHONE},
     }
     order.update(overrides)
     return order
