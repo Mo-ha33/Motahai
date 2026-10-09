@@ -54,6 +54,7 @@ def is_stale_event_time(event_time: int, now: Optional[float] = None) -> bool:
     return age > MAX_EVENT_AGE_SECONDS or age < -MAX_EVENT_FUTURE_SECONDS
 
 COUNTRY_BY_CURRENCY = {"EGP": "EG", "SAR": "SA"}
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 def normalize_phone(phone: Optional[str], default_country: str = "EG") -> Optional[str]:
     """Normalizes phone to digits-only E.164 representation before hashing."""
@@ -71,6 +72,27 @@ def normalize_phone(phone: Optional[str], default_country: str = "EG") -> Option
         # Saudi mobile written without the trunk zero or country code (5XXXXXXXX)
         digits = "966" + digits
     return digits
+
+def hash_email(email: Optional[str]) -> Optional[str]:
+    """SHA-256 of the normalized (trimmed, lower-cased) email, or None. Safe to store; the raw email is not."""
+    return hash_sha256(email)
+
+def hash_phone(phone: Optional[str], currency: Optional[str] = None, country: Optional[str] = None) -> Optional[str]:
+    """
+    SHA-256 of the normalized phone, or None. The default country comes from the currency when it is
+    mapped (same rule as build_event_payload), else from `country`, else EG. Safe to store.
+    """
+    if not phone:
+        return None
+    default_country = COUNTRY_BY_CURRENCY.get((currency or "").upper()) or (country or "EG").upper()
+    return hash_sha256(normalize_phone(phone, default_country))
+
+def _validated_hash(value: str, field: str) -> str:
+    """Pre-hashed values must already be a SHA-256 hex digest; anything else would be double-hashed or invalid."""
+    cleaned = str(value).strip().lower()
+    if not _SHA256_HEX.match(cleaned):
+        raise ValueError(f"{field} must be a 64-char SHA-256 hex digest (already hashed); got an unhashed value")
+    return cleaned
 
 class MetaCAPISender:
     def __init__(self, pixel_id: Optional[str] = None, access_token: Optional[str] = None):
@@ -91,11 +113,15 @@ class MetaCAPISender:
         client_ip: Optional[str] = None,
         user_agent: Optional[str] = None,
         test_event_code: Optional[str] = None,
-        event_time: Optional[int] = None
+        event_time: Optional[int] = None,
+        email_hash: Optional[str] = None,
+        phone_hash: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Builds a compliant Meta Conversions API JSON payload.
         Ensures Zero-PII by hashing email and phone with SHA-256.
+        email_hash / phone_hash accept values that are ALREADY hashed (e.g. read back from storage, where only
+        hashes are kept); they are used as-is (never re-hashed) and win over the raw email / phone.
         event_time (unix seconds) defaults to now; an explicit value older than 7 days (or >10 min ahead) raises ValueError
         because Meta would reject the whole request.
         """
@@ -104,9 +130,13 @@ class MetaCAPISender:
         elif is_stale_event_time(event_time):
             raise ValueError("event_time is older than 7 days or in the future; Meta rejects the whole request")
         user_data: Dict[str, Any] = {}
-        if email:
+        if email_hash:
+            user_data["em"] = [_validated_hash(email_hash, "email_hash")]
+        elif email:
             user_data["em"] = [hash_sha256(email)]
-        if phone:
+        if phone_hash:
+            user_data["ph"] = [_validated_hash(phone_hash, "phone_hash")]
+        elif phone:
             default_country = COUNTRY_BY_CURRENCY.get(currency.upper(), "EG")
             user_data["ph"] = [hash_sha256(normalize_phone(phone, default_country))]
         if fbp:
@@ -190,7 +220,11 @@ class MetaCAPISender:
         email: Optional[str] = None,
         phone: Optional[str] = None,
         test_event_code: Optional[str] = None,
-        event_time: Optional[int] = None
+        event_time: Optional[int] = None,
+        email_hash: Optional[str] = None,
+        phone_hash: Optional[str] = None,
+        fbp: Optional[str] = None,
+        fbc: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Implements Rule D-005 (Coexist): decides whether to send the custom 'DeliveredPurchase'.
@@ -242,8 +276,12 @@ class MetaCAPISender:
             currency=currency,
             email=email,
             phone=phone,
+            fbp=fbp,
+            fbc=fbc,
             test_event_code=test_event_code,
-            event_time=event_time
+            event_time=event_time,
+            email_hash=email_hash,
+            phone_hash=phone_hash
         )
 
         return {

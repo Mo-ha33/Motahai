@@ -14,8 +14,9 @@ Shopify delivery signals:
   mark orders paid at creation; paid but unfulfilled COD is `paid_unfulfilled` and held.
 - fulfillments/update topic (parse_shopify_fulfillment): `shipment_status == "delivered"`. This payload
   carries `order_id` but NOT order value/currency/customer, so it cannot be emitted on its own.
-  TODO(S1-1): the persistence layer will store orders and join the fulfillment to its stored order
-  (passed to handle_order_update as `order_context`); until then the decision is NEEDS_ORDER_CONTEXT.
+  The persistent path (order_pipeline.process_webhook, S1-1) joins the fulfillment to its stored order;
+  the stateless handle_order_update path takes the stored order as `order_context` and otherwise
+  yields NEEDS_ORDER_CONTEXT.
 """
 
 import logging
@@ -42,6 +43,35 @@ def is_cod_gateway(name: Any) -> bool:
     """
     text = str(name).strip().lower()
     return any(phrase in text for phrase in COD_PHRASES) or bool(COD_TOKEN.search(text))
+
+def fulfillment_context_decision(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    D-005 decision for a parsed fulfillments/update record that has NO order context (value/currency/customer).
+    Nothing can be emitted from it: delivered -> NEEDS_ORDER_CONTEXT, cancelled/failed -> SUPPRESSED,
+    anything else -> DEFERRED. Shared by the stateless handler and the persistent order pipeline.
+    """
+    if parsed["status"] == "delivered":
+        return {
+            "action": "NEEDS_ORDER_CONTEXT",
+            "reason": "Rule D-005: fulfillment is delivered but the payload has no order value/currency. "
+                      "Join it to the stored order (S1-1) before emitting DeliveredPurchase.",
+            "order_id": parsed["order_id"],
+            "current_status": parsed["status"]
+        }
+    if parsed["status"] in ("cancelled", "failed_delivery"):
+        return {
+            "action": "SUPPRESSED",
+            "reason": "Rule D-005: fulfillment cancelled or delivery failed. No conversion is sent.",
+            "order_id": parsed["order_id"],
+            "current_status": parsed["status"]
+        }
+    return {
+        "action": "DEFERRED",
+        "reason": "Rule D-005: fulfillment not delivered yet. Conversion held until delivery.",
+        "order_id": parsed["order_id"],
+        "current_status": parsed["status"],
+        "held_event": "DeliveredPurchase"
+    }
 
 class OrderWebhookProcessor:
     @staticmethod
@@ -204,29 +234,7 @@ class OrderWebhookProcessor:
 
         if parsed.get("needs_order_context"):
             # Fulfillment-only record: nothing can be emitted without the order's value/currency.
-            if parsed["status"] == "delivered":
-                decision = {
-                    "action": "NEEDS_ORDER_CONTEXT",
-                    "reason": "Rule D-005: fulfillment is delivered but the payload has no order value/currency. "
-                              "Join it to the stored order (S1-1) before emitting DeliveredPurchase.",
-                    "order_id": parsed["order_id"],
-                    "current_status": parsed["status"]
-                }
-            elif parsed["status"] in ("cancelled", "failed_delivery"):
-                decision = {
-                    "action": "SUPPRESSED",
-                    "reason": "Rule D-005: fulfillment cancelled or delivery failed. No conversion is sent.",
-                    "order_id": parsed["order_id"],
-                    "current_status": parsed["status"]
-                }
-            else:
-                decision = {
-                    "action": "DEFERRED",
-                    "reason": "Rule D-005: fulfillment not delivered yet. Conversion held until delivery.",
-                    "order_id": parsed["order_id"],
-                    "current_status": parsed["status"],
-                    "held_event": "DeliveredPurchase"
-                }
+            decision = fulfillment_context_decision(parsed)
             return {"status": "processed", "parsed_order": parsed, "d005_decision": decision}
 
         decision = capi_sender.process_cod_order_event(
