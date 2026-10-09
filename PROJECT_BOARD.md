@@ -24,10 +24,10 @@
 | TASK_ID | Title | Assignee | Priority | Status | Tags | Notes |
 | :--- | :--- | :--- | :---: | :---: | :--- | :--- |
 | TASK-001 | Pin httpx<0.28.0 & verify 68 of 68 tests pass | Haiku 5.5 | P0 | DONE | test, env | Fixed Starlette TestClient bug; 68/68 tests pass in 7.57s |
-| TASK-002 | Reconcile GCP Project ID and Service Account email | Gemini 3.8 | P0 | IN_PROGRESS | gcp, security, docs | Standardize agentic-ai-494313 across code and docs |
-| TASK-003 | Enforce HITL approval gate on live GTM publish | Sonnet 5.5 | P0 | BACKLOG | hitl, gtm, safety | D-003 compliance: live deploy requires explicit token |
-| TASK-004 | Remove fake-HTML fallback in browser_service.py | Haiku 5.5 | P0 | BACKLOG | audit, accuracy | Ensure failed site fetches report honest ERROR status |
-| TASK-005 | Label canned metrics in workflow_engine as simulated | Haiku 5.5 | P0 | BACKLOG | telemetry, honesty | Mark simulated: true on mock CAPI parity & ROAS |
+| TASK-002 | Reconcile GCP Project ID and Service Account email | Gemini 3.8 | P0 | DONE | gcp, security, docs | Standardized service account email to tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com (updated 2026-10-09 20:31) |
+| TASK-003 | Enforce HITL approval gate on live GTM publish | Sonnet 5.5 | P0 | DONE | hitl, gtm, safety | Enforced Rule D-003: hermes_gtm_cloud_publish halts and requires hitl_approval_token (updated 2026-10-09 20:34) |
+| TASK-004 | Remove fake-HTML fallback in browser_service.py | Haiku 5.5 | P0 | DONE | audit, accuracy | Removed fake HTML fallback; failed site fetches now report explicit ERROR (updated 2026-10-09 20:33) |
+| TASK-005 | Label canned metrics in workflow_engine as simulated | Haiku 5.5 | P0 | DONE | telemetry, honesty | Labeled mock CAPI parity and ROAS metrics as simulated: True (updated 2026-10-09 20:34) |
 | TASK-010 | Tracking Asset Matrix & Client Delivery Sheet | Sonnet 5.5 | P0 | BACKLOG | core, tariq, sheet | Intake assets, organize credentials, deliver clean sheet |
 | TASK-011 | Frictionless 1-Click Client Onboarding Flow | Sonnet 5.5 | P0 | BACKLOG | ux, onboarding | Shopify collaborator & 1-click Google service invite |
 | TASK-020 | Production Meta CAPI Sender (graph.facebook.com) | Sonnet 5.5 | P0 | BACKLOG | capi, meta, core | Real server-side CAPI sender with retry & SHA-256 |

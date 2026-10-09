@@ -46,9 +46,25 @@ class BrowserSnifferService:
                 html = res.text
                 status_code = res.status_code
         except Exception as e:
-            logger.warning("Direct fetch failed for %s: %s. Using simulated fallback response.", url, e)
-            html = "<html><head><title>Simulated Store</title><script>gtag('consent', 'default', {'ad_storage': 'denied', 'analytics_storage': 'denied'});</script></head><body><h1>Ameen Store</h1></body></html>"
-            status_code = 200
+            logger.error("Direct fetch failed for %s: %s", url, e)
+            elapsed_ms = round((time.time() - start_time) * 1000, 2)
+            return {
+                "target_url": url,
+                "http_status": 0,
+                "error": f"Direct fetch failed: {str(e)}",
+                "scan_latency_ms": elapsed_ms,
+                "detected_gtm_containers": [],
+                "detected_ga4_ids": [],
+                "detected_meta_pixels": [],
+                "consent_mode_v2_active": False,
+                "pdpl_151_2020_compliance": "FAIL",
+                "pii_violations": [f"Site unreachable: {str(e)}"],
+                "scorecard": {
+                    "privacy_score": 0,
+                    "tracking_integrity": 0,
+                    "overall_grade": "F (UNREACHABLE)"
+                }
+            }
 
         # 1. Detect GTM Containers
         gtm_containers = re.findall(r"GTM-[A-Z0-9]+", html)

@@ -119,12 +119,14 @@ class WorkforceEngine:
         """Pixel & CAPI Specialist: Checks Meta Pixel vs CAPI event_id deduplication."""
         return {
             "workflow": WorkflowGoal.DOUBLE_FIRE_CAPI_CHECK.value,
+            "simulated": True,
+            "provenance": "benchmark_simulation",
             "browser_pixel_events": 150,
             "server_capi_events": 148,
             "deduplication_match_rate": "98.7%",
             "event_id_collision_detected": False,
             "double_fires_detected": 0,
-            "summary": "Meta CAPI & Browser Pixel parity verified at 98.7% match with zero double-fires."
+            "summary": "Meta CAPI & Browser Pixel parity verified at 98.7% match with zero double-fires (Benchmark Simulation)."
         }
 
     async def _run_autonomous_tracking_audit(self, task: TaskItem) -> Dict[str, Any]:
@@ -157,7 +159,9 @@ class WorkforceEngine:
             "funnel_conversion_rate": "3.4%",
             "roas_lift_identified": "+18.2%",
             "top_dropoff_step": "payment_gateway_redirect",
-            "summary": "GA4 funnel analysis completed with +18.2% ROAS opportunity identified."
+            "simulated": True,
+            "provenance": "benchmark_simulation",
+            "summary": "GA4 funnel analysis completed with +18.2% ROAS opportunity identified (Benchmark Simulation)."
         }
 
     async def _run_general_client_service(self, task: TaskItem) -> Dict[str, Any]:
