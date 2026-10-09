@@ -38,11 +38,10 @@ DELIVERED_EVENT_NAME = "DeliveredPurchase"
 CONFIRMED_EVENT_NAME = "ConfirmedOrder"
 # Statuses that mean revenue is real: COD cash collected / delivered, or prepaid and paid.
 CONVERTING_STATUSES = frozenset({"delivered", "paid"})
-# Statuses that indicate customer confirmation (call, WhatsApp bot, or merchant tag/status)
-CONFIRMED_STATUSES = frozenset({
-    "confirmed", "in_review", "under_review",
-    "مؤكد", "قيد المراجعة", "تحت المراجعة"
-})
+# ConfirmedOrder eligibility is decided per tenant by confirmation.py (merchant tags, merchant-configured statuses,
+# implicit shipped/paid), NOT by a global status list. Salla `in_review` / `under_review` mean the order is still
+# AWAITING review (before confirmation) and are deliberately not confirmation signals. Kept empty for compatibility.
+CONFIRMED_STATUSES: frozenset = frozenset()
 # Meta rejects the WHOLE request if any event_time is older than 7 days.
 MAX_EVENT_AGE_SECONDS = 7 * 24 * 3600
 MAX_EVENT_FUTURE_SECONDS = 10 * 60
@@ -61,7 +60,8 @@ class EventType:
     """
     One CAPI event kind on the D-005 signal ladder. Event name/id/eligibility live here (not as scattered string
     literals).
-    - Step 2: ConfirmedOrder (S2-2) -> Fired when customer confirms via call, WhatsApp bot, or merchant tag.
+    - Step 2: ConfirmedOrder (S2-2) -> Fired when the order is genuinely confirmed (merchant tag, configured status,
+      shipped/paid, or manual call/WhatsApp confirmation); never for orders merely awaiting review.
     - Step 3: DeliveredPurchase (S2-1) -> Fired when delivered & cash collected.
     """
     name: str

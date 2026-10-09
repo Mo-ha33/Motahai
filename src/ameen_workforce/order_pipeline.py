@@ -43,12 +43,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .capi_service import (
-    CONFIRMED_EVENT, CONFIRMED_EVENT_NAME, CONFIRMED_STATUSES, DELIVERED_EVENT, DELIVERED_EVENT_NAME,
+    CONFIRMED_EVENT, CONFIRMED_EVENT_NAME, DELIVERED_EVENT, DELIVERED_EVENT_NAME,
     EVENT_TYPES, LATE_DELIVERY_CUTOFF, MATCH_KEYS, NON_REVENUE_STATUSES, EventType, capi_sender, hash_email, hash_phone,
     quality_flags_for
 )
 from .checkout_context import (  # noqa: F401  (purge_expired_checkout_context is re-exported for the scheduler)
     capture_checkout_context, load_checkout_context, purge_checkout_context, purge_expired_checkout_context
+)
+from .confirmation import (
+    SOURCE_IMPLICIT_SHIPPED, SOURCE_MANUAL, effective_confirmation_rules
 )
 from .credentials import CredentialError, get_credential
 from .db import CapiEvent, Order, OrderStatusEvent, Tenant, WebhookDelivery, utcnow
@@ -78,13 +81,14 @@ def payload_sha256(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _parse(platform: str, topic: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _parse(platform: str, topic: str, payload: Dict[str, Any],
+           rules: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     if platform == "shopify" and topic.startswith("fulfillments/"):
         return OrderWebhookProcessor.parse_shopify_fulfillment(payload)
     if platform == "shopify":
-        return OrderWebhookProcessor.parse_shopify_order(payload)
+        return OrderWebhookProcessor.parse_shopify_order(payload, rules)
     if platform == "salla":
-        return OrderWebhookProcessor.parse_salla_order(payload)
+        return OrderWebhookProcessor.parse_salla_order(payload, rules)
     if platform in ("bosta", "courier_bosta"):
         return OrderWebhookProcessor.parse_bosta_delivery(payload)
     if platform in ("oto", "courier_oto"):
@@ -200,7 +204,7 @@ def _decide(session: Session, sender, tenant: Tenant, order: Order, now: datetim
             else:
                 event_time = int(now.timestamp())
         placed_cutoff = None
-        is_conf = is_confirmed or bool(getattr(order, "confirmed_at", None) or order.current_status in CONFIRMED_STATUSES)
+        is_conf = is_confirmed or bool(getattr(order, "confirmed_at", None))
     else:
         order_val = float(order.value)
         if event_time is None:
@@ -359,7 +363,7 @@ async def process_webhook(
         if not tenant.active:
             _finish(session, delivery, False, "tenant_inactive")  # not "done": a redelivery after reactivation must run
             return _result("TENANT_INACTIVE")
-        parsed = _parse(platform, topic, payload)
+        parsed = _parse(platform, topic, payload, effective_confirmation_rules(tenant))
         if parsed is None:
             _finish(session, delivery, False, "unsupported_platform")
             return _result("UNSUPPORTED")
@@ -396,8 +400,9 @@ async def emit_confirmed_order(
     if order is None:
         return {"status": "error", "message": "order_not_found", "order_id": str(platform_order_id)}
 
-    if order.confirmed_at is None:
-        order.confirmed_at = now
+    if order.confirmed_at is None and order.current_status not in NON_REVENUE_STATUSES:
+        order.confirmed_at = now  # a cancelled/refunded/voided order is never marked confirmed
+        order.confirmation_source = SOURCE_MANUAL
         session.commit()
 
     decision = _decide(session, sender, tenant, order, now, CONFIRMED_EVENT, event_time=event_time, is_confirmed=True)
@@ -436,6 +441,21 @@ def _has_final_event(session: Session, order_id: int) -> bool:
         CapiEvent.order_id == order_id,
         CapiEvent.event_name == DELIVERED_EVENT_NAME,
         CapiEvent.status.in_(_FINAL_EVENT_STATUSES)).limit(1)) is not None
+
+
+def _confirmation_source(parsed: Dict[str, Any], new_status: str, tenant: Tenant, from_fulfillment: bool) -> Optional[str]:
+    """
+    Why THIS webhook confirms the order, or None. Order webhooks carry their own verdict (parsed["confirmation_source"],
+    from the tenant's rules). Fulfillment/courier records carry no tags or status text, so they confirm only
+    implicitly: the order is shipped/delivered (and the tenant's implicit_on_ship is on). Cancelled/refunded/voided never.
+    """
+    if new_status in NON_REVENUE_STATUSES:
+        return None
+    if not from_fulfillment:
+        return parsed.get("confirmation_source")
+    if new_status in ("shipped", "delivered") and effective_confirmation_rules(tenant)["implicit_on_ship"]:
+        return SOURCE_IMPLICIT_SHIPPED
+    return None
 
 
 async def _process_parsed(session, tenant, delivery, parsed, platform, topic, payload, digest, sender, event_time, now,
@@ -480,10 +500,12 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
         if parsed.get("is_cod") is True and not order.is_cod:
             order.is_cod = True
 
-    is_confirmed = bool(parsed.get("is_confirmed") or new_status in CONFIRMED_STATUSES)
-    if is_confirmed and getattr(order, "confirmed_at", None) is None:
+    confirmation_source = _confirmation_source(parsed, new_status, tenant, from_fulfillment)
+    is_confirmed = confirmation_source is not None
+    if is_confirmed and order.confirmed_at is None:
         platform_time = _parse_platform_time(parsed.get("updated_at")) if parsed.get("updated_at") else None
         order.confirmed_at = platform_time or now
+        order.confirmation_source = confirmation_source
 
     if new_status in DELIVERED_EVENT.converting_statuses and order.delivered_at is None:
         order.delivered_at = now  # first time we saw delivered/paid: starts the settlement window
@@ -503,8 +525,11 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
         else:
             target_event = DELIVERED_EVENT
 
-    # If the order is confirmed AND delivered, and ConfirmedOrder hasn't been emitted yet, emit ConfirmedOrder first.
-    if is_confirmed and target_event == DELIVERED_EVENT and new_status not in NON_REVENUE_STATUSES:
+    # Funnel invariant (Confirmed contains Delivered): an order that is confirmed (explicit OR implicit shipped/paid, also
+    # when first observed already delivered/paid) gets its ConfirmedOrder before the DeliveredPurchase if it has none yet.
+    # For a prepaid order payment IS the confirmation. Cancelled/refunded orders and cancellation-tagged ones never confirm.
+    if (is_confirmed or order.confirmed_at is not None) and target_event == DELIVERED_EVENT \
+            and new_status not in NON_REVENUE_STATUSES:
         has_confirmed = session.scalar(select(CapiEvent.id).where(
             CapiEvent.tenant_id == tenant.id,
             CapiEvent.order_id == order.id,
@@ -512,14 +537,8 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
         ).limit(1)) is not None
         if not has_confirmed:
             conf_time = event_time
-            if conf_time is None:
-                if parsed.get("updated_at"):
-                    pt = _parse_platform_time(parsed["updated_at"])
-                    conf_time = int(pt.timestamp()) if pt else int(now.timestamp())
-                elif order.confirmed_at:
-                    conf_time = int(order.confirmed_at.timestamp())
-                else:
-                    conf_time = int(now.timestamp())
+            if conf_time is None:  # first observation of the confirmation (confirmed_at), not the delivery time
+                conf_time = int((order.confirmed_at or now).timestamp())
             conf_decision = _decide(session, sender, tenant, order, now, CONFIRMED_EVENT, event_time=conf_time, is_confirmed=True)
             if conf_decision["action"] == "READY_TO_EMIT":
                 conf_claim = CapiEvent(

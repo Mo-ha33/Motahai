@@ -4,6 +4,7 @@ Tests status parsers, webhook authentication/signatures, order pipeline reconcil
 12-hour settlement window scheduling, and FastAPI webhook routes.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -35,12 +36,17 @@ OTO_SECRET = "oto_webhook_secret_key_test_456"
 
 
 class SpySender(MetaCAPISender):
+    """`calls` = DeliveredPurchase sends; ConfirmedOrder sends (funnel invariant) go to `confirmed_calls`; `all_calls` has both."""
     def __init__(self):
         super().__init__()
         self.calls = []
+        self.confirmed_calls = []
+        self.all_calls = []
 
     async def send_event(self, pixel_id, access_token, payload):
-        self.calls.append({"pixel_id": pixel_id, "access_token": access_token, "payload": payload})
+        call = {"pixel_id": pixel_id, "access_token": access_token, "payload": payload}
+        self.all_calls.append(call)
+        (self.calls if payload["data"][0]["event_name"] == DELIVERED_EVENT_NAME else self.confirmed_calls).append(call)
         return {"status": "success", "fbtrace_id": "TRACE_COURIER_1"}
 
 
@@ -278,7 +284,11 @@ async def test_bosta_delivery_enters_12h_settlement_window(db_session, settlemen
     assert len(sender.calls) == 0
 
     # Event exists in DB with status scheduled
-    events = db_session.scalars(select(CapiEvent).where(CapiEvent.order_id == order.id)).all()
+    all_rows = db_session.scalars(select(CapiEvent).where(CapiEvent.order_id == order.id)).all()
+    # Funnel invariant: the (shipped -> delivered) order also has its ConfirmedOrder row, sent immediately
+    assert sorted(e.event_name for e in all_rows) == ["ConfirmedOrder", DELIVERED_EVENT_NAME]
+    assert [c["payload"]["data"][0]["event_name"] for c in sender.confirmed_calls] == ["ConfirmedOrder"]
+    events = [e for e in all_rows if e.event_name == DELIVERED_EVENT_NAME]
     assert len(events) == 1
     assert events[0].status == "scheduled"
     assert events[0].event_name == DELIVERED_EVENT_NAME
@@ -340,7 +350,8 @@ async def test_courier_delivery_dispatches_after_settlement_elapsed(db_session, 
     assert call["payload"]["data"][0]["event_name"] == DELIVERED_EVENT_NAME
     assert call["payload"]["data"][0]["custom_data"]["value"] == 850.0
 
-    event = db_session.scalars(select(CapiEvent).where(CapiEvent.order_id == order.id)).one()
+    event = db_session.scalars(select(CapiEvent).where(CapiEvent.order_id == order.id,
+                                                       CapiEvent.event_name == DELIVERED_EVENT_NAME)).one()
     assert event.status == "sent"
 
 
@@ -388,7 +399,8 @@ async def test_cancellation_during_settlement_window_suppresses_conversion(db_se
     assert counts["sent"] == 0
     assert len(sender.calls) == 0  # Zero CAPI calls emitted!
 
-    event = db_session.scalars(select(CapiEvent).where(CapiEvent.order_id == order.id)).one()
+    event = db_session.scalars(select(CapiEvent).where(CapiEvent.order_id == order.id,
+                                                       CapiEvent.event_name == DELIVERED_EVENT_NAME)).one()
     assert event.status == "stale"
     assert event.error_type == "no_longer_eligible"
 
@@ -474,8 +486,13 @@ async def test_stateless_oto_with_order_context():
 
 
 # =============================================================================
-# 6. FastAPI Webhook Routes (/webhooks/bosta & /webhooks/oto)
+# 6. FastAPI Webhook Routes (/webhooks/bosta/{shop} & /webhooks/oto/{shop}) -- FX-1 tenant isolation
 # =============================================================================
+
+OTHER_BOSTA_SECRET = "bosta_other_merchant_secret_789"
+OTHER_OTO_SECRET = "oto_other_merchant_secret_012"
+SHARED_ORDER_ID = "1001"  # Salla/Shopify order numbers are per-merchant: two stores can both have #1001
+
 
 @pytest.fixture
 def client_factory(db_session):
@@ -483,80 +500,314 @@ def client_factory(db_session):
 
 
 @pytest.fixture
-def courier_client(client_factory, monkeypatch):
-    monkeypatch.setenv(webhook_routes.BOSTA_SECRET_ENV, BOSTA_SECRET)
-    monkeypatch.setenv(webhook_routes.OTO_SECRET_ENV, OTO_SECRET)
+def courier_client(client_factory):
     app.dependency_overrides[webhook_routes.get_session_factory_dep] = lambda: client_factory
     yield TestClient(app)
     app.dependency_overrides.pop(webhook_routes.get_session_factory_dep, None)
 
 
-def test_bosta_route_accepts_valid_auth(courier_client, db_session, settlement_tenant):
-    make_pending_order(db_session, settlement_tenant, order_id="ORD-API-BOSTA-1", status="shipped")
+def _make_tenant(db_session, name, platform, domain, country, currency, dataset):
+    tenant = create_tenant(db_session, name=name, platform=platform, shop_domain=domain, meta_dataset_id=dataset,
+                           mode="live", settlement_hours=12.0, country=country, currency=currency)
+    store_credential(db_session, tenant.id, "meta_capi_token", f"META-TOKEN-{dataset}")
+    return tenant
+
+
+@pytest.fixture
+def secured_settlement_tenant(db_session, settlement_tenant):
+    """Shopify/EG tenant that has configured its own Bosta secret."""
+    store_credential(db_session, settlement_tenant.id, "bosta_webhook_secret", BOSTA_SECRET)
+    return settlement_tenant
+
+
+@pytest.fixture
+def secured_oto_tenant(db_session, oto_tenant):
+    """Salla/SA tenant that has configured its own OTO secret."""
+    store_credential(db_session, oto_tenant.id, "oto_webhook_secret", OTO_SECRET)
+    return oto_tenant
+
+
+@pytest.fixture
+def two_bosta_tenants(db_session, fernet_key):
+    a = _make_tenant(db_session, "Store A", "shopify", "store-a.myshopify.com", "EG", "EGP", "DS_A")
+    b = _make_tenant(db_session, "Store B", "shopify", "store-b.myshopify.com", "EG", "EGP", "DS_B")
+    store_credential(db_session, a.id, "bosta_webhook_secret", BOSTA_SECRET)
+    store_credential(db_session, b.id, "bosta_webhook_secret", OTHER_BOSTA_SECRET)
+    return a, b
+
+
+@pytest.fixture
+def two_oto_tenants(db_session, fernet_key):
+    a = _make_tenant(db_session, "Store A", "salla", "111111", "SA", "SAR", "DS_A")
+    b = _make_tenant(db_session, "Store B", "salla", "222222", "SA", "SAR", "DS_B")
+    store_credential(db_session, a.id, "oto_webhook_secret", OTO_SECRET)
+    store_credential(db_session, b.id, "oto_webhook_secret", OTHER_OTO_SECRET)
+    return a, b
+
+
+def oto_payload(order_id, secret, status="delivered", timestamp="2026-10-10T01:00:00Z"):
+    msg = f"{order_id}:{status}:{timestamp}".encode("utf-8")
+    sig = base64.b64encode(hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).digest()).decode("ascii")
+    return {"orderId": order_id, "status": status, "timestamp": timestamp, "signature": sig}
+
+
+def bosta_headers(secret):
+    return {"Content-Type": "application/json", BOSTA_AUTH_HEADER: secret}
+
+
+def order_for(db_session, tenant, order_id):
+    db_session.expire_all()
+    return db_session.scalar(select(Order).where(Order.tenant_id == tenant.id, Order.platform_order_id == order_id))
+
+
+def events_for(db_session, tenant):
+    db_session.expire_all()
+    return db_session.scalars(select(CapiEvent).where(CapiEvent.tenant_id == tenant.id)).all()
+
+
+def delivered_events_for(db_session, tenant):
+    """DeliveredPurchase rows only (the pipeline may also hold a ConfirmedOrder row for the same order)."""
+    return [e for e in events_for(db_session, tenant) if e.event_name == DELIVERED_EVENT_NAME]
+
+
+def deliveries(db_session, platform):
+    db_session.expire_all()
+    return db_session.scalars(select(WebhookDelivery).where(WebhookDelivery.platform == platform)
+                              .order_by(WebhookDelivery.id)).all()
+
+
+# ---- happy paths -----------------------------------------------------------
+
+def test_bosta_route_accepts_valid_auth(courier_client, db_session, secured_settlement_tenant):
+    tenant = secured_settlement_tenant
+    make_pending_order(db_session, tenant, order_id="ORD-API-BOSTA-1", status="shipped")
 
     payload = {"businessReference": "ORD-API-BOSTA-1", "state": 45, "cod": 850.0}
-    headers = {
-        "Content-Type": "application/json",
-        BOSTA_AUTH_HEADER: BOSTA_SECRET,
-        "X-Shop-Domain": settlement_tenant.shop_domain
-    }
-    response = courier_client.post("/webhooks/bosta", json=payload, headers=headers)
+    response = courier_client.post(f"/webhooks/bosta/{tenant.shop_domain}", json=payload,
+                                   headers=bosta_headers(BOSTA_SECRET))
     assert response.status_code == 200
     assert response.json() == {"status": "accepted"}
+    assert order_for(db_session, tenant, "ORD-API-BOSTA-1").current_status == "delivered"
+    assert len(delivered_events_for(db_session, tenant)) == 1
 
 
-def test_bosta_route_finds_tenant_by_order_in_db(courier_client, db_session, settlement_tenant):
-    make_pending_order(db_session, settlement_tenant, order_id="ORD-API-BOSTA-2", status="shipped")
+def test_oto_route_accepts_valid_signature(courier_client, db_session, secured_oto_tenant):
+    tenant = secured_oto_tenant
+    make_pending_order(db_session, tenant, order_id="ORD-API-OTO-1", status="pending")
 
-    payload = {"businessReference": "ORD-API-BOSTA-2", "state": 45}
-    headers = {"Content-Type": "application/json", BOSTA_AUTH_HEADER: BOSTA_SECRET}
-    # No shop domain in header/query; route resolves tenant from order in DB
-    response = courier_client.post("/webhooks/bosta", json=payload, headers=headers)
+    response = courier_client.post(f"/webhooks/oto/{tenant.shop_domain}",
+                                   json=oto_payload("ORD-API-OTO-1", OTO_SECRET))
     assert response.status_code == 200
     assert response.json() == {"status": "accepted"}
+    assert order_for(db_session, tenant, "ORD-API-OTO-1").current_status == "delivered"
+    assert len(delivered_events_for(db_session, tenant)) == 1
 
 
-def test_bosta_route_rejects_invalid_auth(courier_client):
+# ---- auth failures ---------------------------------------------------------
+
+def test_bosta_route_rejects_invalid_auth(courier_client, db_session, secured_settlement_tenant):
+    tenant = secured_settlement_tenant
     payload = {"businessReference": "ORD-1", "state": 45}
-    headers = {"Content-Type": "application/json", BOSTA_AUTH_HEADER: "wrong-secret"}
-    response = courier_client.post("/webhooks/bosta", json=payload, headers=headers)
+    response = courier_client.post(f"/webhooks/bosta/{tenant.shop_domain}", json=payload,
+                                   headers=bosta_headers("wrong-secret"))
     assert response.status_code == 401
     assert "Invalid webhook authentication" in response.json()["detail"]
+    row = deliveries(db_session, "bosta")[-1]
+    assert (row.tenant_id, row.signature_ok, row.processed_ok, row.error_type) == (
+        tenant.id, False, False, "invalid_signature")
 
 
-def test_oto_route_accepts_valid_signature(courier_client, db_session, oto_tenant):
-    make_pending_order(db_session, oto_tenant, order_id="ORD-API-OTO-1", status="pending")
-
-    order_id = "ORD-API-OTO-1"
-    status = "delivered"
-    timestamp = "2026-10-10T01:00:00Z"
-    msg = f"{order_id}:{status}:{timestamp}".encode("utf-8")
-    sig = base64.b64encode(hmac.new(OTO_SECRET.encode("utf-8"), msg, hashlib.sha256).digest()).decode("ascii")
-
-    payload = {
-        "orderId": order_id,
-        "status": status,
-        "timestamp": timestamp,
-        "signature": sig
-    }
-    response = courier_client.post(f"/webhooks/oto/{oto_tenant.shop_domain}", json=payload)
-    assert response.status_code == 200
-    assert response.json() == {"status": "accepted"}
-
-
-def test_oto_route_rejects_invalid_signature(courier_client, oto_tenant):
-    payload = {
-        "orderId": "ORD-1",
-        "status": "delivered",
-        "timestamp": "2026-10-10T01:00:00Z",
-        "signature": "invalid-sig"
-    }
-    response = courier_client.post(f"/webhooks/oto/{oto_tenant.shop_domain}", json=payload)
+def test_oto_route_rejects_invalid_signature(courier_client, db_session, secured_oto_tenant):
+    tenant = secured_oto_tenant
+    payload = {"orderId": "ORD-1", "status": "delivered", "timestamp": "2026-10-10T01:00:00Z",
+               "signature": "invalid-sig"}
+    response = courier_client.post(f"/webhooks/oto/{tenant.shop_domain}", json=payload)
     assert response.status_code == 401
     assert "Invalid webhook signature" in response.json()["detail"]
+    row = deliveries(db_session, "oto")[-1]
+    assert (row.tenant_id, row.signature_ok, row.processed_ok, row.error_type) == (
+        tenant.id, False, False, "invalid_signature")
 
 
-def test_courier_route_unknown_shop_or_order(courier_client):
-    headers = {"Content-Type": "application/json", BOSTA_AUTH_HEADER: BOSTA_SECRET}
-    response = courier_client.post("/webhooks/bosta", json={"businessReference": "NON-EXISTENT"}, headers=headers)
+def test_bosta_missing_tenant_credential_fails_closed(courier_client, db_session, settlement_tenant):
+    """Tenant exists but never configured a Bosta secret -> 401 (no env or open fallback), whatever the header."""
+    make_pending_order(db_session, settlement_tenant, order_id="ORD-NOCRED", status="shipped")
+    for headers in (bosta_headers(BOSTA_SECRET), {"Content-Type": "application/json"}):
+        response = courier_client.post(f"/webhooks/bosta/{settlement_tenant.shop_domain}",
+                                       json={"businessReference": "ORD-NOCRED", "state": 45}, headers=headers)
+        assert response.status_code == 401
+    assert order_for(db_session, settlement_tenant, "ORD-NOCRED").current_status == "shipped"
+    assert events_for(db_session, settlement_tenant) == []
+    rows = deliveries(db_session, "bosta")
+    assert len(rows) == 2
+    assert all(r.error_type == "signature_not_configured" and r.signature_ok is False for r in rows)
+
+
+def test_oto_missing_tenant_credential_fails_closed(courier_client, db_session, oto_tenant):
+    make_pending_order(db_session, oto_tenant, order_id="ORD-NOCRED", status="pending")
+    response = courier_client.post(f"/webhooks/oto/{oto_tenant.shop_domain}",
+                                   json=oto_payload("ORD-NOCRED", OTO_SECRET))
+    assert response.status_code == 401
+    assert order_for(db_session, oto_tenant, "ORD-NOCRED").current_status == "pending"
+    assert events_for(db_session, oto_tenant) == []
+    assert deliveries(db_session, "oto")[-1].error_type == "signature_not_configured"
+
+
+def test_global_env_secret_is_not_honored(courier_client, settlement_tenant, oto_tenant, monkeypatch):
+    """The old shared env secret must have no effect: a shared secret is exactly the vulnerability."""
+    monkeypatch.setenv("BOSTA_WEBHOOK_SECRET", BOSTA_SECRET)
+    monkeypatch.setenv("OTO_WEBHOOK_SECRET", OTO_SECRET)
+    response = courier_client.post(f"/webhooks/bosta/{settlement_tenant.shop_domain}",
+                                   json={"businessReference": "X", "state": 45}, headers=bosta_headers(BOSTA_SECRET))
+    assert response.status_code == 401
+    response = courier_client.post(f"/webhooks/oto/{oto_tenant.shop_domain}", json=oto_payload("X", OTO_SECRET))
+    assert response.status_code == 401
+
+
+# ---- routing ---------------------------------------------------------------
+
+def test_unscoped_courier_routes_no_longer_exist(courier_client, db_session, secured_settlement_tenant):
+    tenant = secured_settlement_tenant
+    make_pending_order(db_session, tenant, order_id="ORD-UNSCOPED", status="shipped")
+    payload = {"businessReference": "ORD-UNSCOPED", "state": 45}
+    headers = {**bosta_headers(BOSTA_SECRET), "X-Shop-Domain": tenant.shop_domain}
+    for path in ("/webhooks/bosta", "/webhooks/oto"):
+        assert courier_client.post(path, json=payload, headers=headers).status_code in (404, 405)
+        assert courier_client.post(f"{path}?shop={tenant.shop_domain}", json=payload,
+                                   headers=headers).status_code in (404, 405)
+    assert order_for(db_session, tenant, "ORD-UNSCOPED").current_status == "shipped"
+
+
+def test_courier_route_unknown_shop_is_404_with_audit_row(courier_client, db_session):
+    payload = {"businessReference": "NON-EXISTENT", "state": 45}
+    response = courier_client.post("/webhooks/bosta/nope.myshopify.com", json=payload,
+                                   headers=bosta_headers(BOSTA_SECRET))
     assert response.status_code == 404
+    row = deliveries(db_session, "bosta")[-1]
+    assert (row.tenant_id, row.signature_ok, row.processed_ok, row.error_type) == (
+        None, False, False, "unknown_tenant")
+
+    response = courier_client.post("/webhooks/oto/nope.myshopify.com", json=oto_payload("NON-EXISTENT", OTO_SECRET))
+    assert response.status_code == 404
+    row = deliveries(db_session, "oto")[-1]
+    assert (row.tenant_id, row.error_type) == (None, "unknown_tenant")
+
+
+def test_invalid_json_after_auth_is_400(courier_client, db_session, secured_settlement_tenant):
+    tenant = secured_settlement_tenant
+    response = courier_client.post(f"/webhooks/bosta/{tenant.shop_domain}", content=b"not json",
+                                   headers=bosta_headers(BOSTA_SECRET))
+    assert response.status_code == 400
+    assert deliveries(db_session, "bosta")[-1].error_type == "invalid_json"
+
+
+# ---- cross-tenant isolation (FX-1) ----------------------------------------
+
+def test_bosta_same_order_number_in_two_stores_only_touches_the_addressed_tenant(
+        courier_client, db_session, two_bosta_tenants):
+    a, b = two_bosta_tenants
+    make_pending_order(db_session, a, order_id=SHARED_ORDER_ID, value=100.0, status="shipped")
+    make_pending_order(db_session, b, order_id=SHARED_ORDER_ID, value=999.0, status="shipped")
+
+    response = courier_client.post(f"/webhooks/bosta/{a.shop_domain}",
+                                   json={"businessReference": SHARED_ORDER_ID, "state": 45},
+                                   headers=bosta_headers(BOSTA_SECRET))
+    assert response.status_code == 200
+
+    assert order_for(db_session, a, SHARED_ORDER_ID).current_status == "delivered"
+    order_b = order_for(db_session, b, SHARED_ORDER_ID)
+    assert order_b.current_status == "shipped"
+    assert order_b.delivered_at is None
+    assert len(delivered_events_for(db_session, a)) == 1
+    assert events_for(db_session, b) == []
+    assert db_session.scalars(select(OrderStatusEvent).where(OrderStatusEvent.order_id == order_b.id)).all() == []
+
+
+def test_oto_same_order_number_in_two_stores_only_touches_the_addressed_tenant(
+        courier_client, db_session, two_oto_tenants):
+    a, b = two_oto_tenants
+    make_pending_order(db_session, a, order_id=SHARED_ORDER_ID, value=100.0, status="pending")
+    make_pending_order(db_session, b, order_id=SHARED_ORDER_ID, value=999.0, status="pending")
+
+    response = courier_client.post(f"/webhooks/oto/{a.shop_domain}", json=oto_payload(SHARED_ORDER_ID, OTO_SECRET))
+    assert response.status_code == 200
+
+    assert order_for(db_session, a, SHARED_ORDER_ID).current_status == "delivered"
+    order_b = order_for(db_session, b, SHARED_ORDER_ID)
+    assert order_b.current_status == "pending"
+    assert order_b.delivered_at is None
+    assert len(delivered_events_for(db_session, a)) == 1
+    assert events_for(db_session, b) == []
+
+
+def test_bosta_dispatch_goes_only_to_the_addressed_tenants_pixel(courier_client, db_session, two_bosta_tenants):
+    a, b = two_bosta_tenants
+    make_pending_order(db_session, a, order_id=SHARED_ORDER_ID, status="shipped")
+    make_pending_order(db_session, b, order_id=SHARED_ORDER_ID, status="shipped")
+    courier_client.post(f"/webhooks/bosta/{a.shop_domain}", json={"businessReference": SHARED_ORDER_ID, "state": 45},
+                        headers=bosta_headers(BOSTA_SECRET))
+
+    sender = SpySender()
+    counts = asyncio.run(send_due_events(db_session, now=datetime.now(timezone.utc) + timedelta(hours=13),
+                                         sender=sender))
+    assert counts["sent"] >= 1
+    assert {c["pixel_id"] for c in sender.calls} == {"DS_A"}  # B's pixel is never used
+    assert [c["payload"]["data"][0]["event_name"] for c in sender.calls].count(DELIVERED_EVENT_NAME) == 1
+
+
+def test_bosta_other_tenants_secret_is_rejected(courier_client, db_session, two_bosta_tenants):
+    """B's (legitimate) secret used against A's URL: 401, and neither store's order is touched."""
+    a, b = two_bosta_tenants
+    make_pending_order(db_session, a, order_id=SHARED_ORDER_ID, status="shipped")
+    make_pending_order(db_session, b, order_id=SHARED_ORDER_ID, status="shipped")
+
+    response = courier_client.post(f"/webhooks/bosta/{a.shop_domain}",
+                                   json={"businessReference": SHARED_ORDER_ID, "state": 45},
+                                   headers=bosta_headers(OTHER_BOSTA_SECRET))
+    assert response.status_code == 401
+    assert order_for(db_session, a, SHARED_ORDER_ID).current_status == "shipped"
+    assert order_for(db_session, b, SHARED_ORDER_ID).current_status == "shipped"
+    assert events_for(db_session, a) == [] and events_for(db_session, b) == []
+    row = deliveries(db_session, "bosta")[-1]
+    assert (row.tenant_id, row.signature_ok, row.processed_ok) == (a.id, False, False)
+
+
+def test_oto_other_tenants_secret_is_rejected(courier_client, db_session, two_oto_tenants):
+    a, b = two_oto_tenants
+    make_pending_order(db_session, a, order_id=SHARED_ORDER_ID, status="pending")
+    make_pending_order(db_session, b, order_id=SHARED_ORDER_ID, status="pending")
+
+    response = courier_client.post(f"/webhooks/oto/{a.shop_domain}",
+                                   json=oto_payload(SHARED_ORDER_ID, OTHER_OTO_SECRET))
+    assert response.status_code == 401
+    assert order_for(db_session, a, SHARED_ORDER_ID).current_status == "pending"
+    assert order_for(db_session, b, SHARED_ORDER_ID).current_status == "pending"
+    assert events_for(db_session, a) == [] and events_for(db_session, b) == []
+
+
+def test_bad_auth_never_touches_orders_or_background_processing(
+        courier_client, db_session, two_bosta_tenants, two_oto_tenants, monkeypatch):
+    """Auth is checked before any order lookup or processing: processing must not even be scheduled."""
+    calls = []
+
+    async def spy(*args, **kwargs):
+        calls.append(args)
+
+    monkeypatch.setattr(webhook_routes, "_process_in_background", spy)
+    a, _ = two_bosta_tenants
+    sa, _ = two_oto_tenants
+    make_pending_order(db_session, a, order_id=SHARED_ORDER_ID, status="shipped")
+
+    r1 = courier_client.post(f"/webhooks/bosta/{a.shop_domain}",
+                             json={"businessReference": SHARED_ORDER_ID, "state": 45},
+                             headers=bosta_headers("forged"))
+    r2 = courier_client.post(f"/webhooks/oto/{sa.shop_domain}", json=oto_payload(SHARED_ORDER_ID, "forged"))
+    assert (r1.status_code, r2.status_code) == (401, 401)
+    assert calls == []
+    assert order_for(db_session, a, SHARED_ORDER_ID).current_status == "shipped"
+
+    # sanity: a valid request IS scheduled (proves the spy is wired to the real path)
+    r3 = courier_client.post(f"/webhooks/bosta/{a.shop_domain}",
+                             json={"businessReference": SHARED_ORDER_ID, "state": 45},
+                             headers=bosta_headers(BOSTA_SECRET))
+    assert r3.status_code == 200 and len(calls) == 1

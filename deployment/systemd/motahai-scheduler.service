@@ -1,0 +1,35 @@
+[Unit]
+Description=Motahai conversion scheduler (settled DeliveredPurchase dispatch, every 15 minutes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Never root: this process only needs the database, the Fernet key and outbound HTTPS to Meta.
+User=motahai
+Group=motahai
+WorkingDirectory=/opt/ameen-workforce
+# `python -m ameen_workforce.scheduler` resolves the package from src/ (the repo has no installed package).
+Environment=PYTHONPATH=/opt/ameen-workforce/src
+# Must define MOTAHAI_FERNET_KEY and DATABASE_URL (pointing into /var/lib/motahai). See README_scheduler.md.
+EnvironmentFile=/etc/motahai/core.env
+ExecStart=/opt/ameen-workforce/venv/bin/python -m ameen_workforce.scheduler
+Restart=always
+RestartSec=10s
+# A running cycle finishes before the daemon exits on SIGTERM.
+TimeoutStopSec=120s
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=motahai
+ReadWritePaths=/var/lib/motahai
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=motahai-scheduler
+
+[Install]
+WantedBy=multi-user.target

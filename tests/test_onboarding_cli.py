@@ -4,6 +4,7 @@ tests/test_onboarding_cli.py — Unit and integration tests for Operator Onboard
 """
 
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -240,6 +241,7 @@ async def test_verify_capi_ping_error():
     res = await verify_capi_ping(
         meta_dataset_id="123456789",
         meta_capi_token="INVALID_TOKEN",
+        test_event_code="TEST1234",
         sender=failing_sender
     )
     assert res["status"] == "error"
@@ -274,6 +276,8 @@ def test_cli_main_success(db_session, test_fernet_key, monkeypatch, capsys):
         "--meta-dataset-id", "999888777",
         "--meta-capi-token", "CLI_SECRET_TOKEN",
         "--webhook-secret", "CLI_WH_SECRET",
+        "--verify-capi-ping",
+        "--test-event-code", "TEST_CLI_1",
         "--json"
     ]
 
@@ -298,72 +302,12 @@ def test_cli_main_invalid_args_returns_error(capsys):
 # 4. S2-8 Storefront Salla Capture Endpoint & Webhook Parsing Tests
 # =============================================================================
 
-def test_salla_storefront_capture_endpoint(db_session, test_fernet_key):
-    # 1. Onboard a Salla store
-    tenant = Tenant(
-        name="Salla Pilot Store",
-        platform="salla",
-        shop_domain="778899",  # merchant id
-        meta_dataset_id="444555666",
-        country="SA",
-        currency="SAR",
-        timezone="Asia/Riyadh",
-        mode="live"
-    )
-    db_session.add(tenant)
-    db_session.commit()
-
-    factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False)
-    app.dependency_overrides[get_session_factory_dep] = lambda: factory
+def test_old_storefront_capture_routes_are_gone(db_session):
+    """FX-2: the unauthenticated /storefront/capture and /webhooks/salla/capture routes no longer exist."""
     client = TestClient(app)
-
-    capture_payload = {
-        "platform": "salla",
-        "merchant": "778899",
-        "order_id": "ORD-12345",
-        "attribution": {
-            "utm_source": "meta",
-            "utm_medium": "paid",
-            "utm_campaign": "1001",
-            "utm_content": "2002",
-            "ad_id": "2002",
-            "fbp": "fb.1.1700000000000.1234567890",
-            "fbc": "fb.1.1700000000000.ABC_DEF",
-            "ttclid": "TT-123",
-            "sccid": "SC-456"
-        },
-        "user_agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36",
-        "client_ip": "197.35.120.40"
-    }
-
-    # Test POST /storefront/capture
-    res = client.post("/storefront/capture", json=capture_payload)
-    assert res.status_code == 200
-    assert res.json()["status"] == "captured"
-    assert res.json()["order_id"] == "ORD-12345"
-
-    # Verify Order created and attribution persisted
-    order = db_session.scalar(select(Order).where(Order.tenant_id == tenant.id, Order.platform_order_id == "ORD-12345"))
-    assert order is not None
-    assert order.utm_source == "meta"
-    assert order.ad_id == "2002"
-    assert order.fbp == "fb.1.1700000000000.1234567890"
-    assert order.fbc == "fb.1.1700000000000.ABC_DEF"
-    assert order.ttclid == "TT-123"
-    assert order.sccid == "SC-456"
-
-    # Verify Checkout Context encrypted (client_ip and user_agent)
-    ip, ua = load_checkout_context(db_session, order.id)
-    assert ip == "197.35.120.40"
-    assert ua == "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36"
-
-    # Test alias POST /webhooks/salla/capture
-    capture_payload["order_id"] = "ORD-67890"
-    res2 = client.post("/webhooks/salla/capture", json=capture_payload)
-    assert res2.status_code == 200
-    assert res2.json()["status"] == "captured"
-
-    app.dependency_overrides.pop(get_session_factory_dep, None)
+    for path in ("/storefront/capture", "/webhooks/salla/capture"):
+        res = client.post(path, json={"merchant": "778899", "order_id": "ORD-1"})
+        assert res.status_code in (404, 405)
 
 
 def test_parse_salla_order_with_source_details_and_notes():
@@ -416,3 +360,127 @@ def test_parse_salla_order_with_embedded_notes():
     assert parsed["attribution"]["ad_id"] == "12345"
     assert parsed["attribution"]["fbp"] == "fb.1.1700000000000.1234567890"
     assert parsed["attribution"]["ttclid"] == "TT_XYZ"
+
+
+# =============================================================================
+# 5. Connection-test guard (R5) and courier webhook secrets
+# =============================================================================
+
+BASE_CLI_ARGS = [
+    "--name", "CLI Store",
+    "--platform", "shopify",
+    "--shop-domain", "cli-store.myshopify.com",
+    "--meta-dataset-id", "999888777",
+    "--meta-capi-token", "CLI_SECRET_TOKEN",
+]
+
+
+@pytest.fixture
+def cli_db(db_session, test_fernet_key, monkeypatch):
+    """Routes the CLI to the in-memory session and skips touching the real database file."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_scope(*_args, **_kwargs):
+        yield db_session
+
+    monkeypatch.setattr("scripts.onboard_store.session_scope", fake_scope)
+    monkeypatch.setattr("scripts.onboard_store.init_db", lambda *a, **k: None)
+    return db_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [None, "", "   "])
+async def test_verify_capi_ping_refuses_without_test_event_code(mock_capi_sender, code):
+    with pytest.raises(ValueError, match="test_event_code"):
+        await verify_capi_ping(
+            meta_dataset_id="123456789", meta_capi_token="VALID_TOKEN", test_event_code=code, sender=mock_capi_sender
+        )
+    mock_capi_sender.send_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_verify_capi_ping_sends_connection_test_event_not_delivered_purchase(mock_capi_sender):
+    res = await verify_capi_ping(
+        meta_dataset_id="123456789", meta_capi_token="VALID_TOKEN", test_event_code="TEST1234", sender=mock_capi_sender
+    )
+    payload = mock_capi_sender.send_event.call_args.kwargs["payload"]
+    assert payload["data"][0]["event_name"] == "MotahaiConnectionTest"
+    assert payload["test_event_code"] == "TEST1234"
+    assert res["event_name"] == "MotahaiConnectionTest"
+
+
+def test_cli_verify_ping_without_test_event_code_exits_nonzero_and_sends_nothing(cli_db, monkeypatch, capsys):
+    send = AsyncMock(return_value={"status": "success"})
+    monkeypatch.setattr(MetaCAPISender, "send_event", send)
+
+    ret = main(BASE_CLI_ARGS + ["--verify-capi-ping", "--json"])
+
+    assert ret != 0
+    send.assert_not_called()
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None  # refused before any write
+    assert "--test-event-code" in json.loads(capsys.readouterr().out)["message"]
+
+
+def test_cli_default_run_sends_no_ping(cli_db, monkeypatch):
+    send = AsyncMock(return_value={"status": "success"})
+    monkeypatch.setattr(MetaCAPISender, "send_event", send)
+
+    assert main(BASE_CLI_ARGS + ["--json"]) == 0
+    send.assert_not_called()
+
+
+def test_cli_verify_ping_with_test_event_code_sends_connection_test(cli_db, monkeypatch):
+    send = AsyncMock(return_value={"status": "success", "events_received": 1, "fbtrace_id": "T1"})
+    monkeypatch.setattr(MetaCAPISender, "send_event", send)
+
+    assert main(BASE_CLI_ARGS + ["--verify-capi-ping", "--test-event-code", "TEST9", "--json"]) == 0
+
+    send.assert_called_once()
+    payload = send.call_args.kwargs["payload"]
+    assert payload["data"][0]["event_name"] == "MotahaiConnectionTest"
+    assert payload["test_event_code"] == "TEST9"
+
+
+def test_cli_courier_secret_flags_store_credentials_of_the_right_kinds(cli_db, capsys):
+    assert main(BASE_CLI_ARGS + ["--bosta-webhook-secret", "BOSTA_SECRET_VALUE",
+                                 "--oto-webhook-secret", "OTO_SECRET_VALUE", "--json"]) == 0
+
+    tenant = get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com")
+    assert get_credential(cli_db, tenant.id, "bosta_webhook_secret") == "BOSTA_SECRET_VALUE"
+    assert get_credential(cli_db, tenant.id, "oto_webhook_secret") == "OTO_SECRET_VALUE"
+    out = capsys.readouterr().out
+    assert "BOSTA_SECRET_VALUE" not in out and "OTO_SECRET_VALUE" not in out
+
+
+def test_cli_generate_courier_secrets_prints_once_and_never_logs(cli_db, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+
+    assert main(BASE_CLI_ARGS + ["--generate-courier-secrets"]) == 0
+
+    captured = capsys.readouterr()
+    tenant = get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com")
+    bosta = get_credential(cli_db, tenant.id, "bosta_webhook_secret")
+    oto = get_credential(cli_db, tenant.id, "oto_webhook_secret")
+    assert len(bosta) >= 43 and len(oto) >= 43 and bosta != oto  # token_urlsafe(32)
+    # printed exactly once, on stdout only
+    assert captured.out.count(bosta) == 1
+    assert captured.out.count(oto) == 1
+    assert bosta not in captured.err and oto not in captured.err
+    # per-tenant webhook paths are shown
+    assert "/webhooks/bosta/cli-store.myshopify.com" in captured.out
+    assert "/webhooks/oto/cli-store.myshopify.com" in captured.out
+    # never logged
+    assert bosta not in caplog.text and oto not in caplog.text
+
+
+def test_cli_generate_conflicts_with_explicit_courier_secret(cli_db):
+    assert main(BASE_CLI_ARGS + ["--generate-courier-secrets", "--bosta-webhook-secret", "X", "--json"]) != 0
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+def test_cli_refuses_real_run_without_fernet_key(monkeypatch, capsys):
+    monkeypatch.delenv(FERNET_KEY_ENV, raising=False)
+
+    assert main(BASE_CLI_ARGS + ["--json"]) != 0
+    assert FERNET_KEY_ENV in json.loads(capsys.readouterr().out)["message"]

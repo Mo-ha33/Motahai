@@ -1,10 +1,13 @@
 /*! salla_capture.js - ad attribution & thank-you page capture for Salla storefronts (no dependencies, ES2017).
  * Reads click params (utm_*, fbclid, ttclid, ScCid/sccid, mt_ad) + Meta cookies (_fbp/_fbc) on storefront visits,
  * stores the LAST click for 7 days in localStorage (mt_attr).
- * On the thank-you / order confirmation page, extracts the order_id, captures user_agent, fbp, fbc, utm_*, ad_id,
- * and transmits them to the Motahai capture endpoint and/or attaches them to Salla order notes.
+ * On the thank-you / order confirmation page, extracts order_id, order_total, currency, fbp, fbc, utm_*, ad_id,
+ * and POSTs them to <CORE_HOST>/v1/capture/<merchant_id> and/or attaches them to Salla order notes.
+ * The server derives IP and user agent from the connection itself: this script never sends them.
  * Never reads or sends customer email/phone. Safe try/catch throughout to guarantee store stability.
- * Config override via window.MOTAHAI_CONFIG = { endpoint: '...', merchant_id: '...' }.
+ * Required config: window.MOTAHAI_CONFIG = { core_host: 'https://<CORE_HOST>', merchant_id: '...' } (or the
+ * data-core-host / data-merchant-id attributes on this script tag). Without core_host nothing is sent.
+ * Optional overrides: order_id, order_total, currency, is_thank_you.
  */
 (function () {
   'use strict';
@@ -140,30 +143,63 @@
     } catch (e) {}
   }
 
-  function postCapture(merchantId, orderId, attrs) {
+  function findCoreHost() {
     try {
       var cfg = W.MOTAHAI_CONFIG || {};
-      var endpoint = cfg.endpoint || '/storefront/capture';
-      var ua = (W.navigator && W.navigator.userAgent) ? clean(W.navigator.userAgent, 512) : '';
-      var body = JSON.stringify({
-        platform: 'salla',
-        merchant: merchantId,
-        order_id: String(orderId),
-        attribution: attrs,
-        user_agent: ua,
-        timestamp: Date.now()
-      });
+      var h = cfg.core_host || (D.currentScript && D.currentScript.getAttribute('data-core-host')) || '';
+      h = String(h).trim().replace(/\/+$/, '');
+      return /^https:\/\/[^\/\s]+$/i.test(h) ? h : '';
+    } catch (e) { return ''; }
+  }
 
+  function num(v) {
+    if (v && typeof v === 'object') v = v.amount !== undefined ? v.amount : v.value;
+    if (typeof v === 'string') v = v.replace(/,/g, '').trim();
+    if (v === '' || v === null || v === undefined) return NaN;
+    return Number(v);
+  }
+
+  function findOrderTotal() {
+    try {
+      var cfg = W.MOTAHAI_CONFIG || {}, t = num(cfg.order_total), c = W.salla && W.salla.config;
+      if (isFinite(t) && t >= 0) return t;
+      var keys = ['order.total', 'order.amounts.total', 'order.total.amount'];
+      for (var i = 0; c && i < keys.length; i++) {
+        t = num(c.get(keys[i]));
+        if (isFinite(t) && t >= 0) return t;
+      }
+      t = num(W.salla && W.salla.order && W.salla.order.total);
+      if (isFinite(t) && t >= 0) return t;
+      var el = D.querySelector('[data-order-total]');
+      t = num(el && el.getAttribute('data-order-total'));
+      if (isFinite(t) && t >= 0) return t;
+    } catch (e) {}
+    return NaN;
+  }
+
+  function findCurrency() {
+    try {
+      var cfg = W.MOTAHAI_CONFIG || {}, c = W.salla && W.salla.config, v = cfg.currency;
+      if (!v && c) v = c.get('order.currency') || c.get('currency.code') || c.get('store.currency') || c.get('currency');
+      if (!v && W.salla && W.salla.order) v = W.salla.order.currency;
+      if (!v) { var el = D.querySelector('[data-order-currency]'); v = el && el.getAttribute('data-order-currency'); }
+      if (v && typeof v === 'object') v = v.code || v.currency;
+      v = clean(v, 8).toUpperCase();
+      return /^[A-Z]{3}$/.test(v) ? v : '';
+    } catch (e) { return ''; }
+  }
+
+  function postCapture(host, merchantId, orderId, total, currency, attrs) {
+    try {
+      var url = host + '/v1/capture/' + encodeURIComponent(merchantId);
+      // text/plain keeps this a CORS "simple request" (no preflight). No ip / user_agent: the server derives them.
+      var body = JSON.stringify({ order_id: String(orderId), order_total: total, currency: currency, attribution: attrs });
+      if (W.navigator && typeof W.navigator.sendBeacon === 'function' && typeof Blob === 'function') {
+        if (W.navigator.sendBeacon(url, new Blob([body], { type: 'text/plain;charset=UTF-8' }))) return;
+      }
       if (typeof fetch === 'function') {
-        fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: body,
-          keepalive: true
-        }).catch(function () {});
-      } else if (W.navigator && typeof W.navigator.sendBeacon === 'function') {
-        var blob = new Blob([body], { type: 'application/json' });
-        W.navigator.sendBeacon(endpoint, blob);
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body: body,
+          keepalive: true, credentials: 'omit', mode: 'cors' }).catch(function () {});
       }
     } catch (e) {}
   }
@@ -181,13 +217,16 @@
       if (isThankYouPage()) {
         var orderId = findOrderId();
         var merchantId = findMerchantId();
+        var host = findCoreHost(), total = findOrderTotal(), currency = findCurrency();
         if (orderId) {
           var lockKey = 'mt_salla_captured_' + orderId;
           if (!ss(lockKey)) {
             var attrs = getAttribution(rec);
             attachToSallaOrderNotes(orderId, attrs);
-            postCapture(merchantId, orderId, attrs);
-            ss(lockKey, '1');
+            if (host && merchantId && isFinite(total) && currency) {
+              postCapture(host, merchantId, orderId, total, currency, attrs);
+              ss(lockKey, '1');
+            }
           }
         }
       }

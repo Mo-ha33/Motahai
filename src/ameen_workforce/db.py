@@ -11,7 +11,7 @@ All timestamps are timezone-aware UTC. SQLite drops tzinfo on read, so UTCDateTi
 
 Schema is created with create_all() for now. NOTE: create_all() never ALTERs an existing table, so the S2 columns
 (orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
-storefront_url) and the new checkout_context table need an Alembic migration before any non-empty database is upgraded.
+storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source) and the new checkout_context table need an Alembic migration before any non-empty database is upgraded.
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
@@ -21,7 +21,7 @@ from datetime import date, datetime, timezone
 from typing import Iterator, Optional
 
 from sqlalchemy import (
-    Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text,
+    JSON, Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text,
     UniqueConstraint, create_engine, event, select
 )
 from sqlalchemy.engine import Engine
@@ -88,6 +88,9 @@ class Tenant(Base):
     settlement_hours: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     # S2-3: public storefront URL for event_source_url (NULL: Shopify falls back to https://<shop_domain>/).
     storefront_url: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # FX-3: per-tenant ConfirmedOrder rules {"tags": [...], "statuses": [...], "implicit_on_ship": bool}; NULL = defaults.
+    # Read via confirmation.effective_confirmation_rules, write via confirmation.set_confirmation_rules (validated).
+    confirmation_rules: Mapped[Optional[dict]] = mapped_column(JSON(none_as_null=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:
@@ -149,6 +152,8 @@ class Order(Base):
     delivered_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
     # S2-2: when the customer confirmed the order (call, WhatsApp, or merchant tag 'confirmed')
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # FX-3: why the order counts as confirmed: tag | status | implicit_shipped | implicit_paid | manual (see confirmation.py)
+    confirmation_source: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     # S2-2: full order total before refunds (for ConfirmedOrder value)
     order_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
@@ -219,6 +224,45 @@ class CheckoutContext(Base):
 
     def __repr__(self) -> str:
         return f"CheckoutContext(id={self.id!r}, order_id={self.order_id!r})"  # no ciphertext in reprs
+
+
+class PendingCapture(Base):
+    """
+    FX-2: a storefront thank-you-page capture, QUARANTINED until the signed platform webhook creates the order.
+    The public capture endpoint only ever writes here (never to orders). capture.merge_pending_captures later joins a
+    row to the order with the same (tenant, platform_order_id) after an order-total second-factor check. IP/UA are
+    Fernet ciphertext (D-006), cleared once the row is merged/rejected; the row itself is deleted at expires_at
+    (received_at + 48h). No email/phone/name is ever stored here.
+    """
+    __tablename__ = "pending_captures"
+    __table_args__ = (
+        Index("ix_pending_captures_tenant_order", "tenant_id", "platform_order_id"),
+        Index("ix_pending_captures_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"))
+    platform_order_id: Mapped[str] = mapped_column(String(64))
+    order_total: Mapped[float] = mapped_column(Float)
+    currency: Mapped[str] = mapped_column(String(3))
+    utm_source: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    utm_medium: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    utm_campaign: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    utm_content: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ad_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    fbp: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    fbc: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ttclid: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    sccid: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    ip_ciphertext: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ua_ciphertext: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    merged_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    rejected_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"PendingCapture(id={self.id!r}, tenant_id={self.tenant_id!r})"  # no order id / ciphertext in reprs
 
 
 class WebhookDelivery(Base):

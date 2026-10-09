@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import inspect, select, text
 
 from src.ameen_workforce.capi_service import MetaCAPISender, hash_email, hash_phone
+from src.ameen_workforce.confirmation import set_confirmation_rules
 from src.ameen_workforce.credentials import (
     CredentialConfigError, FERNET_KEY_ENV, get_credential, store_credential
 )
@@ -39,14 +40,25 @@ DELIVERED = dict(financial_status="paid", fulfillment_status="fulfilled")
 
 
 class FakeSender(MetaCAPISender):
-    """Real D-005 logic, fake network."""
+    """
+    Real D-005 logic, fake network. `calls` holds the DeliveredPurchase sends only (what these tests are about);
+    ConfirmedOrder sends (the funnel invariant sends one before every DeliveredPurchase) go to `confirmed_calls`
+    and always succeed without consuming `results`. `all_calls` has both, in order.
+    """
     def __init__(self, results=None):
         super().__init__()
         self.calls = []
+        self.confirmed_calls = []
+        self.all_calls = []
         self.results = list(results or [])
 
     async def send_event(self, pixel_id, access_token, payload):
-        self.calls.append({"pixel_id": pixel_id, "access_token": access_token, "payload": payload})
+        call = {"pixel_id": pixel_id, "access_token": access_token, "payload": payload}
+        self.all_calls.append(call)
+        if payload["data"][0]["event_name"] != "DeliveredPurchase":
+            self.confirmed_calls.append(call)
+            return {"status": "success", "fbtrace_id": "TRACE-CONFIRMED"}
+        self.calls.append(call)
         if self.results:
             return self.results.pop(0)
         return {"status": "success", "fbtrace_id": "TRACE1"}
@@ -56,7 +68,12 @@ FAIL = {"status": "error", "http_code": 500, "error_message": "boom"}
 
 
 def events(session):
-    return session.scalars(select(CapiEvent)).all()
+    """DeliveredPurchase rows only (every delivered order also has a ConfirmedOrder row; see all_events)."""
+    return [e for e in all_events(session) if e.event_name == "DeliveredPurchase"]
+
+
+def all_events(session):
+    return session.scalars(select(CapiEvent).order_by(CapiEvent.id)).all()
 
 
 async def deliver(session, tenant, payload, sender, topic="orders/updated", delivery_id=None, platform="shopify", **kw):
@@ -257,6 +274,8 @@ FULFILLMENT = {"id": 555, "order_id": 987654321, "status": "success", "shipment_
 
 @pytest.mark.asyncio
 async def test_fulfillment_delivered_for_known_order_emits_with_stored_hashes(db_session, live_tenant):
+    # Explicit-only confirmation: a shipped COD order would otherwise also emit an implicit ConfirmedOrder (FX-3).
+    set_confirmation_rules(db_session, live_tenant, {"implicit_on_ship": False})
     sender = FakeSender()
     held = await deliver(db_session, live_tenant, shopify_order(fulfillment_status="fulfilled"), sender)
     assert held["action"] == "DEFERRED"  # COD, shipped but not delivered

@@ -35,13 +35,23 @@ ADDRESS = {"first_name": "Ahmed", "last_name": "El-Sayed", "city": "Nasr City", 
 
 
 class FakeSender(MetaCAPISender):
-    """Real D-005 logic, fake network."""
+    """
+    Real D-005 logic, fake network. `calls` holds the DeliveredPurchase sends only (what these tests are about);
+    ConfirmedOrder sends (the funnel invariant sends one before every DeliveredPurchase) go to `confirmed_calls`
+    and always succeed without consuming `results`. `all_calls` has both, in order.
+    """
     def __init__(self, results=None):
         super().__init__()
         self.calls = []
+        self.confirmed_calls = []
+        self.all_calls = []
         self.results = list(results or [])
 
     async def send_event(self, pixel_id, access_token, payload):
+        self.all_calls.append(payload)
+        if payload["data"][0]["event_name"] != "DeliveredPurchase":
+            self.confirmed_calls.append(payload)
+            return {"status": "success", "fbtrace_id": "TRACE-CONFIRMED"}
         self.calls.append(payload)
         if self.results:
             return self.results.pop(0)
@@ -77,8 +87,13 @@ async def deliver(session, tenant, payload, sender, topic="orders/updated", plat
     return await process_webhook(session, tenant, platform, topic, payload, sender=sender, **kw)
 
 
-def capi_rows(session):
+def all_capi_rows(session):
     return session.scalars(select(CapiEvent).order_by(CapiEvent.id)).all()
+
+
+def capi_rows(session):
+    """DeliveredPurchase rows only (every delivered order also has a ConfirmedOrder row; see all_capi_rows)."""
+    return [r for r in all_capi_rows(session) if r.event_name == "DeliveredPurchase"]
 
 
 @pytest.fixture

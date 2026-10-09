@@ -219,16 +219,22 @@ async def test_handle_shopify_cod_paid_emits_delivered_purchase(sent_events):
     assert decision["action"] == "READY_TO_EMIT"
     assert decision["event_name"] == "DeliveredPurchase"
     assert decision["event_id"] == "delivered_987654321"
-    assert len(sent_events) == 1
-    assert sent_events[0]["data"][0]["event_name"] == "DeliveredPurchase"
-    assert sent_events[0]["data"][0]["event_id"] == "delivered_987654321"
+    assert decision["payload"]["data"][0]["event_name"] == "DeliveredPurchase"
+    assert decision["payload"]["data"][0]["event_id"] == "delivered_987654321"
+    assert "capi_dispatch_result" not in decision
+    assert sent_events == []  # handle_order_update is decision-only (FX-3): pixel_id/access_token are ignored
 
 @pytest.mark.asyncio
 async def test_handle_shopify_cod_shipped_and_cancelled_do_not_emit(sent_events):
     processor = OrderWebhookProcessor()
     shipped = await processor.handle_order_update(
-        "shopify", _shopify(fulfillment_status="fulfilled"), pixel_id="123", access_token="tok")
-    assert shipped["d005_decision"]["action"] == "DEFERRED"
+        "shopify", _shopify(fulfillment_status="fulfilled"), pixel_id="123", access_token="tok",
+        confirmation_rules={"implicit_on_ship": False})
+    assert shipped["d005_decision"]["action"] == "DEFERRED"  # no DeliveredPurchase until delivered
+    # With the default rules, shipping is an implicit confirmation: a ConfirmedOrder decision (still never sent here)
+    implicit = await processor.handle_order_update("shopify", _shopify(fulfillment_status="fulfilled"))
+    assert implicit["d005_decision"]["event_name"] == "ConfirmedOrder"
+    assert implicit["parsed_order"]["confirmation_source"] == "implicit_shipped"
     for overrides in ({"cancelled_at": "2026-10-01T10:00:00Z"}, {"financial_status": "refunded"}, {"financial_status": "voided"}):
         res = await processor.handle_order_update(
             "shopify", _shopify(fulfillment_status="fulfilled", **overrides), pixel_id="123", access_token="tok")
@@ -240,7 +246,7 @@ async def test_handle_shopify_prepaid_paid_emits(sent_events):
     order = _shopify(financial_status="paid", payment_gateway_names=["shopify_payments"])
     result = await OrderWebhookProcessor().handle_order_update("shopify", order, pixel_id="123", access_token="tok")
     assert result["d005_decision"]["event_id"] == "delivered_987654321"
-    assert len(sent_events) == 1
+    assert sent_events == []  # decision-only
 
 @pytest.mark.asyncio
 async def test_handle_fulfillment_delivered_needs_order_context_then_emits_with_context(sent_events):
@@ -267,7 +273,7 @@ async def test_handle_fulfillment_delivered_needs_order_context_then_emits_with_
         order_context={"total_price": 850.0, "currency": "EGP", "is_cod": True, "email": "a@example.com"})
     assert joined["d005_decision"]["action"] == "READY_TO_EMIT"
     assert joined["d005_decision"]["event_id"] == "delivered_987654321"
-    assert len(sent_events) == 1
+    assert sent_events == []  # decision-only
 
 @pytest.mark.asyncio
 async def test_handle_unsupported_platform():
@@ -350,7 +356,7 @@ async def test_cod_paid_unfulfilled_is_held_and_paid_fulfilled_emits(sent_events
     emitted = await processor.handle_order_update(
         "shopify", _shopify(financial_status="paid", fulfillment_status="fulfilled"), pixel_id="123", access_token="tok")
     assert emitted["d005_decision"]["action"] == "READY_TO_EMIT"
-    assert len(sent_events) == 1
+    assert sent_events == []  # decision-only
 
 @pytest.mark.asyncio
 async def test_send_event_uses_access_token_param_not_authorization_header(monkeypatch):

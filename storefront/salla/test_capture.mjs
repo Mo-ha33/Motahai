@@ -1,4 +1,4 @@
-// Node test for storefront/salla_capture.js: runs the script in a vm with a fake window/document/storage/fetch.
+// Node test for storefront/salla/salla_capture.js: runs the script in a vm with a fake window/document/storage/fetch.
 // Usage: node storefront/salla/test_capture.mjs   (exit code 1 on failure)
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -7,8 +7,9 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const SCRIPT = fs.readFileSync(
-  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'salla_capture.js'), 'utf8');
+  path.join(path.dirname(fileURLToPath(import.meta.url)), 'salla_capture.js'), 'utf8');
 const DAY = 864e5;
+const CORE = 'https://core.example.com';
 
 function makeStorage(throwing = false) {
   const m = new Map();
@@ -39,6 +40,7 @@ async function load(b, {
   motahaiConfig,
   fetchImpl,
   localStorageThrows = false,
+  beacon = true,
   userAgent = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)'
 } = {}) {
   const listeners = {};
@@ -67,11 +69,17 @@ async function load(b, {
         }
       }
     },
-    MOTAHAI_CONFIG: motahaiConfig,
-    navigator: { userAgent },
+    MOTAHAI_CONFIG: motahaiConfig === undefined ? { core_host: CORE } : motahaiConfig,
+    navigator: {
+      userAgent,
+      ...(beacon ? { sendBeacon: (url, blob) => {
+        b.calls.push({ url, via: 'beacon', type: blob.type, body: JSON.parse(blob.text) });
+        return true;
+      } } : {}),
+    },
   };
   const fetch = fetchImpl || ((url, opts) => {
-    b.calls.push({ url, opts, body: JSON.parse(opts.body) });
+    b.calls.push({ url, opts, via: 'fetch', body: JSON.parse(opts.body) });
     return Promise.resolve({ ok: b.fetchOk });
   });
 
@@ -81,6 +89,7 @@ async function load(b, {
     fetch,
     URLSearchParams,
     Date: FakeDate,
+    Blob: class { constructor(parts, o) { this.text = parts.join(''); this.type = (o && o.type) || ''; } },
     JSON,
     Object,
     String,
@@ -118,7 +127,7 @@ test('landing page: captures click params and cookies into localStorage', async 
   assert.equal(stored.a.sccid, 'S1');
 });
 
-test('thank-you page: sends capture POST with order_id, merchant, attribution, UA', async () => {
+test('thank-you page: beacon POST to <core>/v1/capture/<merchant> with order_id, total, currency, attribution (no ip/UA)', async () => {
   const b = makeBrowser();
   b.cookies._fbp = 'fb.1.1700000000000.1234567890';
   // Step 1: visit landing page
@@ -133,6 +142,8 @@ test('thank-you page: sends capture POST with order_id, merchant, attribution, U
         if (k === 'page.slug') return 'thank-you';
         if (k === 'merchant.id') return '1234567';
         if (k === 'order.id') return '998877';
+        if (k === 'order.total') return 350.5;
+        if (k === 'order.currency') return 'sar';
         return null;
       }
     }
@@ -140,17 +151,18 @@ test('thank-you page: sends capture POST with order_id, merchant, attribution, U
   await load(b, { pathname: '/orders/998877', salla });
 
   assert.equal(b.calls.length, 1);
-  assert.equal(b.calls[0].url, '/storefront/capture');
-  assert.equal(b.calls[0].opts.method, 'POST');
+  assert.equal(b.calls[0].url, `${CORE}/v1/capture/1234567`);
+  assert.equal(b.calls[0].via, 'beacon');
+  assert.ok(b.calls[0].type.startsWith('text/plain'), 'simple request: no preflight');
   const payload = b.calls[0].body;
-  assert.equal(payload.platform, 'salla');
-  assert.equal(payload.merchant, '1234567');
   assert.equal(payload.order_id, '998877');
+  assert.equal(payload.order_total, 350.5);
+  assert.equal(payload.currency, 'SAR');
+  for (const k of ['user_agent', 'client_ip', 'ip', 'merchant', 'platform']) assert.ok(!(k in payload), `no ${k} in body`);
   assert.equal(payload.attribution.utm_source, 'meta');
   assert.equal(payload.attribution.ad_id, '222');
   assert.equal(payload.attribution.fbp, 'fb.1.1700000000000.1234567890');
   assert.equal(payload.attribution.fbc, `fb.1.${b.now}.ABC_d-1`);
-  assert.ok(payload.user_agent.includes('iPhone'));
 });
 
 test('attaches to order note via salla.order.updateNote when available', async () => {
@@ -163,6 +175,8 @@ test('attaches to order note via salla.order.updateNote when available', async (
         if (k === 'page.slug') return 'thank-you';
         if (k === 'merchant.id') return '1234567';
         if (k === 'order.id') return '554433';
+        if (k === 'order.total') return '100';
+        if (k === 'order.currency') return 'EGP';
         return null;
       }
     },
@@ -192,6 +206,8 @@ test('deduplication: reload of thank-you page does not send second capture POST'
         if (k === 'page.slug') return 'thank-you';
         if (k === 'merchant.id') return '1234567';
         if (k === 'order.id') return '1001';
+        if (k === 'order.total') return '100';
+        if (k === 'order.currency') return 'EGP';
         return null;
       }
     }
@@ -213,6 +229,8 @@ test('expired click (> 7 days) is cleared and not attached', async () => {
         if (k === 'page.slug') return 'thank-you';
         if (k === 'merchant.id') return '1234567';
         if (k === 'order.id') return '2002';
+        if (k === 'order.total') return '100';
+        if (k === 'order.currency') return 'EGP';
         return null;
       }
     }
@@ -235,8 +253,52 @@ test('never throws on storage failure or network failure', async () => {
     pathname: '/orders/3003',
     salla,
     localStorageThrows: true,
+    beacon: false,
     fetchImpl: () => Promise.reject(new Error('Network down'))
   });
+});
+
+function sallaOrder(id, extra = {}) {
+  const vals = { 'page.slug': 'thank-you', 'merchant.id': '1234567', 'order.id': id, ...extra };
+  return { config: { get: (k) => (k in vals ? vals[k] : null) } };
+}
+
+test('no beacon support: falls back to fetch keepalive with text/plain, no credentials', async () => {
+  const b = makeBrowser();
+  await load(b, { pathname: '/orders/7001', beacon: false,
+    salla: sallaOrder('7001', { 'order.total': '1,250.00', 'order.currency': 'EGP' }) });
+  assert.equal(b.calls.length, 1);
+  assert.equal(b.calls[0].via, 'fetch');
+  assert.equal(b.calls[0].url, `${CORE}/v1/capture/1234567`);
+  assert.equal(b.calls[0].opts.keepalive, true);
+  assert.equal(b.calls[0].opts.credentials, 'omit');
+  assert.ok(b.calls[0].opts.headers['Content-Type'].startsWith('text/plain'));
+  assert.equal(b.calls[0].body.order_total, 1250);
+});
+
+test('no-op when order total or currency cannot be found', async () => {
+  const b = makeBrowser();
+  await load(b, { pathname: '/orders/7002', salla: sallaOrder('7002') });
+  assert.equal(b.calls.length, 0);
+});
+
+test('no-op when core_host is missing or not https', async () => {
+  for (const cfg of [{}, { core_host: 'http://core.example.com' }, { core_host: 'javascript:alert(1)' }]) {
+    const b = makeBrowser();
+    await load(b, { pathname: '/orders/7003', motahaiConfig: cfg,
+      salla: sallaOrder('7003', { 'order.total': 10, 'order.currency': 'EGP' }) });
+    assert.equal(b.calls.length, 0);
+  }
+});
+
+test('MOTAHAI_CONFIG overrides supply order_total / currency / merchant', async () => {
+  const b = makeBrowser();
+  await load(b, { pathname: '/orders/7004', motahaiConfig: { core_host: `${CORE}/`, merchant_id: '42', order_total: 99.9, currency: 'sar' },
+    salla: sallaOrder('7004') });
+  assert.equal(b.calls.length, 1);
+  assert.equal(b.calls[0].url, `${CORE}/v1/capture/42`);
+  assert.equal(b.calls[0].body.order_total, 99.9);
+  assert.equal(b.calls[0].body.currency, 'SAR');
 });
 
 let failed = 0;

@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import select, text
 
 from src.ameen_workforce.capi_service import MetaCAPISender
+from src.ameen_workforce.confirmation import set_confirmation_rules
 from src.ameen_workforce.db import Order
 from src.ameen_workforce.order_pipeline import process_webhook
 from src.ameen_workforce.webhook_listener import OrderWebhookProcessor, order_webhook_processor
@@ -204,6 +205,8 @@ async def test_ip_and_user_agent_are_not_stored_in_any_column(db_session, live_t
 
 @pytest.mark.asyncio
 async def test_fulfillment_triggered_send_uses_stored_fbp_fbc_and_stored_ip_ua(db_session, live_tenant):
+    # Explicit-only confirmation: a shipped COD order would otherwise also emit an implicit ConfirmedOrder (FX-3).
+    set_confirmation_rules(db_session, live_tenant, {"implicit_on_ship": False})
     sender = FakeSender()
     held = await deliver(db_session, live_tenant, shopify_order(financial_status="pending"), sender)
     assert held["action"] == "DEFERRED"  # COD shipped, not yet delivered
@@ -257,6 +260,6 @@ def test_capture_script_stays_small():
 
 
 def test_salla_capture_script_stays_small():
-    script = (ROOT / "storefront/salla_capture.js").read_text(encoding="utf-8")
-    assert len(script.encode("utf-8")) < 10000
+    script = (ROOT / "storefront/salla/salla_capture.js").read_text(encoding="utf-8")
+    assert len(script.encode("utf-8")) < 14000
 

@@ -3,6 +3,15 @@ webhook_routes.py — Public webhook endpoints for Shopify and Salla (S1-2).
 
   POST /webhooks/shopify/{topic}   e.g. /webhooks/shopify/orders/updated
   POST /webhooks/salla             topic is the payload's `event` (e.g. order.status.updated)
+  POST /webhooks/bosta/{shop_domain}   courier delivery updates (Bosta); Authorization header = per-tenant secret
+  POST /webhooks/oto/{shop_domain}     courier order status (OTO); HMAC over orderId:status:timestamp, per-tenant secret
+
+Courier routes (S2-5 / FX-1): the tenant comes ONLY from the URL (each merchant configures their own URL in their
+courier dashboard); there are no un-scoped routes and no payload/query/header fallback. Order numbers are per-merchant
+and collide across stores, so the order is always looked up by (tenant_id, platform_order_id). The secret is the
+tenant's own credential of kind `bosta_webhook_secret` / `oto_webhook_secret` (credentials.store_credential, e.g. via
+scripts/onboard_store.py); a tenant without one gets 401. There is no shared env secret. Checks run: tenant (404) ->
+auth (401, audit row) -> JSON (400) -> background processing; nothing touches orders before auth succeeds.
 
 Request flow (each step fails closed):
   1. Body > 1 MB -> 413 (read in a bounded stream, nothing is stored).
@@ -36,11 +45,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .credentials import CredentialError, get_credential
 from .db import Incident, Order, Tenant, WebhookDelivery, get_session_factory, get_tenant_by_shop_domain
-from .order_pipeline import _merge_attribution, capture_checkout_context, process_webhook
-from .webhook_listener import (
-    ATTRIBUTION_FIELDS, sanitize_attribution, sanitize_client_ip, sanitize_user_agent
-)
+from .order_pipeline import process_webhook
 from .webhook_signatures import (
     BOSTA_AUTH_HEADER, OTO_SIGNATURE_HEADER, SALLA_SIGNATURE_HEADER, SHOPIFY_HMAC_HEADER,
     verify_bosta_auth, verify_oto_signature, verify_salla_signature, verify_shopify_hmac
@@ -50,8 +57,9 @@ logger = logging.getLogger("ameen_workforce.webhooks")
 
 SHOPIFY_SECRET_ENV = "SHOPIFY_APP_SECRET"
 SALLA_SECRET_ENV = "SALLA_WEBHOOK_SECRET"
-BOSTA_SECRET_ENV = "BOSTA_WEBHOOK_SECRET"
-OTO_SECRET_ENV = "OTO_WEBHOOK_SECRET"
+# Courier secrets are PER TENANT (credentials table); there is deliberately no env/global fallback.
+BOSTA_SECRET_KIND = "bosta_webhook_secret"
+OTO_SECRET_KIND = "oto_webhook_secret"
 MAX_BODY_BYTES = 1_000_000  # 1 MB
 INCIDENT_KIND = "webhook_processing_error"
 
@@ -235,110 +243,105 @@ async def salla_webhook(request: Request, background_tasks: BackgroundTasks,
     return await _ingest(request, background_tasks, factory, "salla", None)
 
 
+async def _reject_courier(
+    session: Session, tenant_id: Optional[int], platform: str, topic: str, raw: bytes, error_type: str,
+    status_code: int, detail: str, signature_ok: bool = False
+) -> None:
+    """Records the audit row (hash only; never the payload, never an unauthenticated delivery id) and raises."""
+    _record_delivery(session, tenant_id, platform, topic, None, raw, signature_ok, False, error_type)
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _courier_secret(session: Session, tenant: Tenant, kind: str) -> str:
+    """Per-tenant courier secret. Missing, expired or undecryptable -> "" so verification fails closed (401)."""
+    try:
+        return get_credential(session, tenant.id, kind) or ""
+    except CredentialError as exc:
+        logger.error("Courier secret %s unreadable for tenant %s: %s", kind, tenant.id, type(exc).__name__)
+        return ""
+
+
 async def _ingest_bosta(
-    request: Request, background_tasks: BackgroundTasks, factory: sessionmaker,
-    shop_domain: Optional[str] = None
+    request: Request, background_tasks: BackgroundTasks, factory: sessionmaker, shop_domain: str
 ) -> Dict[str, str]:
+    """
+    Order of checks (each fails closed): tenant from the URL (404) -> per-tenant secret + auth header (401) ->
+    JSON (400) -> process in background. No order lookup happens before auth, and the tenant is NEVER inferred from
+    the order id (order numbers are per-merchant and collide across stores).
+    """
     raw = await _read_body(request)
     headers = request.headers
-    secret = os.environ.get(BOSTA_SECRET_ENV, "")
-    auth_header = headers.get(BOSTA_AUTH_HEADER) or headers.get("X-Bosta-Signature")
-
-    signed = verify_bosta_auth(auth_header, secret) if secret else True
 
     session = factory()
     try:
-        if not signed:
-            logger.warning("Rejected Bosta webhook: invalid auth header")
-            _record_delivery(session, None, "bosta", "delivery_update", None, raw,
-                             False, False, "invalid_signature")
-            raise HTTPException(status_code=401, detail="Invalid webhook authentication")
+        tenant = get_tenant_by_shop_domain(session, shop_domain) if shop_domain else None
+        if tenant is None:
+            logger.warning("Bosta webhook for unknown shop")
+            await _reject_courier(session, None, "bosta", "delivery_update", raw, "unknown_tenant", 404, "Unknown shop",
+                                  signature_ok=False)
+
+        secret = _courier_secret(session, tenant, BOSTA_SECRET_KIND)
+        auth_header = headers.get(BOSTA_AUTH_HEADER) or headers.get("X-Bosta-Signature")
+        if not verify_bosta_auth(auth_header, secret):
+            logger.warning("Rejected Bosta webhook for tenant %s: %s", tenant.id,
+                           "secret not configured" if not secret else "invalid auth header")
+            await _reject_courier(session, tenant.id, "bosta", "delivery_update", raw,
+                                  "signature_not_configured" if not secret else "invalid_signature", 401,
+                                  "Invalid webhook authentication")
 
         payload = _try_json(raw)
         if payload is None:
-            _record_delivery(session, None, "bosta", "delivery_update", None, raw, True, False, "invalid_json")
-            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+            await _reject_courier(session, tenant.id, "bosta", "delivery_update", raw, "invalid_json", 400,
+                                  "Body must be a JSON object", signature_ok=True)
 
         data = payload.get("data") or payload.get("delivery") or payload
-        order_id = str(
-            data.get("businessReference")
-            or data.get("business_reference")
-            or data.get("orderId")
-            or data.get("order_id")
-            or data.get("reference")
-            or data.get("_id")
-            or ""
-        )
+        data = data if isinstance(data, dict) else payload
         delivery_id = str(data.get("trackingNumber") or data.get("_id") or "") or None
-
-        domain = shop_domain or request.query_params.get("shop") or headers.get("X-Shop-Domain")
-        tenant = None
-        if domain:
-            tenant = get_tenant_by_shop_domain(session, domain)
-        if tenant is None and order_id:
-            order = session.scalar(select(Order).where(Order.platform_order_id == order_id).limit(1))
-            if order:
-                tenant = session.get(Tenant, order.tenant_id)
-
-        if tenant is None:
-            logger.warning("Bosta webhook for unknown tenant/order (order_id=%s)", order_id)
-            _record_delivery(session, None, "bosta", "delivery_update", delivery_id, raw, True, False, "unknown_tenant")
-            raise HTTPException(status_code=404, detail="Unknown shop or order")
-
         tenant_id = tenant.id
     finally:
         session.close()
 
-    background_tasks.add_task(_process_in_background, factory, tenant_id, "bosta", "delivery_update", payload, delivery_id)
+    background_tasks.add_task(_process_in_background, factory, tenant_id, "bosta", "delivery_update", payload,
+                              delivery_id)
     return {"status": "accepted"}
 
 
 async def _ingest_oto(
-    request: Request, background_tasks: BackgroundTasks, factory: sessionmaker,
-    shop_domain: Optional[str] = None
+    request: Request, background_tasks: BackgroundTasks, factory: sessionmaker, shop_domain: str
 ) -> Dict[str, str]:
+    """Same check order as _ingest_bosta; the OTO signature covers orderId:status:timestamp (see webhook_signatures)."""
     raw = await _read_body(request)
     headers = request.headers
-    payload = _try_json(raw)
-    if payload is None:
-        session = factory()
-        try:
-            _record_delivery(session, None, "oto", "orderStatus", None, raw, True, False, "invalid_json")
-        finally:
-            session.close()
-        raise HTTPException(status_code=400, detail="Body must be a JSON object")
-
-    data = payload.get("data") or payload
-    order_id = str(data.get("orderId") or data.get("order_id") or data.get("reference_id") or "")
-    status_val = str(data.get("status") or data.get("dcStatus") or "")
-    timestamp_val = str(data.get("timestamp") or "")
-    sig_val = str(data.get("signature") or headers.get(OTO_SIGNATURE_HEADER) or "")
-
-    secret = os.environ.get(OTO_SECRET_ENV, "")
-    signed = verify_oto_signature(order_id, status_val, timestamp_val, sig_val, secret) if secret else True
 
     session = factory()
     try:
-        delivery_id = str(data.get("trackingNumber") or data.get("orderId") or "") or None
-        if not signed:
-            logger.warning("Rejected OTO webhook: invalid signature")
-            _record_delivery(session, None, "oto", "orderStatus", delivery_id, raw, False, False, "invalid_signature")
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-        domain = shop_domain or request.query_params.get("shop") or headers.get("X-Shop-Domain")
-        tenant = None
-        if domain:
-            tenant = get_tenant_by_shop_domain(session, domain)
-        if tenant is None and order_id:
-            order = session.scalar(select(Order).where(Order.platform_order_id == order_id).limit(1))
-            if order:
-                tenant = session.get(Tenant, order.tenant_id)
-
+        tenant = get_tenant_by_shop_domain(session, shop_domain) if shop_domain else None
         if tenant is None:
-            logger.warning("OTO webhook for unknown tenant/order (order_id=%s)", order_id)
-            _record_delivery(session, None, "oto", "orderStatus", delivery_id, raw, True, False, "unknown_tenant")
-            raise HTTPException(status_code=404, detail="Unknown shop or order")
+            logger.warning("OTO webhook for unknown shop")
+            await _reject_courier(session, None, "oto", "orderStatus", raw, "unknown_tenant", 404, "Unknown shop",
+                                  signature_ok=False)
 
+        secret = _courier_secret(session, tenant, OTO_SECRET_KIND)
+        payload = _try_json(raw)
+        data = payload.get("data") if payload is not None else None
+        data = data if isinstance(data, dict) else (payload or {})
+        order_id = str(data.get("orderId") or data.get("order_id") or data.get("reference_id") or "")
+        status_val = str(data.get("status") or data.get("dcStatus") or "")
+        timestamp_val = str(data.get("timestamp") or "")
+        sig_val = str(data.get("signature") or headers.get(OTO_SIGNATURE_HEADER) or "")
+
+        if not verify_oto_signature(order_id, status_val, timestamp_val, sig_val, secret):
+            logger.warning("Rejected OTO webhook for tenant %s: %s", tenant.id,
+                           "secret not configured" if not secret else "invalid signature")
+            await _reject_courier(session, tenant.id, "oto", "orderStatus", raw,
+                                  "signature_not_configured" if not secret else "invalid_signature", 401,
+                                  "Invalid webhook signature")
+
+        if payload is None:
+            await _reject_courier(session, tenant.id, "oto", "orderStatus", raw, "invalid_json", 400,
+                                  "Body must be a JSON object", signature_ok=True)
+
+        delivery_id = str(data.get("trackingNumber") or data.get("orderId") or "") or None
         tenant_id = tenant.id
     finally:
         session.close()
@@ -347,81 +350,13 @@ async def _ingest_oto(
     return {"status": "accepted"}
 
 
-@router.post("/webhooks/bosta")
 @router.post("/webhooks/bosta/{shop_domain}")
-async def bosta_webhook(request: Request, background_tasks: BackgroundTasks,
-                        shop_domain: Optional[str] = None,
+async def bosta_webhook(shop_domain: str, request: Request, background_tasks: BackgroundTasks,
                         factory: sessionmaker = Depends(get_session_factory_dep)):
     return await _ingest_bosta(request, background_tasks, factory, shop_domain)
 
 
-@router.post("/webhooks/oto")
 @router.post("/webhooks/oto/{shop_domain}")
-async def oto_webhook(request: Request, background_tasks: BackgroundTasks,
-                      shop_domain: Optional[str] = None,
+async def oto_webhook(shop_domain: str, request: Request, background_tasks: BackgroundTasks,
                       factory: sessionmaker = Depends(get_session_factory_dep)):
     return await _ingest_oto(request, background_tasks, factory, shop_domain)
-
-
-@router.post("/storefront/capture")
-@router.post("/webhooks/salla/capture")
-async def storefront_capture(request: Request,
-                             factory: sessionmaker = Depends(get_session_factory_dep)):
-    """
-    S2-8: Ingests client-side attribution capture (fbp, fbc, user_agent, utm_*, ad_id, IP)
-    from the storefront thank-you page snippet.
-    """
-    raw = await _read_body(request)
-    payload = _try_json(raw)
-    if payload is None:
-        raise HTTPException(status_code=400, detail="Body must be a JSON object")
-
-    merchant = payload.get("merchant") or payload.get("shop_domain")
-    order_id = str(payload.get("order_id") or payload.get("id") or "").strip()
-    if not order_id:
-        raise HTTPException(status_code=400, detail="Missing order_id")
-    if not merchant:
-        raise HTTPException(status_code=400, detail="Missing merchant")
-
-    session = factory()
-    try:
-        tenant = get_tenant_by_shop_domain(session, str(merchant))
-        if tenant is None:
-            raise HTTPException(status_code=404, detail="Unknown shop")
-
-        raw_attr = payload.get("attribution")
-        if not isinstance(raw_attr, dict):
-            raw_attr = {k: payload.get(k) for k in ATTRIBUTION_FIELDS}
-        sanitized_attr = sanitize_attribution(raw_attr)
-
-        client_ip = sanitize_client_ip(
-            payload.get("client_ip") or (request.client.host if request.client else None)
-        )
-        user_agent = sanitize_user_agent(
-            payload.get("user_agent") or request.headers.get("user-agent")
-        )
-
-        order = session.scalar(select(Order).where(
-            Order.tenant_id == tenant.id, Order.platform_order_id == order_id
-        ))
-        if order is None:
-            order = Order(
-                tenant_id=tenant.id,
-                platform_order_id=order_id,
-                current_status="pending",
-                currency=tenant.currency,
-            )
-            session.add(order)
-            session.flush()
-
-        _merge_attribution(order, sanitized_attr)
-
-        if client_ip or user_agent:
-            capture_checkout_context(session, order.id, client_ip, user_agent)
-
-        session.commit()
-        return {"status": "captured", "order_id": order_id}
-    finally:
-        session.close()
-
-

@@ -23,11 +23,13 @@ import ipaddress
 import json
 import logging
 import re
+import warnings
 from typing import Dict, Any, Optional
 from .capi_service import (
-    CONFIRMED_EVENT, CONFIRMED_EVENT_NAME, CONFIRMED_STATUSES, DELIVERED_EVENT, DELIVERED_EVENT_NAME,
+    CONFIRMED_EVENT, CONFIRMED_EVENT_NAME, DELIVERED_EVENT, DELIVERED_EVENT_NAME,
     EventType, capi_sender, hash_match_value
 )
+from .confirmation import evaluate_confirmation, normalized_tags
 
 logger = logging.getLogger("ameen_workforce.webhooks")
 
@@ -40,7 +42,11 @@ FULFILLMENT_PLATFORM = "shopify_fulfillment"
 SALLA_DELIVERED_SLUGS = ("delivered", "completed", "تم التوصيل", "مكتمل")
 SALLA_CANCELLED_SLUGS = ("canceled", "cancelled", "ملغي", "ملغى")
 SALLA_PAID_SLUGS = ("in_progress", "processing", "shipping", "shipped", "delivering")
-SALLA_CONFIRMED_SLUGS = ("confirmed", "in_review", "under_review", "مؤكد", "قيد المراجعة", "تحت المراجعة")
+# Salla actually handed the order to a carrier / delivered it (implicit_shipped confirmation source).
+SALLA_SHIPPED_SLUGS = ("shipped", "shipping", "delivering")
+# NOTE: there is deliberately NO default list of Salla "confirmed" statuses. `in_review` / `under_review` (and their
+# Arabic names) mean the order is still AWAITING review, i.e. before confirmation. A merchant's real confirmed status is
+# configured per tenant (tenants.confirmation_rules["statuses"], see confirmation.py).
 
 # Courier platforms & status mappings (S2-5)
 BOSTA_PLATFORM = "bosta"
@@ -287,9 +293,11 @@ def match_hashes_from_parsed(parsed: Dict[str, Any]) -> Dict[str, Optional[str]]
 
 class OrderWebhookProcessor:
     @staticmethod
-    def parse_shopify_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def parse_shopify_order(payload: Dict[str, Any], rules: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Parses Shopify orders/fulfilled, orders/updated, or orders/paid webhook.
+        `rules` = the tenant's confirmation rules (confirmation.effective_confirmation_rules; None = defaults); they
+        set parsed["is_confirmed"] / ["confirmation_source"] (a cancelled/refunded/voided order is never confirmed).
         Status: cancelled | voided | refunded (never emit), delivered (COD, paid and fulfilled),
         paid_unfulfilled (COD, paid but not fulfilled: held), paid (prepaid, paid),
         shipped (fulfilled but not paid), pending.
@@ -334,18 +342,14 @@ class OrderWebhookProcessor:
         client_details = payload.get("client_details")
         client_details = client_details if isinstance(client_details, dict) else {}
 
-        # S2-2 ConfirmedOrder: trigger on tag containing 'confirmed' (or explicit confirmed status)
-        raw_tags = payload.get("tags")
-        is_confirmed = False
-        if isinstance(raw_tags, str):
-            tag_items = [t.strip().lower() for t in raw_tags.split(",") if t.strip()]
-            is_confirmed = any("confirmed" in t for t in tag_items)
-        elif isinstance(raw_tags, list):
-            is_confirmed = any("confirmed" in str(t).strip().lower() for t in raw_tags if str(t).strip())
-        if not is_confirmed and isinstance(payload.get("tag_list"), list):
-            is_confirmed = any("confirmed" in str(t).strip().lower() for t in payload.get("tag_list") if str(t).strip())
-        if not is_confirmed and str(payload.get("status") or "").lower() == "confirmed":
-            is_confirmed = True
+        # ConfirmedOrder (FX-3): explicit merchant tag (exact match), else implicit shipped/paid; per-tenant `rules`.
+        tags = normalized_tags(payload.get("tags")) + normalized_tags(payload.get("tag_list"))
+        has_fulfillment = fulfillment_status in ("fulfilled", "partial") or bool(payload.get("fulfillments"))
+        confirmation_source = evaluate_confirmation(
+            rules, effective_status=effective_status, tags=tags,
+            shipped=has_fulfillment or effective_status in ("shipped", "delivered"),
+            prepaid_paid=effective_status == "paid" and not is_cod)
+        is_confirmed = confirmation_source is not None
 
         return {
             "platform": "shopify",
@@ -355,6 +359,7 @@ class OrderWebhookProcessor:
             "total_price": total_price,
             "order_total": order_total,
             "is_confirmed": is_confirmed,
+            "confirmation_source": confirmation_source,
             "updated_at": payload.get("updated_at"),
             "currency": currency,
             "email": email,
@@ -407,9 +412,11 @@ class OrderWebhookProcessor:
         }
 
     @staticmethod
-    def parse_salla_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def parse_salla_order(payload: Dict[str, Any], rules: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Parses Salla order.status.updated webhook.
+        `rules` = the tenant's confirmation rules (None = defaults). Review statuses (`under_review`, `in_review`) are NOT
+        confirmation: only a merchant tag, a status the tenant configured, or an actually shipped/paid order confirms.
         """
         data = payload.get("data") or payload
         order_id = str(data.get("id") or data.get("reference_id") or "")
@@ -439,14 +446,15 @@ class OrderWebhookProcessor:
         order_total = total_price
         currency = (amounts.get("total") or {}).get("currency") or data.get("currency") or "SAR"
 
-        # S2-2 ConfirmedOrder: trigger on Salla status ('confirmed' / 'in_review') or tag containing 'confirmed'
-        is_confirmed = status_slug in SALLA_CONFIRMED_SLUGS
-        raw_tags = data.get("tags")
-        if not is_confirmed:
-            if isinstance(raw_tags, list):
-                is_confirmed = any("confirmed" in str(t).strip().lower() for t in raw_tags if str(t).strip())
-            elif isinstance(raw_tags, str):
-                is_confirmed = any("confirmed" in t.strip().lower() for t in raw_tags.split(",") if t.strip())
+        # ConfirmedOrder (FX-3): merchant tag (exact), a merchant-configured status slug/name, else implicit shipped/paid.
+        customized = status_info.get("customized") if isinstance(status_info.get("customized"), dict) else {}
+        status_candidates = [status_info.get("slug"), status_info.get("name"), customized.get("name")]
+        confirmation_source = evaluate_confirmation(
+            rules, effective_status=effective_status, tags=normalized_tags(data.get("tags")),
+            status_candidates=[c for c in status_candidates if isinstance(c, str)],
+            shipped=status_slug in SALLA_DELIVERED_SLUGS or status_slug in SALLA_SHIPPED_SLUGS,
+            prepaid_paid=effective_status == "paid")
+        is_confirmed = confirmation_source is not None
 
         attribution = extract_salla_attribution(payload)
         src = data.get("source_details") if isinstance(data.get("source_details"), dict) else {}
@@ -466,6 +474,7 @@ class OrderWebhookProcessor:
             "total_price": total_price,
             "order_total": order_total,
             "is_confirmed": is_confirmed,
+            "confirmation_source": confirmation_source,
             "updated_at": data.get("updated_at"),
             "currency": currency,
             "email": email,
@@ -603,21 +612,32 @@ class OrderWebhookProcessor:
         access_token: Optional[str] = None,
         test_event_code: Optional[str] = None,
         order_context: Optional[Dict[str, Any]] = None,
-        event_type: Optional[EventType] = None
+        event_type: Optional[EventType] = None,
+        confirmation_rules: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Ingests the platform webhook, applies Rule D-005, and dispatches custom CAPI events
-        ('DeliveredPurchase' or 'ConfirmedOrder') to Meta CAPI if eligible.
+        DECISION-ONLY: parses the platform webhook and applies Rule D-005 ('DeliveredPurchase' or 'ConfirmedOrder'),
+        returning {"status", "parsed_order", "d005_decision"}. It NEVER sends anything to Meta: settlement windows,
+        the late-delivery cutoff and idempotency live in the persistent pipeline (order_pipeline.process_webhook).
+
+        pixel_id / access_token: DEPRECATED and IGNORED (they used to trigger a direct send that bypassed settlement,
+        cutoff and idempotency). Passing either emits a DeprecationWarning.
+        confirmation_rules: the tenant's rules (confirmation.effective_confirmation_rules); None = defaults.
         """
+        if pixel_id is not None or access_token is not None:
+            warnings.warn(
+                "handle_order_update(pixel_id=..., access_token=...) is deprecated and ignored: it is decision-only "
+                "and never sends. Use order_pipeline.process_webhook to send.",
+                DeprecationWarning, stacklevel=2)
         if platform == "shopify":
-            parsed = self.parse_shopify_order(payload)
+            parsed = self.parse_shopify_order(payload, confirmation_rules)
         elif platform == FULFILLMENT_PLATFORM:
             parsed = self.parse_shopify_fulfillment(payload)
             if order_context and order_context.get("total_price") is not None:
                 parsed = {**parsed, **{k: v for k, v in order_context.items() if k in (
                     "total_price", "currency", "is_cod", "email", "phone")}, "needs_order_context": False}
         elif platform == "salla":
-            parsed = self.parse_salla_order(payload)
+            parsed = self.parse_salla_order(payload, confirmation_rules)
         elif platform in ("bosta", BOSTA_PLATFORM):
             parsed = self.parse_bosta_delivery(payload)
             if order_context and order_context.get("total_price") is not None:
@@ -661,14 +681,6 @@ class OrderWebhookProcessor:
             event_type=event_type,
             is_confirmed=bool(parsed.get("is_confirmed"))
         )
-
-        if decision["action"] == "READY_TO_EMIT" and pixel_id and access_token:
-            result = await capi_sender.send_event(
-                pixel_id=pixel_id,
-                access_token=access_token,
-                payload=decision["payload"]
-            )
-            decision["capi_dispatch_result"] = result
 
         return {
             "status": "processed",

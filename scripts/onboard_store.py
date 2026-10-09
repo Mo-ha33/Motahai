@@ -20,10 +20,18 @@ Usage:
         --mode shadow
 
 Options:
-    --skip-ping         Skip CAPI test event verification ping
-    --test-event-code   Meta test event code (e.g. TEST12345)
-    --dry-run           Validate inputs without writing to DB or Meta
-    --json              Output result as JSON
+    --verify-capi-ping        Send a MotahaiConnectionTest event to Meta to verify dataset + token (opt-in).
+                              REQUIRES --test-event-code: without it the CLI exits non-zero and sends nothing.
+    --test-event-code         Meta test event code (e.g. TEST12345) from Events Manager; keeps the ping out of live data
+    --skip-ping               Skip the ping even if --verify-capi-ping is given
+    --bosta-webhook-secret    Bosta webhook secret (stored encrypted as bosta_webhook_secret)
+    --oto-webhook-secret      OTO webhook secret (stored encrypted as oto_webhook_secret)
+    --generate-courier-secrets  Generate strong Bosta + OTO secrets, store them, print them ONCE with webhook URLs
+    --dry-run                 Validate inputs without writing to DB or Meta
+    --json                    Output result as JSON
+
+Requires MOTAHAI_FERNET_KEY in the environment (outside --dry-run). A throwaway key would make the stored
+credentials unreadable by the services, so none is generated for real runs.
 """
 
 import argparse
@@ -31,6 +39,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 from typing import Any, Dict, Optional, Sequence
@@ -45,6 +54,7 @@ from src.ameen_workforce.capi_service import MetaCAPISender, capi_sender, hash_e
 from src.ameen_workforce.credentials import (
     FERNET_KEY_ENV, CredentialConfigError, encrypt_value, generate_key, store_credential
 )
+from src.ameen_workforce.config import settings
 from src.ameen_workforce.db import (
     PLATFORMS, TENANT_MODES, Tenant, create_tenant, get_session_factory,
     get_tenant_by_shop_domain, init_db, session_scope
@@ -52,6 +62,42 @@ from src.ameen_workforce.db import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("onboard_store")
+
+# Connection-test event. A custom name so the ping can never land in the merchant's dataset as a DeliveredPurchase
+# (custom conversion campaigns optimise on that event).
+CAPI_PING_EVENT_NAME = "MotahaiConnectionTest"
+# Courier webhook secret kinds; the courier webhook routes read exactly these credential kinds.
+COURIER_SECRET_KINDS = {"bosta": "bosta_webhook_secret", "oto": "oto_webhook_secret"}
+
+
+def store_courier_secrets(
+    session: Session,
+    tenant_id: int,
+    shop_domain: str,
+    bosta_secret: Optional[str] = None,
+    oto_secret: Optional[str] = None,
+    generate: bool = False,
+) -> Dict[str, Any]:
+    """
+    Stores courier webhook secrets (Fernet-encrypted) for one tenant. With generate=True, strong random secrets are
+    created (secrets.token_urlsafe(32)) and returned in "generated" so the caller can print them ONCE. Secrets are
+    never logged here.
+    """
+    if generate:
+        bosta_secret = secrets.token_urlsafe(32)
+        oto_secret = secrets.token_urlsafe(32)
+    base_url = settings.EMPLOYEES_PORTAL.rstrip("/")
+    status: Dict[str, str] = {}
+    generated: Dict[str, Dict[str, str]] = {}
+    for courier, value in (("bosta", bosta_secret), ("oto", oto_secret)):
+        if value is None:
+            continue
+        kind = COURIER_SECRET_KINDS[courier]
+        store_credential(session, tenant_id, kind, value.strip())
+        status[kind] = "configured (Fernet-encrypted)"
+        if generate:
+            generated[courier] = {"url": f"{base_url}/webhooks/{courier}/{shop_domain}", "secret": value}
+    return {"credentials": status, "generated": generated}
 
 
 def ensure_fernet_key() -> str:
@@ -212,22 +258,25 @@ async def verify_capi_ping(
     sender: Optional[MetaCAPISender] = None,
 ) -> Dict[str, Any]:
     """
-    Sends a test ping event to Meta Conversions API to verify the dataset ID
-    and CAPI token connection.
+    Sends a connection-test event (MotahaiConnectionTest) to Meta Conversions API to verify the dataset ID and CAPI
+    token. A Meta test_event_code is mandatory: without one the event would reach the live dataset, so this raises
+    ValueError before anything is sent.
     """
+    if not test_event_code or not str(test_event_code).strip():
+        raise ValueError("verify_capi_ping requires a Meta test_event_code; refusing to send a connection test to live data")
     active_sender = sender or capi_sender
     order_id = f"TEST-ONBOARD-{int(time.time())}"
     event_id = f"test_onboard_ping_{int(time.time())}"
 
     payload = active_sender.build_event_payload(
-        event_name="DeliveredPurchase",
+        event_name=CAPI_PING_EVENT_NAME,
         event_id=event_id,
         order_id=order_id,
         value=1.0,
         currency=currency,
         email_hash=hash_email("test_onboard@motahai.com"),
         phone_hash=hash_phone("0500000000", currency=currency, country=country),
-        test_event_code=test_event_code,
+        test_event_code=str(test_event_code).strip(),
         event_source_url=storefront_url
     )
 
@@ -242,7 +291,8 @@ async def verify_capi_ping(
             "status": "success",
             "events_received": result.get("events_received", 1),
             "fbtrace_id": result.get("fbtrace_id"),
-            "event_id": event_id
+            "event_id": event_id,
+            "event_name": CAPI_PING_EVENT_NAME
         }
     else:
         return {
@@ -270,11 +320,40 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--mode", default="shadow", choices=["shadow", "live"], help="Operational mode")
     parser.add_argument("--settlement-hours", type=float, default=12.0, help="Settlement window in hours")
     parser.add_argument("--storefront-url", default=None, help="Public storefront URL (e.g. https://store.com)")
-    parser.add_argument("--skip-ping", action="store_true", help="Skip Meta CAPI verification ping")
-    parser.add_argument("--test-event-code", default=None, help="Meta test event code (e.g. TEST12345)")
+    parser.add_argument("--verify-capi-ping", action="store_true",
+                        help="Send a MotahaiConnectionTest event to Meta to verify dataset + token. Requires --test-event-code.")
+    parser.add_argument("--skip-ping", action="store_true", help="Skip the Meta connection ping even if --verify-capi-ping is set")
+    parser.add_argument("--test-event-code", default=None,
+                        help="Meta test event code (e.g. TEST12345). Required by --verify-capi-ping; keeps the ping out of live data.")
+    parser.add_argument("--bosta-webhook-secret", default=None, help="Bosta webhook secret (stored encrypted)")
+    parser.add_argument("--oto-webhook-secret", default=None, help="OTO webhook secret (stored encrypted)")
+    parser.add_argument("--generate-courier-secrets", action="store_true",
+                        help="Generate strong Bosta + OTO webhook secrets, store them, and print them ONCE with the webhook URLs. "
+                             "Replaces any existing courier secrets.")
     parser.add_argument("--dry-run", action="store_true", help="Validate configuration without persisting to DB")
     parser.add_argument("--json", action="store_true", help="Print output as JSON")
     return parser.parse_args(args)
+
+
+def validate_cli_args(args: argparse.Namespace) -> Optional[str]:
+    """Returns a human-readable problem with the combination of flags, or None. Runs before anything is written or sent."""
+    if args.verify_capi_ping and not (args.test_event_code and args.test_event_code.strip()):
+        return ("--verify-capi-ping requires --test-event-code (the Meta test event code from Events Manager). "
+                "Nothing was sent and nothing was stored.")
+    if args.generate_courier_secrets and (args.bosta_webhook_secret is not None or args.oto_webhook_secret is not None):
+        return "--generate-courier-secrets cannot be combined with --bosta-webhook-secret or --oto-webhook-secret"
+    for flag, value in (("--bosta-webhook-secret", args.bosta_webhook_secret), ("--oto-webhook-secret", args.oto_webhook_secret)):
+        if value is not None and not value.strip():
+            return f"{flag} must not be empty"
+    return None
+
+
+def _fail(args: argparse.Namespace, message: str) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps({"status": "error", "message": message}, indent=2))
+    else:
+        print(f"\n[ERROR] {message}\n", file=sys.stderr)
+    return 2
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -283,10 +362,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 1
 
+    problem = validate_cli_args(args)
+    if problem:
+        return _fail(args, problem)
+    if not args.dry_run and not os.environ.get(FERNET_KEY_ENV):
+        return _fail(args, f"{FERNET_KEY_ENV} must be set in the environment. Refusing to store credentials under a "
+                           "throwaway key that the services could not read.")
+
     try:
         ensure_fernet_key()
         init_db()
 
+        courier_flags_given = bool(args.generate_courier_secrets or args.bosta_webhook_secret is not None
+                                   or args.oto_webhook_secret is not None)
         with session_scope() as session:
             onboard_result = onboard_store(
                 session=session,
@@ -304,9 +392,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 storefront_url=args.storefront_url,
                 dry_run=args.dry_run
             )
+            if args.dry_run:
+                if courier_flags_given:
+                    onboard_result["courier_secrets"] = "not stored (dry run)"
+            elif courier_flags_given:
+                courier_result = store_courier_secrets(
+                    session,
+                    tenant_id=onboard_result["tenant_id"],
+                    shop_domain=onboard_result["shop_domain"],
+                    bosta_secret=args.bosta_webhook_secret,
+                    oto_secret=args.oto_webhook_secret,
+                    generate=args.generate_courier_secrets,
+                )
+                onboard_result["credentials"].update(courier_result["credentials"])
+                if courier_result["generated"]:
+                    onboard_result["generated_courier_webhooks"] = courier_result["generated"]
 
         ping_result = None
-        if not args.skip_ping and not args.dry_run:
+        if args.verify_capi_ping and not args.skip_ping and not args.dry_run:
             logger.info("Executing Meta CAPI test ping for dataset %s...", args.meta_dataset_id)
             ping_result = asyncio.run(verify_capi_ping(
                 meta_dataset_id=args.meta_dataset_id,
@@ -338,6 +441,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("  Credentials:")
             print(f"    * Meta CAPI Token: {onboard_result['credentials']['meta_capi_token']}")
             print(f"    * Webhook Secret:  {onboard_result['credentials']['webhook_secret']}")
+            for kind in COURIER_SECRET_KINDS.values():
+                if kind in onboard_result["credentials"]:
+                    print(f"    * {kind}: {onboard_result['credentials'][kind]}")
+            if onboard_result.get("courier_secrets"):
+                print(f"    * Courier secrets: {onboard_result['courier_secrets']}")
+            generated = onboard_result.get("generated_courier_webhooks")
+            if generated:
+                print("  Courier webhooks (secrets shown ONCE: paste them into the courier dashboards; they are")
+                print("  stored encrypted and cannot be displayed again. Rotate by re-running with --generate-courier-secrets):")
+                for courier in ("bosta", "oto"):
+                    if courier in generated:
+                        print(f"    * {courier.capitalize()} URL:    {generated[courier]['url']}")
+                        print(f"      {courier.capitalize()} secret: {generated[courier]['secret']}")
             if ping_result:
                 print("  Verification Ping:")
                 status_str = ping_result.get("status", "").upper()

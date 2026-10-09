@@ -25,6 +25,7 @@ from .hermes_bridge import hermes_bridge
 from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
+from .capture_routes import router as capture_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -37,7 +38,19 @@ async def lifespan(_app: FastAPI):
         init_db()
     except Exception as exc:
         logger.error("Database initialisation failed: %s", type(exc).__name__)
-    yield
+    # The conversion scheduler runs in-app ONLY when MOTAHAI_RUN_SCHEDULER_IN_APP=1 (default off). Each uvicorn
+    # worker would start its own loop (service runs --workers 2), duplicating sends. Production runs the
+    # standalone daemon `python -m ameen_workforce.scheduler` (deployment/systemd/motahai-scheduler.service).
+    scheduler_in_app = None
+    if os.environ.get("MOTAHAI_RUN_SCHEDULER_IN_APP") == "1":
+        from .scheduler import SchedulerRunner
+        scheduler_in_app = SchedulerRunner()
+        await scheduler_in_app.start()
+    try:
+        yield
+    finally:
+        if scheduler_in_app is not None:
+            await scheduler_in_app.stop()
 
 app = FastAPI(
     title="Ameen Digital AI Workforce Engine",
@@ -46,6 +59,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 app.include_router(webhook_router)
+app.include_router(capture_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [

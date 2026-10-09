@@ -66,11 +66,13 @@ def raw_json(obj) -> bytes:
 
 
 class SpySender:
+    """`calls` = DeliveredPurchase payloads; ConfirmedOrder (funnel invariant) payloads go to `confirmed_calls`."""
     def __init__(self):
         self.calls = []
+        self.confirmed_calls = []
 
     async def __call__(self, pixel_id, access_token, payload):
-        self.calls.append(payload)
+        (self.calls if payload["data"][0]["event_name"] == "DeliveredPurchase" else self.confirmed_calls).append(payload)
         return {"status": "success", "fbtrace_id": "TRACE1"}
 
 
@@ -144,6 +146,7 @@ def test_shopify_valid_hmac_processes_in_background(client, factory, live_tenant
     assert delivery.signature_ok is True and delivery.processed_ok is True
     assert delivery.delivery_id == "wh-1" and delivery.tenant_id == live_tenant.id and delivery.topic == "orders/updated"
     assert len(spy.calls) == 1
+    assert [c["data"][0]["event_name"] for c in spy.confirmed_calls] == ["ConfirmedOrder"]  # Confirmed contains Delivered
 
 
 def test_shopify_tampered_body_is_401_and_recorded_unprocessed(client, factory, live_tenant, no_process):
@@ -202,7 +205,8 @@ def test_same_webhook_id_twice_is_duplicate_and_meta_called_once(client, factory
                            headers=shopify_headers(raw, webhook_id="wh-dup")).status_code == 200
     first, second = rows(factory, WebhookDelivery)
     assert first.is_duplicate is False and second.is_duplicate is True
-    assert len(spy.calls) == 1 and len(rows(factory, CapiEvent)) == 1
+    assert len(spy.calls) == 1 and len(spy.confirmed_calls) == 1
+    assert sorted(r.event_name for r in rows(factory, CapiEvent)) == ["ConfirmedOrder", "DeliveredPurchase"]
 
 
 def test_reserialized_json_fails_hmac_raw_body_is_what_is_verified(client, live_tenant, no_process):
