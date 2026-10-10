@@ -29,7 +29,7 @@ from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
 from .stats_routes import router as stats_router
-from .auth import require_operator  # noqa: F401  (defined in auth.py; re-exported for the approval route + tests)
+from .auth import require_operator, require_hermes  # noqa: F401  (defined in auth.py; re-exported for routes + tests)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -136,7 +136,7 @@ async def root():
     }
 
 @app.post("/tasks", response_model=TaskItem)
-async def create_and_run_task(req: CreateTaskRequest):
+async def create_and_run_task(req: CreateTaskRequest, _operator: None = Depends(require_operator)):
     """Creates and initiates execution of an AI Employee task."""
     task = workforce_engine.create_task(
         title=req.title,
@@ -152,18 +152,18 @@ async def create_and_run_task(req: CreateTaskRequest):
     return executed_task
 
 @app.get("/tasks/{task_id}", response_model=TaskItem)
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, _operator: None = Depends(require_operator)):
     if task_id not in workforce_engine.tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     return workforce_engine.tasks[task_id]
 
 @app.get("/escalations", response_model=List[EscalationNotice])
-async def list_pending_escalations():
+async def list_pending_escalations(_operator: None = Depends(require_operator)):
     """Supervisor view: Lists all tasks halted pending human review."""
     return hitl_manager.get_pending_escalations()
 
 @app.post("/escalations/{escalation_id}/resolve")
-async def resolve_escalation(escalation_id: str, req: ResolveEscalationRequest):
+async def resolve_escalation(escalation_id: str, req: ResolveEscalationRequest, _operator: None = Depends(require_operator)):
     """Supervisor action: Approve or reject halted task."""
     resolved = hitl_manager.resolve_escalation(
         escalation_id=escalation_id,
@@ -216,7 +216,7 @@ async def approve_gtm_publish(req: GtmPublishApprovalRequest, _operator: None = 
     }
 
 @app.post("/webhook/hermes")
-async def receive_from_hermes(request: Request, authorization: Optional[str] = Header(None)):
+async def receive_from_hermes(request: Request, _hermes: None = Depends(require_hermes)):
     """Receives task dispatches from Hermes Autonomous Agent."""
     body = await request.json()
     logger.info("Received dispatch from Hermes: %s", body.get("event_type"))
