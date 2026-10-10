@@ -15,7 +15,8 @@ Schema is created with create_all() for now. NOTE: create_all() never ALTERs an 
 (orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
 storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source, S1-4 tenants.digest_email +
 tenants.language, tenants.meta_test_event_code) and the new checkout_context and staged_webhooks tables need an Alembic
-migration before any non-empty database is upgraded.
+migration before any non-empty database is upgraded. S3-3 adds tenants.test_event_verified_at (nullable); an existing
+database needs: ALTER TABLE tenants ADD COLUMN test_event_verified_at TIMESTAMP WITH TIME ZONE;  (SQLite: DATETIME).
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
@@ -103,6 +104,9 @@ class Tenant(Base):
     # live tenant's events show in Test Events. Test sends still consume the (tenant, order, event) idempotency claim,
     # so use it on a test dataset or before launch, then clear it. NULL = normal sends. Set via set_meta_test_event_code.
     meta_test_event_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # S3-3: when order_pipeline.verify_test_event last got an HTTP success from Meta for this code (NULL = never, or the
+    # code changed since). Not a secret, but the code itself is never logged at INFO.
+    test_event_verified_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:
@@ -474,7 +478,10 @@ def normalize_test_event_code(code: Optional[str]) -> Optional[str]:
 
 def set_meta_test_event_code(session: Session, tenant: Tenant, code: Optional[str]) -> Optional[str]:
     """Sets (or with None/blank clears) the tenant's Meta test_event_code and commits. Returns the stored value."""
-    tenant.meta_test_event_code = normalize_test_event_code(code)
+    new_code = normalize_test_event_code(code)
+    if new_code != tenant.meta_test_event_code:
+        tenant.test_event_verified_at = None  # a verification belongs to the code it was run with
+    tenant.meta_test_event_code = new_code
     session.commit()
     return tenant.meta_test_event_code
 
