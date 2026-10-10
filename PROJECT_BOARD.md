@@ -64,19 +64,19 @@
 | M1-7 | Re-hash stored phone hashes after the E.164 fix so refuser keys merge — [#33](https://github.com/Mo-ha33/Motahai/issues/33) | Sonnet 5.5 | P0 | BACKLOG | phase-1, backend, capi, bug | Raw phone is never stored (db.py:150-152); re-hash needs re-fetching orders via the M1-2 API clients. Depends on: #28. (updated 2026-10-10) |
 | M1-8 | Verify Salla signature and merchant field against a real delivery — [#34](https://github.com/Mo-ha33/Motahai/issues/34) | Sonnet 5.5 | P0 | BACKLOG | phase-1, security, webhooks, needs-human | Depends on: none. (updated 2026-10-10) |
 | M2-1 | S2-8: Salla thank-you capture of UA and IP — [#35](https://github.com/Mo-ha33/Motahai/issues/35) | Sonnet 5.5 | P1 | BACKLOG | phase-2, backend, capi, feature | Depends on: none. (updated 2026-10-10) |
-| M2-2 | Operator endpoint for manual order confirmation — [#36](https://github.com/Mo-ha33/Motahai/issues/36) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-2, backend, feature | Wave 1 dispatched 2026-10-10. (updated 2026-10-10) |
+| M2-2 | Operator endpoint for manual order confirmation — [#36](https://github.com/Mo-ha33/Motahai/issues/36) | Sonnet 5.5 | P1 | REVIEW | phase-2, backend, feature | Draft PR #67 with M3-4; Opus reviewed; 652 passed. Conflicts expected with #23 (scheduler.py) and #68 (service.py). (updated 2026-10-10) |
 | M2-3 | Courier remittance CSV import — [#37](https://github.com/Mo-ha33/Motahai/issues/37) | Sonnet 5.5 | P1 | BACKLOG | phase-2, backend, feature | Depends on: M1-5. (updated 2026-10-10) |
-| M2-4 | Pilot pre-flight CLI for the S2-7 checklist — [#38](https://github.com/Mo-ha33/Motahai/issues/38) | Haiku 5.5 | P1 | IN_PROGRESS | phase-2, backend, feature | Wave 1 dispatched 2026-10-10. (updated 2026-10-10) |
+| M2-4 | Pilot pre-flight CLI for the S2-7 checklist — [#38](https://github.com/Mo-ha33/Motahai/issues/38) | Haiku 5.5 | P1 | REVIEW | phase-2, backend, feature | Draft PR #66; Opus reviewed; 649 passed. (updated 2026-10-10) |
 | M2-5 | Torod courier webhook (KSA) — [#39](https://github.com/Mo-ha33/Motahai/issues/39) | Sonnet 5.5 | P2 | BACKLOG | phase-2, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
 | M2-6 | SMSA courier webhook (KSA) — [#40](https://github.com/Mo-ha33/Motahai/issues/40) | Haiku 5.5 | P2 | BACKLOG | phase-2, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
-| M3-1 | Tenant stats API on the digest.py named queries — [#41](https://github.com/Mo-ha33/Motahai/issues/41) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, backend, feature, owner:other-thread | Repo audit thread; worker on feat/41-tenant-stats-api; operator-key auth until M3-3. (updated 2026-10-10) |
+| M3-1 | Tenant stats API on the digest.py named queries — [#41](https://github.com/Mo-ha33/Motahai/issues/41) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, feature, owner:other-thread | Repo audit thread, PR #68 (feat/41-tenant-stats-api). (updated 2026-10-10) |
 | M3-2 | Tracking health score — [#42](https://github.com/Mo-ha33/Motahai/issues/42) | Sonnet 5.5 | P1 | BACKLOG | phase-3, backend, feature | Depends on: M3-1. (updated 2026-10-10) |
-| M3-3 | Tenant API auth: scoped API keys — [#43](https://github.com/Mo-ha33/Motahai/issues/43) | Sonnet 5.5 | P1 | BACKLOG | phase-3, backend, security, feature | Depends on: none. (updated 2026-10-10) |
-| M3-4 | Operator endpoint and weekly schedule for audience export — [#44](https://github.com/Mo-ha33/Motahai/issues/44) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, backend, feature | Wave 1 dispatched 2026-10-10. (updated 2026-10-10) |
+| M3-3 | Tenant API auth: scoped API keys — [#43](https://github.com/Mo-ha33/Motahai/issues/43) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, backend, security, feature | Wave 2 dispatched 2026-10-10. (updated 2026-10-10) |
+| M3-4 | Operator endpoint and weekly schedule for audience export — [#44](https://github.com/Mo-ha33/Motahai/issues/44) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, feature | Draft PR #67 with M2-2; weekly export job, rolling 7-day gate. (updated 2026-10-10) |
 | M3-5 | Hermes MCP read tool get_cod_stats — [#45](https://github.com/Mo-ha33/Motahai/issues/45) | Sonnet 5.5 | P1 | BACKLOG | phase-3, hermes, feature | Depends on: M3-1. (updated 2026-10-10) |
 | M3-6 | Onboarding flow (TASK-011) — [#46](https://github.com/Mo-ha33/Motahai/issues/46) | Sonnet 5.5 | P1 | BACKLOG | phase-3, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
 | M3-7 | Honest GTM version note in consultation.py — [#47](https://github.com/Mo-ha33/Motahai/issues/47) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, hermes, bug, owner:other-thread | Repo audit thread; worker on fix/47-gtm-version-note. (updated 2026-10-10) |
-| M4-1 | Portal scaffold: React + Vite + TS with RTL/LTR i18n — [#48](https://github.com/Mo-ha33/Motahai/issues/48) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: none. (updated 2026-10-10) |
+| M4-1 | Portal scaffold: React + Vite + TS with RTL/LTR i18n — [#48](https://github.com/Mo-ha33/Motahai/issues/48) | Haiku 5.5 | P2 | REVIEW | phase-4, frontend, feature | Draft PR #70; vite 6 / vitest 4 (0 audit findings); Opus reviewed; vitest 3/3, pytest 645 passed. (updated 2026-10-10) |
 | M4-2 | Portal sign-in and session — [#49](https://github.com/Mo-ha33/Motahai/issues/49) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, security, feature | Depends on: M3-3, M4-1. (updated 2026-10-10) |
 | M4-3 | Portal: signal health page — [#50](https://github.com/Mo-ha33/Motahai/issues/50) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M3-1, M3-2, M4-2. (updated 2026-10-10) |
 | M4-4 | Portal: delivered ROAS and refusals page — [#51](https://github.com/Mo-ha33/Motahai/issues/51) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M3-1, M4-2. (updated 2026-10-10) |
@@ -93,6 +93,7 @@
 | M6-5 | Checkout refusal-risk score — [#62](https://github.com/Mo-ha33/Motahai/issues/62) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M1-7. (updated 2026-10-10) |
 | M6-6 | Billing and subscriptions — [#63](https://github.com/Mo-ha33/Motahai/issues/63) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
 | B-1 | Board automation: set Project #3 status from Actions — [#64](https://github.com/Mo-ha33/Motahai/issues/64) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | In PR #27 (6fb20c6); 18 unit tests, full suite 662 passed. Live run needs #27 on main. (updated 2026-10-10) |
+| B-2 | CI: run pytest and the portal build on every PR — [#71](https://github.com/Mo-ha33/Motahai/issues/71) | Haiku 5.5 | P1 | IN_PROGRESS | phase-1, infra, board | Wave 2 dispatched 2026-10-10. (updated 2026-10-10) |
 
 ---
 
