@@ -116,7 +116,7 @@ Field notes:
 - `external_id` is Motahai's own hashed customer key. It is the same on every event for that customer.
 - `client_ip_address` and `client_user_agent` come from the checkout (D-006). They are encrypted at rest and purged after a successful send or 14 days.
 - `custom_data.value` is the order total for `ConfirmedOrder` and the net collected amount for `DeliveredPurchase`. The two numbers are not comparable. See section 5.
-- `test_event_code` is **not** set by the pipeline today. See the known gaps in section 9.
+- `test_event_code` is set only when a test code is configured for the store. See section 10 for the two ways to use it.
 
 ---
 
@@ -283,7 +283,7 @@ Both files hold SHA-256 hashes only (lowercase hex). No names, addresses or raw 
    `retry_failed_events` resends failed rows up to `max_attempts` (default 5). Credential and dataset errors do not use up attempts, so they resume once the tenant is fixed.
 3. **No matched user.** Check that `user_data` has a hashed `em` or `ph`. Re-check phone normalization (section 2). A phone without the country code will not match.
 4. **Not sent by design.** `late_delivery`, `stale` and `SUPPRESSED` are correct behavior, not bugs (section 1).
-5. **Known gap: `test_event_code`.** The pipeline never sets `test_event_code`. See section 10.
+5. **`test_event_code`.** Events missing from the live dataset may be going to Test Events because a stored test code is still set for the store. See section 10.
 
 **`missing_user_agent` quality flag** (on `capi_events.quality_flags`)
 - Means the event has no `client_user_agent`. Causes: the platform payload has no `client_details` (Shopify), Salla has no capture path yet, or the checkout context was purged or expired (14 days, D-006).
@@ -304,7 +304,10 @@ Both files hold SHA-256 hashes only (lowercase hex). No names, addresses or raw 
 
 ## 10. Known gaps (as of 2026-10-10)
 
-- **`test_event_code` is not wired into the pipeline.** `order_pipeline` and `capi_service` accept the parameter, but the pipeline never passes it. Only the connection test in `scripts/onboard_store.py` sets one. Events sent by the pipeline will not show in Test Events and will count in the live dataset. Until this is fixed, do not run a Test Events check on a dataset that feeds live campaigns. Use a dedicated test dataset for that check. This needs an engineering fix. It is not a media-buyer setting.
+- **`test_event_code` has two modes. An engineer sets either one; it is not a media-buyer setting.**
+  - **Stored code (always on).** `scripts/onboard_store.py --meta-test-event-code CODE` saves the code on the store. From then on EVERY event the pipeline sends for that store carries it, so the events appear in Events Manager > Test Events and do NOT count in the live dataset or for optimization. Use it only on a test dataset or before launch, and clear it (`--meta-test-event-code ''`) before real traffic. Shadow stores send nothing, so the stored code only matters once a store is live.
+  - **One-shot replay (safe for live stores).** `scripts/onboard_store.py --verify-capi-ping --test-event-code CODE` re-sends the store's latest shadow `DeliveredPurchase` or `ConfirmedOrder` once with that code, under the event id `verify_<original id>`, and nothing is stored. It never changes the original event, never creates a sent record, and never purges the checkout IP and user agent. On success it records `tenants.test_event_verified_at`. Events older than about 6.5 days are not replayed (Meta rejects them); wait for a fresh order. A store with no shadow event yet gets a `MotahaiConnectionTest` event instead.
+  - **Existing databases need one manual change** for `tenants.test_event_verified_at`: `ALTER TABLE tenants ADD COLUMN test_event_verified_at TIMESTAMP WITH TIME ZONE;` (SQLite: `DATETIME`). The app does not add it by itself.
 - **Customer-list value key** is not in Meta's official schema (see section 8).
 - **Shopify `tags` in `orders/updated`** is unverified (S2-7 Q8).
 - **Category effect** of a Purchase-category custom conversion is unknown (S2-7 Q2).

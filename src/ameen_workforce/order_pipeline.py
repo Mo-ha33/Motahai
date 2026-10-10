@@ -722,6 +722,8 @@ async def retry_failed_events(
 
 # How many of the newest shadow events verify_test_event will look through for one that is still sendable.
 VERIFY_CANDIDATE_LIMIT = 10
+# Prepended to the original event_id on the replay (e.g. verify_delivered_123), so it never collides with the live event.
+VERIFY_EVENT_ID_PREFIX = "verify_"
 
 
 def _verify_error(error: str, **extra: Any) -> Dict[str, Any]:
@@ -748,7 +750,10 @@ async def verify_test_event(session: Session, tenant: Tenant, sender=capi_sender
     next newest is tried, up to VERIFY_CANDIDATE_LIMIT. If none can be sent the error is `event_too_old` (every candidate
     was past the window) or `not_eligible`, and nothing is sent.
 
-    Returns {"status": "success", "event_name", "event_id", "event_time", "events_received", "fbtrace_id", "verified_at"}
+    The replay is sent with event_id = "verify_" + the original event_id; everything else (event_name, event_time,
+    custom_data, user_data) is identical to the live event.
+
+    Returns {"status": "success", "event_name", "event_id" (as sent), "source_event_id" (the original), "event_time", "events_received", "fbtrace_id", "verified_at"}
     or {"status": "error", "error": <type>, ...}. Error types: no_test_event_code, invalid_test_event_code, no_shadow_event, missing_dataset_id,
     missing_credential, credential_error, event_too_old, not_eligible, a send exception class name, or meta_api_error
     (with http_code). Results never contain the access token or Meta's free-text message.
@@ -791,6 +796,11 @@ async def verify_test_event(session: Session, tenant: Tenant, sender=capi_sender
 
     payload = dict(chosen["payload"])
     payload["test_event_code"] = code  # same top-level key build_event_payload sets; covers the one-shot override
+    # The replay uses its own event_id so a later LIVE send of the same event can never be deduplicated against the
+    # test event (we do not rely on Meta keeping test and production dedup separate). Everything else is identical.
+    source_event_id = chosen["event_id"]
+    sent_event_id = VERIFY_EVENT_ID_PREFIX + source_event_id
+    payload["data"] = [{**payload["data"][0], "event_id": sent_event_id}, *payload["data"][1:]]
 
     try:
         token = get_credential(session, tenant.id, META_CAPI_TOKEN_KIND)
@@ -812,7 +822,8 @@ async def verify_test_event(session: Session, tenant: Tenant, sender=capi_sender
     return {
         "status": "success",
         "event_name": chosen["event_name"],
-        "event_id": chosen["event_id"],
+        "event_id": sent_event_id,
+        "source_event_id": source_event_id,
         "event_time": payload["data"][0]["event_time"],
         "events_received": result.get("events_received", 1),
         "fbtrace_id": result.get("fbtrace_id"),

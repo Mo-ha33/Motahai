@@ -125,12 +125,18 @@ async def test_verify_sends_the_live_payload_plus_the_test_code(db_session, read
     await process_webhook(db_session, live, "shopify", "orders/updated", shopify_order(**DELIVERED), sender=live_sender)
     live_event = live_sender.calls[0]["payload"]["data"][0]
     event = call["payload"]["data"][0]
-    for key in ("event_name", "event_id", "event_time", "custom_data"):
+    # Everything but event_id is identical to the live event; the replay's event_id is the live one with a prefix.
+    assert event.keys() == live_event.keys()
+    # (event_source_url is excluded only because the twin is a different tenant with its own shop domain.)
+    for key in event.keys() - {"event_id", "event_source_url"}:
         assert event[key] == live_event[key], key
+    assert event["event_id"] == "verify_" + live_event["event_id"] != live_event["event_id"]
+    assert res["event_id"] == event["event_id"] and res["source_event_id"] == live_event["event_id"]
     assert "test_event_code" not in live_sender.calls[0]["payload"]
     stored = db_session.scalar(select(CapiEvent).where(CapiEvent.tenant_id == ready.id,
                                                        CapiEvent.event_name == "DeliveredPurchase"))
-    assert (event["event_id"], event["event_time"]) == (stored.event_id, stored.event_time)
+    assert (event["event_id"], event["event_time"]) == ("verify_" + stored.event_id, stored.event_time)
+    assert stored.event_id == res["source_event_id"]  # the stored (live) event keeps its real id
 
 
 @pytest.mark.asyncio
