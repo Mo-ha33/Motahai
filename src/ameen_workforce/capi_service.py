@@ -1,6 +1,6 @@
 """
 capi_service.py — Production Meta Conversions API (CAPI) & Rule D-005 Engine
-Handles server-side conversion delivery to Meta Graph API v20.0.
+Handles server-side conversion delivery to the Meta Graph API (version pinned in META_GRAPH_API_VERSION).
 
 Rule D-005 (decision "Option A: Coexist", 2026-10-09):
 - The merchant's native Shopify/Salla Meta integration keeps sending the standard 'Purchase'
@@ -23,6 +23,7 @@ Rule D-005 (decision "Option A: Coexist", 2026-10-09):
 import hashlib
 import time
 import re
+from datetime import date
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -31,7 +32,11 @@ import httpx
 
 logger = logging.getLogger("ameen_workforce.capi")
 
-META_GRAPH_API_VERSION = "v20.0"
+# Meta expires each Graph API version about two years after release; a call to an expired version is silently served by
+# the oldest live version instead of failing. v20.0 expired 2026-09-24. Expiration dates are from Meta's version table:
+# https://developers.facebook.com/docs/graph-api/changelog/versions (tests fail 90 days before the pinned one expires).
+META_GRAPH_API_VERSION = "v22.0"
+META_GRAPH_API_VERSION_EXPIRES = date(2027, 5, 20)
 
 # Rule D-005 (Coexist): custom events, never the standard Purchase the native integration sends.
 DELIVERED_EVENT_NAME = "DeliveredPurchase"
@@ -82,7 +87,8 @@ EVENT_TYPES: Dict[str, EventType] = {
 def quality_flags_for(payload: Dict[str, Any]) -> Optional[str]:
     """
     Comma-separated flags for required-for-website fields the event is MISSING (Meta documents client_user_agent and
-    event_source_url as required for action_source=website; what it does without them is undocumented), or None.
+    event_source_url as required for action_source=website; what it does without them is undocumented), plus
+    `test_event` when the payload carries a test_event_code (it went to Events Manager's Test Events), or None.
     Recorded on capi_events.quality_flags at send time so the pilot can compare accepted vs discarded events.
     Nothing is ever fabricated to fill a gap.
     """
@@ -92,6 +98,8 @@ def quality_flags_for(payload: Dict[str, Any]) -> Optional[str]:
         flags.append("missing_user_agent")
     if not event.get("event_source_url"):
         flags.append("missing_event_source_url")
+    if payload.get("test_event_code"):
+        flags.append("test_event")
     return ",".join(flags) or None
 
 def hash_sha256(val: Optional[str]) -> Optional[str]:
@@ -107,39 +115,104 @@ def is_stale_event_time(event_time: int, now: Optional[float] = None) -> bool:
     age = now - float(event_time)
     return age > MAX_EVENT_AGE_SECONDS or age < -MAX_EVENT_FUTURE_SECONDS
 
-COUNTRY_BY_CURRENCY = {"EGP": "EG", "SAR": "SA"}
+# Default phone country for an order's currency (MENA/GCC). Used when no shipping country is known.
+COUNTRY_BY_CURRENCY = {
+    "EGP": "EG", "SAR": "SA", "AED": "AE", "KWD": "KW", "QAR": "QA", "BHD": "BH", "OMR": "OM",
+}
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
+# E.164 numbering plans: country -> (calling code, national significant number lengths, uses a trunk "0").
+# Mobile and landline lengths (ITU-T E.164 national plans): EG mobile 10 / Cairo landline 9; SA and AE mobile 9 /
+# landline 8; KW, QA, BH, OM 8 digits with no trunk prefix.
+PHONE_PLANS = {
+    "EG": ("20", (9, 10), True),
+    "SA": ("966", (8, 9), True),
+    "AE": ("971", (8, 9), True),
+    "KW": ("965", (8,), False),
+    "QA": ("974", (8,), False),
+    "BH": ("973", (8,), False),
+    "OM": ("968", (8,), False),
+}
+# Longest calling code first, so "966" is tried before shorter prefixes.
+_PLANS_BY_CODE = sorted(PHONE_PLANS.values(), key=lambda plan: -len(plan[0]))
+
+
+def _strip_trunk_after_code(digits: str) -> str:
+    """'+20 010...' or '00966 05...' carry a trunk 0 after the calling code that E.164 drops."""
+    for code, lengths, trunk in _PLANS_BY_CODE:
+        rest = digits[len(code):]
+        if trunk and digits.startswith(code) and rest.startswith("0") and len(rest) - 1 in lengths:
+            return code + rest[1:]
+    return digits
+
+
 def normalize_phone(phone: Optional[str], default_country: str = "EG") -> Optional[str]:
-    """Normalizes phone to digits-only E.164 representation before hashing."""
+    """
+    Normalizes a phone to E.164 digits (country code first, no '+', no trunk zero) before hashing, as Meta requires.
+    - '+...' or '00...': already international; only a trunk 0 right after a known calling code is dropped.
+    - Digits already starting with a known calling code and the right national length are kept (e.g. 9665XXXXXXXX).
+    - Otherwise the number is national for `default_country` (EG, SA, AE, KW, QA, BH, OM): one trunk 0 is dropped
+      where that country uses one, and the calling code is prefixed when the length fits its numbering plan. A
+      number written without its trunk 0 is only prefixed at the mobile length, the one unambiguous case.
+    - Unknown country or a length that fits no plan: the digits are returned unchanged (never guessed into a country),
+      except the historical rule that a bare 9-digit 5XXXXXXXX with a non-GCC default is Saudi.
+    """
     if not phone:
         return None
-    digits = re.sub(r"\D", "", str(phone))
-    if digits.startswith("00"):
-        # International call prefix (0020..., 00966...) -> country code
-        digits = digits[2:]
-    elif default_country == "EG" and digits.startswith("01"):
-        digits = "2" + digits
-    elif default_country == "SA" and digits.startswith("05"):
-        digits = "966" + digits[1:]
+    raw = str(phone).strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+    if raw.startswith("+") or digits.startswith("00"):
+        return _strip_trunk_after_code(digits[2:] if digits.startswith("00") else digits)
+
+    country = (default_country or "").upper()
+    plan = PHONE_PLANS.get(country)
+    if plan:
+        code, lengths, trunk = plan
+        if digits.startswith(code) and len(digits) - len(code) in lengths:
+            return digits
+        if trunk and digits.startswith("0"):
+            if len(digits) - 1 in lengths:
+                return code + digits[1:]
+        elif not trunk and len(digits) in lengths:
+            return code + digits
+        elif len(digits) == max(lengths):
+            # Without its trunk 0 only the mobile length is unambiguous (e.g. AE 5XXXXXXXX, EG 1XXXXXXXXX).
+            return code + digits
+    for code, lengths, _trunk in _PLANS_BY_CODE:
+        if digits.startswith(code) and len(digits) - len(code) in lengths:
+            return digits
     if len(digits) == 9 and digits.startswith("5"):
-        # Saudi mobile written without the trunk zero or country code (5XXXXXXXX)
-        digits = "966" + digits
+        # Historical rule: a Saudi mobile written without the trunk zero or country code (5XXXXXXXX). SA and AE
+        # defaults already resolved it above, so this only applies to other defaults.
+        return "966" + digits
     return digits
 
 def hash_email(email: Optional[str]) -> Optional[str]:
     """SHA-256 of the normalized (trimmed, lower-cased) email, or None. Safe to store; the raw email is not."""
     return hash_sha256(email)
 
-def hash_phone(phone: Optional[str], currency: Optional[str] = None, country: Optional[str] = None) -> Optional[str]:
+def phone_default_country(currency: Optional[str] = None, country: Optional[str] = None,
+                          ship_country: Optional[str] = None) -> str:
     """
-    SHA-256 of the normalized phone, or None. The default country comes from the currency when it is
-    mapped (same rule as build_event_payload), else from `country`, else EG. Safe to store.
+    Country whose national format a phone without a calling code is read in: the order's shipping country when it
+    has a known numbering plan, else the currency's country, else `country` (the tenant's), else EG.
+    """
+    ship = (ship_country or "").strip().upper()
+    if ship in PHONE_PLANS:
+        return ship
+    return COUNTRY_BY_CURRENCY.get((currency or "").strip().upper()) or (country or "EG").strip().upper()
+
+def hash_phone(phone: Optional[str], currency: Optional[str] = None, country: Optional[str] = None,
+               ship_country: Optional[str] = None) -> Optional[str]:
+    """
+    SHA-256 of the E.164-normalized phone, or None. The default country is chosen by phone_default_country
+    (shipping country, then currency, then `country`, then EG). Safe to store.
     """
     if not phone:
         return None
-    default_country = COUNTRY_BY_CURRENCY.get((currency or "").upper()) or (country or "EG").upper()
-    return hash_sha256(normalize_phone(phone, default_country))
+    return hash_sha256(normalize_phone(phone, phone_default_country(currency, country, ship_country)))
 
 def _validated_hash(value: str, field: str) -> str:
     """Pre-hashed values must already be a SHA-256 hex digest; anything else would be double-hashed or invalid."""
@@ -235,8 +308,7 @@ class MetaCAPISender:
         if phone_hash:
             user_data["ph"] = [_validated_hash(phone_hash, "phone_hash")]
         elif phone:
-            default_country = COUNTRY_BY_CURRENCY.get(currency.upper(), "EG")
-            user_data["ph"] = [hash_sha256(normalize_phone(phone, default_country))]
+            user_data["ph"] = [hash_phone(phone, currency)]
         for key in MATCH_KEYS:
             hashed = (match_hashes or {}).get(key)
             if hashed:
