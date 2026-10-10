@@ -16,3 +16,32 @@ mcp-capability.conf
 
 # local SQLite databases (default DATABASE_URL is sqlite:///./motahai.db)
 *.db
+
+# --- public-release hygiene ---
+.env.*
+!*.env.example
+*.pem
+*.key
+*service-account*.json
+*-sa.json
+gcp-*.json
+*.log
+logs/
+.coverage
+htmlcov/
+/scratch_*.py
+/inspect_*.py
+/tmp_*.py
+/check_*.py
+/debug_*.py
+screenshots/
+/*.png
+/*.mp4
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/
+.antigravity/
+deliverables/*.mp4
+video_build_cache/

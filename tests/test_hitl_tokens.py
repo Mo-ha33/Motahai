@@ -104,7 +104,7 @@ def consultation(monkeypatch):
     executor.VPSExecutor = object
     for name, mod in (("fakehermes", pkg), ("fakehermes.tools", sub), ("fakehermes.executor", executor)):
         monkeypatch.setitem(sys.modules, name, mod)
-    spec = importlib.util.spec_from_file_location("fakehermes.tools.consultation", ROOT / "consultation.py")
+    spec = importlib.util.spec_from_file_location("fakehermes.tools.consultation", ROOT / "ops" / "hermes" / "consultation.py")
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)

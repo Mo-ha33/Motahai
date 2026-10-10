@@ -3,7 +3,7 @@
 **Deliverable ID:** `VID-19`  
 **Parent Blueprint:** [`VID-17 Pre-Production Bible`](VID-17_Motahai_Pre_Production_Bible.md) & [`VID-18 Master Render Report`](VID-18_Motahai_60s_Master_Video_Report.md)  
 **Agent:** `Ziad | AI Creative Video Director` (`ziad-ai-creative-vid-ca4e`)  
-**Production Artifact:** [`VID-19_Motahai_60s_Cinematic_AI_Master.mp4`](VID-19_Motahai_60s_Cinematic_AI_Master.mp4)  
+**Production Artifact:** attached to the GitHub Release v1.0.0  
 **Resolution & Codec:** 1920×1080 (16:9 Full HD), H.264, 24 fps, AAC Stereo  
 **Exact Runtime:** 60.000s (1,440 frames)  
 **Production Timestamp:** 2026-10-09  
