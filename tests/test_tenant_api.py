@@ -274,6 +274,16 @@ def test_status_reflects_checklist_progress_and_test_event_code(db_session, clie
     assert body["missing_required_steps"] == [] and body["checklist_ready"] is True and body["onboarded"] is True
 
 
+def test_inactive_tenant_with_complete_checklist_is_not_onboarded(db_session, client, tenants):
+    a, _ = tenants
+    a.active = False
+    db_session.commit()
+    body = client.get("/v1/tenants/a.myshopify.com/status", headers=AUTH).json()
+    assert body["active"] is False
+    assert body["checklist_ready"] is True and body["missing_required_steps"] == []
+    assert body["onboarded"] is False
+
+
 def test_webhooks_verified_requires_a_verified_signature(db_session, client):
     c = create_tenant(db_session, name="C", platform="shopify", shop_domain="c.myshopify.com")
     path = "/v1/tenants/c.myshopify.com/status"

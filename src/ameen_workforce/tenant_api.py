@@ -33,7 +33,8 @@ tenant id. No CAPI calls, no writes.
                         tenant (signature_ok FALSE / tenant_id NULL), so they cannot make this true.
   checklist_ready       onboarding_routes.compute_checklist(...)["ready_for_live"], the SAME function the operator
                         GET /v1/operator/onboarding/tenants/{id}/checklist uses (all required steps done)
-  onboarded             = checklist_ready (defined from the shared checklist so operator and Tariq cannot disagree)
+  onboarded             = active AND checklist_ready (an inactive tenant is never onboarded, even with a complete
+                        checklist; the checklist half is the shared function so operator and Tariq cannot disagree)
   missing_required_steps  ids of required checklist steps not done (ids only, e.g. "courier_secret", "api_key")
   test_event_code_set   the tenant has a Meta test_event_code (the bool only, never the code)
 
@@ -165,7 +166,7 @@ def _build_status(session: Session, tenant: Tenant, now: datetime) -> Dict[str, 
         "last_capi_event_at": _iso(last_capi_event_at),
         "webhooks_verified": webhooks_verified,
         "checklist_ready": checklist["ready_for_live"],
-        "onboarded": checklist["ready_for_live"],
+        "onboarded": bool(tenant.active) and checklist["ready_for_live"],
         "missing_required_steps": [s["key"] for s in steps if s["required"] and s["status"] != "done"],
         "test_event_code_set": tenant.meta_test_event_code is not None,
     }
