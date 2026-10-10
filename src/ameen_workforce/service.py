@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException, Request, Response, status, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 from .config import settings
@@ -77,6 +79,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# Merchant portal (built by `npm run build` in portal/). Served only when the build exists.
+_PORTAL_DIST = Path(__file__).resolve().parents[2] / "portal" / "dist"
+if _PORTAL_DIST.is_dir():
+    app.mount("/app", StaticFiles(directory=_PORTAL_DIST, html=True), name="portal")
 
 # -----------------------------------------------------------------------------
 # Request & Response Schemas
