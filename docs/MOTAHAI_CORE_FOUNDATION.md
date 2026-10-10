@@ -15,6 +15,9 @@ Label conventions used throughout:
 - **Not built**: only in documents.
 - **Recommendation**: this audit's proposal, not a decision already recorded.
 
+Line references point at the audited commit `0cabdb2`. Findings fixed since then are listed in the
+[resolution log](#resolution-log) at the end; the body is kept as audited.
+
 ---
 
 ## Contents
@@ -86,7 +89,7 @@ day, and it stops the day the subscription stops:
 The ladder is the lock-in, and it is a fair one: the merchant's media buyer builds custom conversions and ad sets on
 `ConfirmedOrder` and `DeliveredPurchase` (`docs/pilot/media_buyer_handbook.md:123-145`). Removing Motahai means
 rebuilding their optimization setup. The honesty rules already agreed (never claim "saved ad budget", report verifiable
-facts only, `HANDOFF_PLAYBOOK.md:144-150`) keep that lock-in defensible.
+facts only, `HANDOFF_PLAYBOOK.md:56-62`) keep that lock-in defensible.
 
 **Recommendation: make the engine the subscription anchor.** Sell the GTM setup or audit as the entry project, and
 make continued `ConfirmedOrder`/`DeliveredPurchase` delivery, the audiences and the digest the recurring line item.
@@ -243,7 +246,7 @@ ad set enough volume (`README.md:50-53`, `capi_service.py:5-19`).
 
 > **Reality check: `HANDOFF_PLAYBOOK.md` still describes the superseded rule.**
 > It says D-005 fires a browser `OrderPlaced` for COD and a server `Purchase` (`purchase_<id>`) on delivery
-> (`HANDOFF_PLAYBOOK.md:117`, `:126-129`). That was replaced by Coexist on 2026-10-09 (`capi_service.py:5`). Any agent
+> (`HANDOFF_PLAYBOOK.md:29`, `:38-41`). That was replaced by Coexist on 2026-10-09 (`capi_service.py:5`). Any agent
 > or person who reads the handoff first will learn the wrong rule. It should be marked superseded or corrected.
 
 ### 4.1 The ladder
@@ -401,8 +404,8 @@ code shows.
 | 8 | 20% to 45% refusal rate | Brief; README | Industry range, not measured on Motahai pilots (the README says so). |
 | 9 | Proprietary web portal as a live channel | Brief | No frontend in the repo; no tenant-facing API endpoints. |
 | 10 | Recurring SaaS via the COD engine | Brief | Mechanics exist (ladder, digest, audiences). The commercial docs never mention COD; billing is a TODO (`MOTAHAI_PRICING_PLAYBOOK.md:156`). |
-| 11 | Weekly digest over **WhatsApp** | `PROJECT_BOARD.md:37`; `HANDOFF_PLAYBOOK.md:144` | Email via SMTP only (`digest.py:670-673`). |
-| 12 | D-005 = browser `OrderPlaced` + server `Purchase` | `HANDOFF_PLAYBOOK.md:117`, `:126-129` | Superseded by Coexist. |
+| 11 | Weekly digest over **WhatsApp** | `PROJECT_BOARD.md:37`; `HANDOFF_PLAYBOOK.md:56` | Email via SMTP only (`digest.py:670-673`). |
+| 12 | D-005 = browser `OrderPlaced` + server `Purchase` | `HANDOFF_PLAYBOOK.md:29`, `:38-41` | Superseded by Coexist. |
 | 13 | Digest "not yet committed or scheduled", Sunday 08:00 | `docs/MOTAHAI_PLAYBOOK.md:189` | Committed and scheduled, Sunday 10:00 tenant-local (`README.md:120`). |
 | 14 | TASK-022: "no HTTP route, no HMAC verification, no idempotency" | `PROJECT_BOARD.md:35` | Routes, signatures and idempotency all exist (S1-1, S1-2 DONE). Board row is stale. |
 | 15 | S2-2, S2-5, S2-8 IN_PROGRESS while README says Bosta/OTO "Supported" | `PROJECT_BOARD.md:48-54`; `README.md:87-90` | S2-2 is functionally done except a manual-confirm entry point; S2-5 lacks remittance import, Torod, SMSA; S2-8 Salla UA/IP is open. |
@@ -484,3 +487,15 @@ confirmations stay Python calls an operator makes by hand.
 - Mark the D-005 section of `HANDOFF_PLAYBOOK.md` as superseded and correct section 7 of `docs/MOTAHAI_PLAYBOOK.md`.
 - Rewrite `docs/commercial/` around the signal ladder as the recurring product, and remove the unsupported EMQ,
   dedup-parity and TikTok/Snap claims until they are built.
+
+---
+
+## Resolution log
+
+| Date | Finding | Resolved by |
+|---|---|---|
+| 2026-10-10 | UAE and Kuwait phone numbers not normalized to E.164 (sections 1.1, 2.1.3, 6 row 5) | PR #22: per-country numbering plans for EG, SA, AE, KW, QA, BH, OM; numbers that fit no plan are dropped, not hashed |
+| 2026-10-10 | Graph API pinned to the expired v20.0 (section 2.1, 6 row 1) | PR #22: pinned to v25.0 (expires 2028-07-29), with a test that fails 90 days before expiry and a `MOTAHAI_META_GRAPH_API_VERSION` override |
+| 2026-10-10 | `test_event_code` not wired into the pipeline (section 2.1.3) | PR #22: per-tenant `tenants.meta_test_event_code`, set with `onboard_store.py --pipeline-test-event-code` |
+| 2026-10-10 | `HANDOFF_PLAYBOOK.md` still teaches the superseded D-005 rule (section 4, 6 row 12) | Issue #57: Decision 1 rewritten as Coexist, the original rule struck through, a historical-document banner added |
+| 2026-10-10 | Commercial docs promise EMQ > 8.5, > 98.5% dedup parity and TikTok/Snap server-side (sections 2.1.2, 2.1.3, 2.2, 6 rows 6 and 7) | Issue #57: those claims replaced with what is built; every `docs/commercial/` file carries a status banner. The pricing model itself still sells AI seats, not the COD engine (section 1.3) |
