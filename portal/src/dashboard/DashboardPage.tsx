@@ -1,15 +1,15 @@
 import type { ReactNode } from 'react';
 import type { ApiError } from '../api/client';
-import type { PageConfig, WidgetInstance } from '../config/dashboard';
+import { pageSources, widgetSource, type PageConfig, type WidgetInstance } from '../config/dashboard';
 import { getFilter } from '../filters/registry';
 import { useFilters } from '../filters/FiltersContext';
 import { dictionaries, interpolate, type Lang } from '../i18n';
 import { getWidget } from '../widgets';
-import { StatsProvider, useStats } from './StatsProvider';
+import { StatsProvider, useStats, type SourceState } from './StatsProvider';
 
 export function DashboardPage({ config, lang }: { config: PageConfig; lang: Lang }) {
   return (
-    <StatsProvider>
+    <StatsProvider sources={pageSources(config)}>
       <div className="filter-bar">
         {config.filters.map((id) => {
           const { Card } = getFilter(id);
@@ -24,9 +24,11 @@ export function DashboardPage({ config, lang }: { config: PageConfig; lang: Lang
 function DashboardBody({ config, lang }: { config: PageConfig; lang: Lang }) {
   const t = dictionaries[lang];
   const { tenantId } = useFilters();
-  const { status, envelope, error, reload } = useStats();
+  const { sources, reload } = useStats();
+  const ids = pageSources(config);
+  const states = ids.map((id) => sources[id]);
 
-  if (status === 'idle') {
+  if (states.every((s) => !s || s.status === 'idle')) {
     const needsTenant = tenantId === null;
     return (
       <StateCard
@@ -35,27 +37,32 @@ function DashboardBody({ config, lang }: { config: PageConfig; lang: Lang }) {
       />
     );
   }
-  if (status === 'loading') return <LoadingCards config={config} label={t.states.loading} />;
-  if (status === 'error' && error) {
-    return (
-      <StateCard heading={t.states.errorHeading} body={errorCopy(error, lang)} role="alert">
-        <button type="button" className="button" onClick={reload}>
-          {t.states.retry}
-        </button>
-      </StateCard>
-    );
+  if (states.every((s) => s?.status === 'loading')) {
+    return <LoadingCards config={config} label={t.states.loading} />;
   }
-  if (!envelope) return null;
-
+  // Every source failed: one page-level card (the first error), as for a summary-only page.
+  if (states.every((s) => s?.status === 'error')) {
+    const error = states[0]?.error;
+    if (error) {
+      return (
+        <StateCard heading={t.states.errorHeading} body={errorCopy(error, lang)} role="alert">
+          <button type="button" className="button" onClick={reload}>
+            {t.states.retry}
+          </button>
+        </StateCard>
+      );
+    }
+  }
   return (
     <div className="widget-grid">
       {config.widgets.map((instance) => (
-        <div
-          key={instance.id}
-          className="widget-cell"
-          data-span={instance.span ?? 12}
-        >
-          <WidgetSlot instance={instance} envelope={envelope} lang={lang} />
+        <div key={instance.id} className="widget-cell" data-span={instance.span ?? 12}>
+          <WidgetSlot
+            instance={instance}
+            state={sources[widgetSource(instance)]}
+            lang={lang}
+            onRetry={reload}
+          />
         </div>
       ))}
     </div>
@@ -64,22 +71,41 @@ function DashboardBody({ config, lang }: { config: PageConfig; lang: Lang }) {
 
 function WidgetSlot({
   instance,
-  envelope,
+  state,
   lang,
+  onRetry,
 }: {
   instance: WidgetInstance;
-  envelope: NonNullable<ReturnType<typeof useStats>['envelope']>;
+  state: SourceState | undefined;
   lang: Lang;
+  onRetry: () => void;
 }) {
+  const t = dictionaries[lang];
   const Widget = getWidget(instance.type);
   if (!Widget) {
     return (
       <section className="widget widget-error" role="alert">
-        {interpolate(dictionaries[lang].widgetErrors.unknownType, { type: instance.type })}
+        {interpolate(t.widgetErrors.unknownType, { type: instance.type })}
       </section>
     );
   }
-  return <Widget data={envelope.data} envelope={envelope} instance={instance} lang={lang} />;
+  if (!state || state.status === 'loading' || state.status === 'idle') {
+    return <div className="widget skeleton" role="status" aria-busy="true" aria-label={t.states.loading} />;
+  }
+  if (state.status === 'error' && state.error) {
+    return (
+      <section className="widget widget-source-error" role="alert" data-widget={instance.type}>
+        {instance.titleKey ? <h2 className="widget-title">{t.widgetTitles[instance.titleKey]}</h2> : null}
+        <p className="widget-note">{t.states.errorHeading}</p>
+        <p className="widget-note">{errorCopy(state.error, lang)}</p>
+        <button type="button" className="button" onClick={onRetry}>
+          {t.states.retry}
+        </button>
+      </section>
+    );
+  }
+  if (!state.envelope) return null;
+  return <Widget data={state.envelope.data} envelope={state.envelope} instance={instance} lang={lang} />;
 }
 
 export function errorCopy(error: ApiError, lang: Lang): string {

@@ -1,3 +1,4 @@
+import type { StatsSourceId } from '../api/types';
 import type { FilterId } from '../filters/ids';
 import type { WidgetTitleKey } from '../i18n';
 import type { Route } from '../router';
@@ -10,6 +11,8 @@ export interface WidgetInstance<O = unknown> {
   id: string;
   type: string;
   titleKey?: WidgetTitleKey;
+  /** Data source feeding this widget. Default 'summary'; must be listed in the page's `sources`. */
+  source?: StatsSourceId;
   /** Columns out of 12 on wide screens; everything is full width below 720px. Default 12. */
   span?: WidgetSpan;
   options: O;
@@ -18,7 +21,19 @@ export interface WidgetInstance<O = unknown> {
 export interface PageConfig {
   route: Route;
   filters: FilterId[];
+  /** Sources fetched in parallel for this page. Default ['summary']. */
+  sources?: StatsSourceId[];
   widgets: WidgetInstance[];
+}
+
+/** The sources a page fetches (`['summary']` unless it declares otherwise). */
+export function pageSources(page: PageConfig): StatsSourceId[] {
+  return page.sources && page.sources.length > 0 ? page.sources : ['summary'];
+}
+
+/** The source a widget reads (`'summary'` unless it declares otherwise). */
+export function widgetSource(instance: WidgetInstance): StatsSourceId {
+  return instance.source ?? 'summary';
 }
 
 export interface DashboardConfig {
@@ -75,11 +90,20 @@ export const defaultDashboard: DashboardConfig = {
         },
       ],
     },
-    // M4-3 (#50): partial until the health score (#42) lands.
+    // M4-3 (#50)
     signal: {
       route: 'signal',
       filters: ['tenant', 'date-range'],
+      sources: ['summary', 'health-score'],
       widgets: [
+        {
+          id: 'health-score',
+          type: 'health-score',
+          titleKey: 'healthScore',
+          source: 'health-score',
+          span: 12,
+          options: { showPenalties: true },
+        },
         { id: 'window', type: 'window-note', titleKey: 'window', span: 12, options: {} },
         group('signal-overview', 'signalOverview', ['signal_events', 'flagged_share', 'late_delivery']),
         bars('confirmed-events', 'confirmedEvents', ['confirmed_sent', 'confirmed_shadow']),

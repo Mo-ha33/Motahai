@@ -10,6 +10,7 @@ import { defaultDashboard, type DashboardConfig } from './config/dashboard';
 import { ApiProvider } from './dashboard/ApiContext';
 import { SessionProvider, useSession } from './auth/SessionContext';
 import { SignIn } from './auth/SignIn';
+import { OnboardingPage } from './onboarding/OnboardingPage';
 import { DashboardPage } from './dashboard/DashboardPage';
 import { FiltersProvider } from './filters/FiltersContext';
 import {
@@ -118,7 +119,9 @@ function Shell({ config }: { config: DashboardConfig }) {
 
         <main className="content">
           <h1 className="page-title">{pageTitle}</h1>
-          {page ? (
+          {route === 'onboarding' ? (
+            <OnboardingPage lang={lang} />
+          ) : page ? (
             <DashboardPage key={route} config={page} lang={lang} />
           ) : (
             <EmptyState lang={lang} route={route} />

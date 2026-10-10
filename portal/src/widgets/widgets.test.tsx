@@ -87,3 +87,31 @@ describe('widgets', () => {
     }
   });
 });
+
+describe('health-score widget', () => {
+  it('renders score, status and sorted penalties; insufficient data shows no number', () => {
+    const Widget = getWidget('health-score')!;
+    const instance: WidgetInstance = { id: 'h', type: 'health-score', source: 'health-score', options: {} };
+    const env = (data: unknown) =>
+      ({ tenant_id: 7, window: summaryEnvelope.window, data }) as never;
+    const ok = {
+      score: 72,
+      status: 'degraded',
+      penalties: [
+        { name: 'incidents_error', points: 10, evidence: { open: 1 } },
+        { name: 'flagged_events', points: 18, evidence: { flagged: 12, total: 340 } },
+      ],
+    };
+    const { unmount } = render(<Widget data={ok} envelope={env(ok)} instance={instance} lang="en" />);
+    expect(screen.getByText('72')).toBeTruthy();
+    expect(screen.getByText('Degraded')).toBeTruthy();
+    expect(screen.getByText('12 of 340 events flagged')).toBeTruthy();
+    expect(screen.getByText('1 open incident')).toBeTruthy();
+    unmount();
+    const none = { score: null, status: 'insufficient_data', penalties: [] };
+    render(<Widget data={none} envelope={env(none)} instance={instance} lang="en" />);
+    expect(screen.getByText(/Not enough tracking data/)).toBeTruthy();
+    expect(screen.queryByText('0')).toBeNull();
+    expect(screen.queryByText('100')).toBeNull();
+  });
+});
