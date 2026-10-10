@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .auth import require_operator
 from .db import Tenant, get_session_factory
+from .health_score import tenant_health_score
 from .digest import q_cohort_delivery, q_creatives, q_refused_cod, q_signal_health, q_week_orders
 
 DEFAULT_WINDOW_DAYS = 7
@@ -112,6 +113,16 @@ def _add_route(name: str) -> None:
 
 for _name in SECTIONS:
     _add_route(_name)
+
+
+@router.get("/health-score")
+def stats_health_score(tenant_id: int, window: Window = Depends(get_window),
+                       factory: sessionmaker = Depends(get_stats_session_factory)) -> Dict[str, Any]:
+    with factory() as session:
+        if session.get(Tenant, tenant_id) is None:
+            raise HTTPException(status_code=404, detail="Unknown tenant")
+        data = tenant_health_score(session, tenant_id, window)
+    return {"tenant_id": tenant_id, "window": _iso(window), "data": data}
 
 
 @router.get("/summary")
