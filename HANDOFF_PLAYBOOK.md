@@ -5,6 +5,10 @@
 > *Latest Commits on main:* `9ee2d61` (Phase 0 Fixes) & `d51dcf0` (CAPI, COD & Webhooks Engine)  
 > *Test Suite:* **74 passed, 0 failed in 9.47s**
 
+> **Historical document (2026-10-09).** Sections 2 to 5 describe the state at `d51dcf0`. Where they disagree with the
+> code, the code and `docs/MOTAHAI_CORE_FOUNDATION.md` win. In particular, Decision 1 below (the old D-005 rule) was
+> superseded by **D-005 "Coexist"** on 2026-10-09.
+
 ---
 
 ## 1. STRICT AGENT & MODEL ROLES (Token-Saving Protocol)
@@ -26,7 +30,7 @@ We heard your feedback loud and clear, and we **executed and pushed the code dir
 | **Hardcoded CAPI/BI Metrics** | Unlabeled mock numbers | **Labeled honestly.** `workflow_engine.py` explicitly tags metrics with `simulated: True` and `provenance: benchmark_simulation`. |
 | **Service Account Email** | Discrepancy with GCP | **Standardized.** Reconciled to `tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com`. |
 | **Real Meta CAPI Sender** | Vision only (0 calls) | **Implemented in code.** `src/ameen_workforce/capi_service.py` with Meta Graph API v20.0, SHA-256 E.164 phone/email normalization, and `test_event_code` support. |
-| **Rule D-005 (COD Logic)** | Vision only | **Implemented & tested.** `process_cod_order_event` emits `OrderPlaced` for in-transit COD, and `Purchase` (`purchase_<id>`) **only when delivered**. |
+| **Rule D-005 (COD Logic)** | Vision only | **Superseded by D-005 "Coexist"** (see Decision 1). ~~`process_cod_order_event` emits `OrderPlaced` for in-transit COD, and `Purchase` (`purchase_<id>`) only when delivered.~~ |
 | **Zero-Effort Webhooks** | Vision only | **Implemented & tested.** `src/ameen_workforce/webhook_listener.py` parses Shopify and Salla webhooks and dispatches delivered CAPI events. |
 | **Client Asset Delivery** | Manual | **Implemented & tested.** `src/ameen_workforce/asset_matrix.py` formats IDs and exports Markdown delivery sheets. |
 | **Project Task Board** | None | **Live & synced.** `PROJECT_BOARD.md` and CLI tool `tools/board/manage_board.py` tracking 13 tasks. |
@@ -35,10 +39,22 @@ We heard your feedback loud and clear, and we **executed and pushed the code dir
 
 ## 3. Core Architectural & Strategic Decisions (Agreed & Locked)
 
-### Decision 1: Rule D-005 (Server-Side Only COD Purchase)
-- **Client-Side:** For COD orders, browser fires custom event `OrderPlaced` on checkout (never `Purchase`).
-- **Server-Side:** When the store platform (Shopify/Salla) updates status to `delivered` / `paid`, Motahai sends `Purchase` via CAPI with `event_id = purchase_<order_id>`.
-- **Prepaid Orders:** Fire standard D-002 deduplicated browser + server events immediately.
+### Decision 1: Rule D-005 "Coexist" (current, replaced the original rule on 2026-10-09)
+- **Native `Purchase` is left alone.** The merchant's own Shopify or Salla Meta integration keeps sending it at
+  checkout. Motahai never sends `Purchase`, so there is no double counting.
+- **`ConfirmedOrder`** (server-side CAPI, `event_id = confirmed_<order_id>`, `event_time` = confirmation time, value =
+  order total) when the merchant confirms the order by tag, configured status, shipment or a manual trigger.
+- **`DeliveredPurchase`** (server-side CAPI, `event_id = delivered_<order_id>`, `event_time` = order placement time,
+  value = net collected) once the order is delivered and paid and the settlement window has passed. Never sent for
+  cancelled, refunded or voided orders, or past placed + 6.5 days.
+- Code: `src/ameen_workforce/capi_service.py`, `src/ameen_workforce/order_pipeline.py`. Full spec:
+  `docs/MOTAHAI_PLAYBOOK.md` section 2.
+
+**Superseded original rule (do not implement):**
+- ~~Client-side: for COD orders, the browser fires custom event `OrderPlaced` on checkout (never `Purchase`).~~
+- ~~Server-side: when the store marks the order `delivered` / `paid`, Motahai sends `Purchase` with
+  `event_id = purchase_<order_id>`.~~
+- ~~Prepaid orders: fire standard D-002 deduplicated browser + server events immediately.~~
 
 ### Decision 2: Frictionless Onboarding & Zero-GTM Prerequisite
 - **The COD Wedge does NOT need GTM access.** It needs only:

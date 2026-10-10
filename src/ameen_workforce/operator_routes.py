@@ -9,18 +9,16 @@ collide across stores. Responses never contain raw PII (audience files hold SHA-
 and row counts only).
 """
 
-import hmac
 import logging
 import os
-from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from .audiences import export_tenant_audiences
+from .auth import require_operator
 from .capi_service import capi_sender
-from .config import settings
 from .db import Order, get_session_factory, get_tenant_by_shop_domain
 from .order_pipeline import emit_confirmed_order
 
@@ -30,28 +28,6 @@ AUDIENCE_EXPORT_DIR_ENV = "AUDIENCE_EXPORT_DIR"
 DEFAULT_AUDIENCE_EXPORT_DIR = "out/audiences"
 
 router = APIRouter()
-
-
-def require_operator(authorization: Optional[str] = Header(None)) -> None:
-    """
-    Authenticates a HUMAN operator for Rule D-003 approvals via env OPERATOR_API_KEY.
-    This key is deliberately separate from HERMES_API_KEY / any agent or webhook credential:
-    an agent that can call the tools must never be able to mint its own approval.
-    Used as a dependency so authentication runs before request-body validation.
-    Fails closed: if OPERATOR_API_KEY is unset (or equals HERMES_API_KEY) nobody is authenticated.
-    """
-    operator_key = os.environ.get("OPERATOR_API_KEY", "")
-    if not operator_key:
-        logger.error("OPERATOR_API_KEY is not configured; refusing all approval requests")
-        raise HTTPException(status_code=401, detail="Operator authentication required")
-    if settings.HERMES_API_KEY and hmac.compare_digest(operator_key.encode(), settings.HERMES_API_KEY.encode()):
-        logger.error("OPERATOR_API_KEY must differ from HERMES_API_KEY; refusing all approval requests")
-        raise HTTPException(status_code=401, detail="Operator authentication required")
-    presented = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        presented = authorization[7:].strip()
-    if not presented or not hmac.compare_digest(presented.encode(), operator_key.encode()):
-        raise HTTPException(status_code=401, detail="Operator authentication required", headers={"WWW-Authenticate": "Bearer"})
 
 
 def get_session_factory_dep() -> sessionmaker:

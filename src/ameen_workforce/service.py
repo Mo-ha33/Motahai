@@ -26,7 +26,9 @@ from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
-from .operator_routes import router as operator_router, require_operator
+from .operator_routes import router as operator_router
+from .stats_routes import router as stats_router
+from .auth import require_operator  # noqa: F401  (defined in auth.py; re-exported for the approval route + tests)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -62,6 +64,7 @@ app = FastAPI(
 app.include_router(webhook_router)
 app.include_router(capture_router)
 app.include_router(operator_router)
+app.include_router(stats_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [

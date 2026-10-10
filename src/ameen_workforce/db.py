@@ -5,15 +5,17 @@ Works on SQLite (dev/tests) and Postgres (prod): only portable column types and 
 Engine URL comes from env DATABASE_URL (default sqlite:///./motahai.db), read lazily.
 
 Privacy: customer email/phone are stored ONLY as SHA-256 hashes (orders.email_hash / phone_hash) and
-webhook payloads are never stored (only their SHA-256). Credentials live encrypted (see credentials.py).
+webhook payloads are never stored in plaintext: webhook_deliveries keeps only their SHA-256, and staged_webhooks keeps
+a Fernet-encrypted copy only until the webhook is processed (see webhook_staging.py). Credentials live encrypted
+(see credentials.py).
 
 All timestamps are timezone-aware UTC. SQLite drops tzinfo on read, so UTCDateTime restores it.
 
 Schema is created with create_all() for now. NOTE: create_all() never ALTERs an existing table, so the S2 columns
 (orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
 storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source, S1-4 tenants.digest_email +
-tenants.language, tenants.meta_test_event_code) and the new checkout_context table need an Alembic migration before
-any non-empty database is upgraded.
+tenants.language, tenants.meta_test_event_code) and the new checkout_context and staged_webhooks tables need an Alembic
+migration before any non-empty database is upgraded.
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
@@ -295,6 +297,38 @@ class WebhookDelivery(Base):
     is_duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
     error_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     payload_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class StagedWebhook(Base):
+    """
+    Durable copy of a verified webhook, written BEFORE the route answers 200 (webhook_staging.py). The payload is
+    Fernet-encrypted (credentials.encrypt_value) and the row is deleted once process_webhook has run, so a background
+    task lost between the 200 and the commit is replayed by the scheduler instead of being dropped. A row that keeps
+    failing ends as status "dead" with its ciphertext wiped (no PII is kept for dead letters).
+    """
+    __tablename__ = "staged_webhooks"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'dead')", name="ck_staged_webhooks_status"),
+        Index("ix_staged_webhooks_due", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(32))
+    topic: Mapped[str] = mapped_column(String(64))
+    delivery_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Platform order reference (order id / courier business reference), not PII. Kept on dead letters so an operator
+    # can reconcile the missing update with the merchant after the payload is wiped.
+    order_ref: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    payload_ciphertext: Mapped[str] = mapped_column(Text)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    next_attempt_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    last_error_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"StagedWebhook(id={self.id!r}, platform={self.platform!r}, status={self.status!r})"  # no ciphertext
 
 
 class Incident(Base):

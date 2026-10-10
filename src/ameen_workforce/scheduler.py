@@ -9,6 +9,7 @@ Handles periodic maintenance and conversion pipeline duties:
   4. merge_pending_captures(): Merges pending storefront captures into their orders (lazy import from
      `capture`; the job is recorded as skipped when that module is not available).
   5. Heartbeat / health check tracking into the `job_runs` table so operators know the scheduler is alive.
+  6. replay_staged_webhooks(): Replays verified webhooks whose background task was lost or failed (webhook_staging.py).
 
 Execution modes:
   - Standalone daemon (production): `python -m ameen_workforce.scheduler` runs run_daemon(), one
@@ -40,6 +41,7 @@ from .digest import send_weekly_digests, sender_from_env
 from .audiences import export_tenant_audiences
 from .db import JobRun, Tenant, get_session_factory, init_db, session_scope, utcnow
 from .order_pipeline import retry_failed_events, send_due_events
+from .webhook_staging import replay_staged_webhooks
 
 logger = logging.getLogger("ameen_workforce.scheduler")
 
@@ -52,6 +54,7 @@ DIGEST_JOB_NAME = "send_weekly_digests"
 HEARTBEAT_JOB_NAME = "scheduler_heartbeat"
 AUDIENCE_EXPORT_JOB_NAME = "export_weekly_audiences"
 AUDIENCE_EXPORT_INTERVAL = timedelta(days=7)
+REPLAY_JOB_NAME = "replay_staged_webhooks"
 
 
 class SchedulerStale(RuntimeError):
@@ -128,6 +131,8 @@ async def run_scheduler_tick(
 ) -> Dict[str, Any]:
     """
     Executes one full iteration of the background jobs:
+      0. replay_staged_webhooks (webhooks whose background task was lost or failed; first, so a replayed delivery's
+         conversion can be sent by step 1 in the same tick)
       1. send_due_events (dispatches settled conversions)
       2. retry_failed_events (retries failed CAPI requests)
       3. purge_expired_checkout_context (purges encrypted IP/UA older than 14 days)
@@ -149,6 +154,11 @@ async def run_scheduler_tick(
         "jobs": {},
     }
 
+    summary["jobs"][REPLAY_JOB_NAME] = await _run_job(
+        factory, REPLAY_JOB_NAME,
+        lambda s, t: replay_staged_webhooks(s, now=t, sender=sender),
+        now,
+    )
     summary["jobs"][SEND_JOB_NAME] = await _run_job(
         factory, SEND_JOB_NAME,
         lambda s, t: send_due_events(s, now=t, sender=sender, limit=due_limit),
