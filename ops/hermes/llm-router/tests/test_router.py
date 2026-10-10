@@ -654,3 +654,136 @@ def test_healthz_exposes_budget_cooldown_and_capacity_fields(env, tmp_path):
     assert 8.9 <= orr["rpm_tokens"] <= 9.1 and orr["cooldown_kind"] == ""
     assert gm["requests_today"] == 0 and gm["daily_request_budget"] == 0
     assert h["sticky_sessions"] == 1 and h["stale_cache_entries"] == 1 and h["config"] == "inline"
+
+
+# ─────────────────────── model end-of-life / rejected streak ────────────────────────
+
+GONE_410 = {"type": "about:blank", "title": "Gone", "status": 410, "detail": (
+    "The model 'meta/llama-3.3-70b-instruct' has reached its end of life on 2026-08-26T09:00:00Z "
+    "and is no longer available.")}
+
+
+def test_410_model_gone_benches_provider_for_six_hours(env, tmp_path, caplog):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(410, json=GONE_410)]
+    c, router = make(tmp_path, up)
+    with caplog.at_level("ERROR"):
+        res = post(c)
+    assert res.headers["x-router-provider"] == "openrouter"
+    assert any("is gone (HTTP 410)" in m and "nv-model" in m for m in caplog.messages)
+    nv = router.health["nvidia"]
+    assert nv.last_kind == "model_gone"
+    assert 21600 <= nv.cooldown_until - time.time() <= 21600 * 1.05 + 5
+    up.calls.clear()
+    res = post(c, msgs("another session"))
+    assert res.headers["x-router-provider"] == "openrouter" and "nvidia" not in up.called()
+
+
+def test_model_gone_attempt_outcome_and_detail(env, tmp_path):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(410, json=GONE_410)]
+    for name in ("openrouter", "gemini"):
+        up.script[name] = [httpx.Response(500, json={})]
+    c, _ = make(tmp_path, up)
+    atts = post(c).json()["error"]["attempts"]
+    assert atts[0]["outcome"] == "model_gone" and atts[0]["status"] == 410
+    assert "end of life" in atts[0]["detail"] and len(atts[0]["detail"]) <= 200
+
+
+@pytest.mark.parametrize("body", [
+    {"error": {"message": "The model `x` does not exist"}},
+    {"error": {"message": "Model not found: nv-model"}},
+    {"error": {"message": "No endpoints found for this model"}},
+    {"error": {"message": "model is deprecated"}},
+])
+def test_404_naming_the_model_is_model_gone(env, tmp_path, body):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(404, json=body)]
+    c, router = make(tmp_path, up)
+    assert post(c).headers["x-router-provider"] == "openrouter"
+    assert router.health["nvidia"].last_kind == "model_gone"
+    assert router.health["nvidia"].cooldown_until - time.time() > 21000
+
+
+def test_bare_404_stays_rejected_without_cooldown(env, tmp_path):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(404, json={}), httpx.Response(404, text="Not Found"),
+                           httpx.Response(404, json={"error": "route missing"})]
+    c, router = make(tmp_path, up)
+    assert post(c).headers["x-router-provider"] == "openrouter"
+    nv = router.health["nvidia"]
+    assert nv.cooldown_until == 0 and nv.consecutive_failures == 0 and nv.last_kind == ""
+    assert nv.rejected_streak == 1
+    post(c, msgs("b")), post(c, msgs("c"))      # "Not Found" without the word model, still rejected
+    assert nv.cooldown_until == 0 and nv.rejected_streak == 3
+
+
+def test_healthz_flags_model_gone_and_degraded(env, tmp_path):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(410, json=GONE_410)]
+    up.script["openrouter"] = [httpx.Response(401, json={})]
+    c, _ = make(tmp_path, up)
+    post(c)
+    h = c.get("/healthz", headers={"Authorization": f"Bearer {KEY}"}).json()
+    nv, orr, gm = h["providers"]
+    assert nv["model_gone"] is True and nv["cooldown_kind"] == "model_gone" and nv["cooling_down_s"] > 21000
+    assert orr["model_gone"] is False and gm["model_gone"] is False
+    assert h["degraded"] == ["nvidia", "openrouter"]
+    assert all("rejected_streak" in row for row in h["providers"])
+
+
+def test_healthy_healthz_has_empty_degraded(env, tmp_path):
+    c, _ = make(tmp_path, Upstream())
+    post(c)
+    h = c.get("/healthz", headers={"Authorization": f"Bearer {KEY}"}).json()
+    assert h["degraded"] == [] and not any(row["model_gone"] for row in h["providers"])
+
+
+def test_model_gone_cooldown_survives_restart(env, tmp_path):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(410, json=GONE_410)]
+    c, _ = make(tmp_path, up)
+    post(c)
+    _, router2 = make(tmp_path, Upstream())
+    assert router2.health["nvidia"].last_kind == "model_gone"
+    assert router2.health["nvidia"].cooldown_until > time.time() + 21000
+
+
+def test_exhausted_kind_is_mixed_with_model_gone(env, tmp_path):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(410, json=GONE_410)]
+    up.script["openrouter"] = [httpx.Response(429, json={})]
+    up.script["gemini"] = [httpx.Response(429, json={})]
+    c, _ = make(tmp_path, up)
+    res = post(c)
+    assert res.status_code == 503 and res.headers["x-router-exhausted-kind"] == "mixed"
+    up.script["openrouter"] = [httpx.Response(429, json={})]
+    up.script["gemini"] = [httpx.Response(429, json={})]
+    # nvidia is now skipped:cooldown (model_gone), the others are 429s -> still mixed, not rate_limited
+    res = post(c, msgs("again"))
+    assert res.status_code == 503 and res.headers["x-router-exhausted-kind"] == "mixed"
+
+
+def test_rejected_streak_counts_warns_once_and_resets_on_success(env, tmp_path, caplog):
+    up = Upstream()
+    up.script["nvidia"] = [httpx.Response(400, json={"error": {"message": "bad schema " + "x" * 300}})
+                           for _ in range(6)]
+    c, router = make(tmp_path, up)
+    with caplog.at_level("WARNING"):
+        for i in range(6):
+            post(c, msgs(f"q{i}"))
+    nv = router.health["nvidia"]
+    assert nv.rejected_streak == 6 and nv.cooldown_until == 0 and nv.consecutive_failures == 0
+    warns = [m for m in caplog.messages if "consecutive rejected" in m]
+    assert len(warns) == 1 and "nvidia" in warns[0] and "HTTP 400" in warns[0] and "bad schema" in warns[0]
+    assert "x" * 121 not in warns[0]
+    h = c.get("/healthz", headers={"Authorization": f"Bearer {KEY}"}).json()
+    assert h["providers"][0]["rejected_streak"] == 6 and h["degraded"] == []
+    assert post(c, msgs("fine")).headers["x-router-provider"] == "nvidia"    # script exhausted -> ok
+    assert nv.rejected_streak == 0
+
+
+def test_old_state_without_rejected_streak_loads(env, tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({"health": {"nvidia": {"consecutive_failures": 1}}}))
+    _, router = make(tmp_path, Upstream())
+    assert router.health["nvidia"].rejected_streak == 0

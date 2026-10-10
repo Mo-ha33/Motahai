@@ -68,6 +68,11 @@ LEAKED_TOOL_CALL = re.compile(r"^\s*(?:<tool_call>|<\|python_tag\|>|\{\s*\"(?:na
 REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_details", "thinking")
 GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
 PER_DAY = re.compile(r"per.?day", re.I)
+# A 404 only means "this model is gone" if the body says so; a bare 404 stays request-level.
+MODEL_GONE_404 = re.compile(
+    r"not found|does not exist|no longer available|end of life|deprecated|not available|no endpoints", re.I)
+MODEL_GONE_COOLDOWN_S = 6 * 3600.0
+REJECTED_STREAK_WARN = 5
 # Outcomes that mean "this provider is just rate-limited", for the exhausted-kind header.
 RATE_LIMITED_OUTCOMES = {"rate_limited", "rate_limited:daily", "skipped:cooldown", "skipped:daily_requests",
                          "skipped:local_rpm"}
@@ -132,6 +137,7 @@ class Health:
     requests_day: str = ""             # America/Los_Angeles date (Gemini's quota reset)
     requests_used: int = 0
     last_kind: str = ""                # kind of the last failure ("" after a success)
+    rejected_streak: int = 0           # consecutive request-level rejections; reset on success
 
 
 @dataclass
@@ -400,7 +406,8 @@ class Router:
         return None
 
     # ── health bookkeeping ──
-    def _fail(self, p: Provider, kind: str, retry_after: float | None, detail: str) -> None:
+    def _fail(self, p: Provider, kind: str, retry_after: float | None, detail: str,
+              status: int | None = None) -> None:
         h = self.health[p.name]
         h.consecutive_failures += 1
         h.last_error = f"{kind}: {detail}"[:300]
@@ -415,6 +422,10 @@ class Router:
         elif kind == "auth":
             cd = 1800
             log.error("provider %s rejected credentials — check its key", p.name)
+        elif kind == "model_gone":                 # EOL / removed model: retrying won't help, bench for 6 h
+            cd = MODEL_GONE_COOLDOWN_S
+            log.error("provider %s model %s is gone (HTTP %s) — change its model in the config",
+                      p.name, p.model, status)
         elif n >= self.breaker_threshold:          # 5xx / timeout / invalid output
             cd = min(60 * 2 ** (n - self.breaker_threshold), 900)
         else:
@@ -422,8 +433,8 @@ class Router:
         if cd:
             # A provider-declared window (e.g. Gemini free tier: "retry in 8h") is honoured up to
             # 24 h, so an exhausted daily quota isn't re-probed every few minutes.
-            declared = kind == "daily_quota" or (kind == "rate_limited" and retry_after is not None)
-            jitter = (1.0, 1.02) if kind == "daily_quota" else (1.0, 1.15)   # don't overshoot the reset
+            declared = kind in ("daily_quota", "model_gone") or (kind == "rate_limited" and retry_after is not None)
+            jitter = {"daily_quota": (1.0, 1.02), "model_gone": (1.0, 1.05)}.get(kind, (1.0, 1.15))   # don't overshoot
             cd = max(5.0, min(cd, 86400.0 if declared else 3600.0)) * random.uniform(*jitter)  # noqa: S311
             h.cooldown_until = time.time() + cd
         self._save_state(force=True)
@@ -432,6 +443,7 @@ class Router:
         h = self.health[p.name]
         changed = h.consecutive_failures or h.cooldown_until
         h.consecutive_failures, h.cooldown_until, h.last_error, h.last_kind = 0, 0.0, "", ""
+        h.rejected_streak = 0
         self._roll_day(h)
         h.tokens_used += int((usage or {}).get("total_tokens") or 0)
         self._save_state(force=bool(changed))
@@ -583,6 +595,9 @@ class Router:
         elif status in (401, 403):
             att.outcome = "auth"
             self._fail(p, "auth", None, text)
+        elif status == 410 or (status == 404 and re.search(r"model", text, re.I) and MODEL_GONE_404.search(text)):
+            att.outcome, att.detail = "model_gone", text[:200]   # EOL / removed model: persistent, not request-level
+            self._fail(p, "model_gone", None, text, status)
         elif status in (400, 413, 422) and CONTEXT_ERROR.search(text):
             att.outcome = "context_too_long"            # request-level: no penalty
         elif status >= 500 or status == 408:
@@ -590,6 +605,10 @@ class Router:
             self._fail(p, "server_error", _retry_after(resp), text)
         else:
             att.outcome, att.detail = "rejected", text[:200]   # e.g. schema the provider dislikes
+            h.rejected_streak += 1                      # no cooldown (may be request-specific), but make it visible
+            if h.rejected_streak == REJECTED_STREAK_WARN:
+                log.warning("provider %s: %d consecutive rejected requests (last HTTP %s): %s",
+                            p.name, h.rejected_streak, status, text[:120])
         return None
 
 
@@ -814,11 +833,15 @@ def create_app(cfg: dict[str, Any] | None = None, transport: httpx.AsyncBaseTran
                 "name": p.name, "model": p.model, "cooling_down_s": max(0, int(h.cooldown_until - now)),
                 "cooldown_kind": h.last_kind if h.cooldown_until > now else "",
                 "consecutive_failures": h.consecutive_failures, "last_error": h.last_error,
+                "model_gone": h.last_kind == "model_gone" and h.cooldown_until > now,
+                "rejected_streak": h.rejected_streak,
                 "tokens_today": h.tokens_used, "requests_today": h.requests_used,
                 "daily_request_budget": p.daily_request_budget,
                 "rpm_tokens": round(bucket.peek(), 1) if p.rpm > 0 else None,
                 "inflight": router.inflight[p.name], "key_present": bool(os.environ.get(p.key_env))})
-        return JSONResponse({"providers": rows, "sticky_sessions": len(router.sticky),
+        degraded = [row["name"] for row in rows
+                    if row["model_gone"] or (row["cooldown_kind"] in ("auth", "payment"))]
+        return JSONResponse({"providers": rows, "degraded": degraded, "sticky_sessions": len(router.sticky),
                              "stale_cache_entries": len(router._cache), "config": config_name})
 
     @contextlib.asynccontextmanager
