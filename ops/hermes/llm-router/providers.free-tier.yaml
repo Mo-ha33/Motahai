@@ -20,7 +20,10 @@
 public_model: hermes-auto
 advertised_context: 120000         # smallest window below (NVIDIA/OpenRouter 128k) minus margin
 overall_deadline_s: 120            # free endpoints are slow when busy; fail over, don't wait
-sticky_seconds: 600
+sticky_seconds: 600                # applies ONLY to providers with `sticky: true`. NVIDIA is the primary, so
+                                   # free-tier traffic always returns to NVIDIA first once it has recovered.
+local_wait_max_s: 8                # all providers merely locally throttled (rpm/busy)? wait up to this long
+local_retry_rounds: 2              # ...and retry (max passes per request) instead of 503ing to a raw 429 fallback
 breaker_threshold: 2               # free endpoints flap — bench sooner
 bytes_per_token: 3.2
 state_file: /var/lib/hermes-llm-router/state.json
@@ -36,11 +39,14 @@ providers:
   - name: nvidia
     base_url: https://integrate.api.nvidia.com/v1
     key_env: NVIDIA_API_KEY
-    model: meta/llama-3.3-70b-instruct      # tool-calling capable on NIM; NOT deepseek-r1 (no tools, <think> noise)
+    # 2026-10-11: llama-3.3-70b returned 410 Gone (EOL 2026-08-26). tool_conformance.py --runs 3:
+    # nemotron-3-super 100 % / 0 malformed / p50 850 ms; glm-5.3 4 errors, p50 31 s; kimi-k2.6 all errors.
+    model: nvidia/nemotron-3-super-120b-a12b
     context_window: 131072
     max_output_tokens: 2048
-    rpm: 35                                  # stay under the ~40 RPM free limit; spill early
+    rpm: 30                                  # ~40 RPM free limit; 25% headroom, spill early
     max_concurrency: 2
+    sticky: true
     timeout_s: 60
 
   - name: gemini-flash
@@ -50,9 +56,12 @@ providers:
     context_window: 1048576
     max_output_tokens: 2048
     rpm: 8                                   # free-tier per-minute limits are low; check AI Studio
+    daily_request_budget: 18                 # = AI Studio RPD for this model minus ~10%: the reserve stops the router before Google 429s
+    sticky: false                            # never pin sessions onto the scarcest daily quota
     max_concurrency: 2
     timeout_s: 60
-    gemini_thought_signatures: false         # set true if the alias points at a Gemini 3.x model and tool loops 400
+    gemini_thought_signatures: true          # flash-latest resolves to Gemini 3.x, which REQUIRES signatures on function calls;
+                                             # the dummy validator token is accepted by 2.5 too, so true is safe for both
     strip_schema_keys: ["$schema"]
 
   - name: gemini-flash-lite                  # separate model = separate free daily quota
@@ -62,27 +71,30 @@ providers:
     context_window: 1048576
     max_output_tokens: 2048
     rpm: 12
+    daily_request_budget: 18                 # same reserve logic as gemini-flash (check this model's RPD)
+    sticky: false
     max_concurrency: 2
     timeout_s: 60
-    gemini_thought_signatures: false
+    gemini_thought_signatures: true
     strip_schema_keys: ["$schema"]
 
   - name: openrouter-free
     base_url: https://openrouter.ai/api/v1
     key_env: OPENROUTER_API_KEY
-    model: meta-llama/llama-3.3-70b-instruct:free
+    model: nvidia/nemotron-3-super-120b-a12b:free   # 2026-10-11 conformance --runs 2: 100 %, 0 malformed
     context_window: 131072
     max_output_tokens: 2048
     rpm: 15
+    daily_request_budget: 45                 # 50/day without purchased credits, 1000/day with >=10 credits: raise if credits bought
+    sticky: false
     max_concurrency: 2
     timeout_s: 60
     extra_body:
-      # OpenRouter tries these in order inside ONE request (its own fallback). [VERIFY]
-      # current :free slugs with GET https://openrouter.ai/api/v1/models before the demo.
+      # OpenRouter tries these in order inside ONE request (its own fallback). Only list slugs that
+      # passed tool_conformance.py (all three previous :free slugs were delisted by 2026-10-11;
+      # google/gemma-4-31b-it:free errored on every tool call). Re-check GET /api/v1/models monthly.
       models:
-        - meta-llama/llama-3.3-70b-instruct:free
-        - deepseek/deepseek-chat-v3-0324:free
-        - qwen/qwen-2.5-72b-instruct:free
+        - nvidia/nemotron-3-super-120b-a12b:free
       provider:
         require_parameters: true
     extra_headers:
