@@ -13,7 +13,7 @@ WorkingDirectory=/opt/hermes
 # HITL_VERIFY_PUBLIC_KEY_PATH=/etc/hermes/hitl_public.pem), HITL_USED_NONCES_PATH, tenant MCP tokens, LLM key.
 EnvironmentFile=/etc/hermes/hermes.env
 # Replace with the real Hermes entry point. The `cryptography` package must be installed in this venv: the inline
-# verifier in consultation.py imports it, and every GTM publish fails closed without it.
+# verifier in ops/hermes/consultation.py imports it, and every GTM publish fails closed without it.
 ExecStart=/opt/hermes/venv/bin/python -m REPLACE_WITH_HERMES_ENTRYPOINT
 Restart=always
 RestartSec=5s

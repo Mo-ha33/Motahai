@@ -4,7 +4,7 @@
 **Parent Specification:** [`VID-17`](VID-17_Motahai_Pre_Production_Bible.md)  
 **Agent:** `Ziad | AI Creative Video Director` (`ziad-ai-creative-vid-ca4e`)  
 **Platform:** Wesam.ai Platform & Hermes VPS Video Engine  
-**Generated Video Artifact:** [`VID-17_Motahai_60s_Master.mp4`](VID-17_Motahai_60s_Master.mp4)  
+**Generated Video Artifact:** attached to the GitHub Release v1.0.0  
 **Production Timestamp:** 2026-10-09  
 
 ---
@@ -69,7 +69,7 @@ Keyframe frames were extracted directly from the rendered master video file:
 
 ## 4. Production Script & Pipeline Automation
 
-The master video was assembled using [`produce_video.py`](../produce_video.py) executing the 5-step deterministic pipeline:
+The master video was assembled using [`produce_video.py`](../tools/video/produce_video.py) executing the 5-step deterministic pipeline:
 1. **TTS Voiceover Generation:** Speech synthesized via `System.Speech.Synthesis`, trimmed at 8.0s, and padded with silence to 10.0s.
 2. **120 BPM Music Generation:** Algorithmic electronic pulse, 73.4Hz bassline, and percussion generated in FFmpeg.
 3. **Master Audio Ducking:** Audio mixed with voiceover boosted +1.2x and music ducked to 0.35x (-9 dB) for vocal clarity.

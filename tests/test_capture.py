@@ -329,12 +329,14 @@ def test_without_fernet_key_attribution_kept_and_ip_ua_skipped(db_session, salla
 
 # --- wiring / legacy routes ----------------------------------------------------------------------------------
 
-def test_real_app_has_new_route_and_legacy_routes_are_gone():
+def test_real_app_has_new_route_and_legacy_routes_are_gone(db_session, monkeypatch):
     from src.ameen_workforce.service import app
-    paths = {getattr(r, "path", None) for r in app.routes}
-    assert "/v1/capture/{tenant_key}" in paths
-    assert "/storefront/capture" not in paths and "/webhooks/salla/capture" not in paths
+    factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False)
+    monkeypatch.setitem(app.dependency_overrides, get_session_factory_dep, lambda: factory)
     c = TestClient(app)
+    # Empty test DB => shop unknown => a wired route answers 404 "Unknown shop"; a missing route answers "Not Found".
+    res = c.options("/v1/capture/demo-store.myshopify.com")
+    assert res.status_code == 404 and res.json() == {"detail": "Unknown shop"}
     for path in ("/storefront/capture", "/webhooks/salla/capture"):
         res = c.post(path, json={"merchant": "778899", "order_id": "1", "client_ip": "1.2.3.4"})
         assert res.status_code in (404, 405)

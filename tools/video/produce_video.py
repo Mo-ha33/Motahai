@@ -261,10 +261,11 @@ def assemble_master_video(work_dir, rendered_blocks, master_audio, output_mp4):
 
 def main():
     start_time = time.time()
-    work_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "video_build_cache")
+    repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    work_dir = os.path.join(repo_dir, "video_build_cache")
     os.makedirs(work_dir, exist_ok=True)
     
-    output_mp4 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deliverables", "VID-17_Motahai_60s_Master.mp4")
+    output_mp4 = os.path.join(repo_dir, "deliverables", "VID-17_Motahai_60s_Master.mp4")
     os.makedirs(os.path.dirname(output_mp4), exist_ok=True)
     
     master_vo = generate_voiceovers(work_dir)

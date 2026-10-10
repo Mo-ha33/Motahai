@@ -19,7 +19,7 @@ from pathlib import Path
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
-BOARD_FILE = Path(__file__).parent / "PROJECT_BOARD.md"
+BOARD_FILE = Path(__file__).resolve().parents[2] / "PROJECT_BOARD.md"
 
 VALID_STATUSES = ["BACKLOG", "IN_PROGRESS", "REVIEW", "DONE"]
 VALID_ROLES = ["Opus 5.5", "Sonnet 5.5", "Gemini 3.8", "Haiku 5.5"]

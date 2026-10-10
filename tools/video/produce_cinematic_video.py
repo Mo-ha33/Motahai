@@ -141,7 +141,7 @@ def assemble_cinematic_master(work_dir, rendered_clips, master_audio, output_mp4
 
 def main():
     start_time = time.time()
-    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     assets_dir = os.path.join(repo_dir, "assets", "cinematic_scenes")
     work_dir = os.path.join(repo_dir, "video_build_cache")
     master_audio = os.path.join(work_dir, "master_mix.wav")

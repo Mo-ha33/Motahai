@@ -303,7 +303,7 @@ def test_salla_webhook_parser():
 def test_tracking_asset_matrix_builder():
     matrix = TrackingAssetMatrixBuilder.build_matrix(
         client_name="Kinz Al Atfal",
-        store_url="https://epxsmk-y0.myshopify.com",
+        store_url="https://demo-store.myshopify.com",
         platform="Shopify",
         gtm_container_id="GTM-5C5N552P",
         ga4_measurement_id="G-AMEEN2026D",

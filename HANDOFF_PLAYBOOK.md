@@ -21,7 +21,7 @@ We heard your feedback loud and clear, and we **executed and pushed the code dir
 | Component / Finding | Previous Status | Current Ground Truth in Repo (`main`) |
 |---|---|---|
 | **Test Suite Health** | 44 passed, 24 failed | **74 passed, 0 failed (100% green)**. `httpx` pinned to `0.27.2` in `requirements.txt`. |
-| **Rule D-003 HITL Gate** | Missing approval step | **Enforced in code.** `consultation.py` & `patch_cloud_tool.py` halt on `hermes_gtm_cloud_publish` unless `hitl_approval_token='SUPERVISOR_APPROVED'` is passed. |
+| **Rule D-003 HITL Gate** | Missing approval step | **Enforced in code.** `ops/hermes/consultation.py` halts `hermes_gtm_cloud_publish` unless it receives a signed, single-use Ed25519 approval token bound to one container and workspace (issued by `POST /approvals/gtm-publish`; see `src/ameen_workforce/hitl_tokens.py`). |
 | **Browser Audit Fallback** | Fake HTML on fetch error | **Removed.** `browser_service.py` returns explicit `http_status: 0` and error scorecard. |
 | **Hardcoded CAPI/BI Metrics** | Unlabeled mock numbers | **Labeled honestly.** `workflow_engine.py` explicitly tags metrics with `simulated: True` and `provenance: benchmark_simulation`. |
 | **Service Account Email** | Discrepancy with GCP | **Standardized.** Reconciled to `tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com`. |
@@ -29,7 +29,7 @@ We heard your feedback loud and clear, and we **executed and pushed the code dir
 | **Rule D-005 (COD Logic)** | Vision only | **Implemented & tested.** `process_cod_order_event` emits `OrderPlaced` for in-transit COD, and `Purchase` (`purchase_<id>`) **only when delivered**. |
 | **Zero-Effort Webhooks** | Vision only | **Implemented & tested.** `src/ameen_workforce/webhook_listener.py` parses Shopify and Salla webhooks and dispatches delivered CAPI events. |
 | **Client Asset Delivery** | Manual | **Implemented & tested.** `src/ameen_workforce/asset_matrix.py` formats IDs and exports Markdown delivery sheets. |
-| **Project Task Board** | None | **Live & synced.** `PROJECT_BOARD.md` and CLI tool `manage_board.py` tracking 13 tasks. |
+| **Project Task Board** | None | **Live & synced.** `PROJECT_BOARD.md` and CLI tool `tools/board/manage_board.py` tracking 13 tasks. |
 
 ---
 
@@ -66,7 +66,7 @@ We heard your feedback loud and clear, and we **executed and pushed the code dir
 
 ## 4. Current Sprint Task Board Status
 
-Managed via `manage_board.py` on GitHub:
+Managed via `tools/board/manage_board.py` on GitHub:
 - `TASK-001` (Pin httpx, 68 tests green): **DONE**
 - `TASK-002` (Reconcile GCP project & SA email): **DONE**
 - `TASK-003` (Enforce D-003 HITL gate on live deploy): **DONE**

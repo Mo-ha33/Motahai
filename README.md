@@ -1,245 +1,193 @@
-# Motahai (متاح) — An 8-Agent GTM & Tracking Workforce with a Self-Hosted Technical Supervisor
+# Motahai (مُتاح)
 
-> **Agents propose. Deterministic code verifies. Humans approve.**
-> Eight AI employees on [Wesam.ai](https://wesam.ai) audit, fix and QA e-commerce tracking (GTM, GA4, Meta CAPI,
-> Consent Mode v2). Every one of them works through **Hermes**, a technical supervisor we host on our own
-> Contabo VPS and expose to Wesam over the **Model Context Protocol (MCP)**. Nothing reaches a production
-> GTM container without explicit human sign-off.
+**Server-side conversion and delivery reconciliation for cash-on-delivery (COD) e-commerce in MENA and the GCC.**
+Motahai tells Meta which orders were confirmed and which were actually delivered and paid, so ad optimization stops
+learning from orders that are refused at the door.
 
-Built for **Untap — Agents at Work (1st Edition)** by **Ameen Digital** · [Verify in 60 seconds](#verify-in-60-seconds)
-
-> **بالعربي:** متاح فريق من 8 موظفين ذكاء اصطناعي على منصة Wesam متخصصين في تتبع التجارة الإلكترونية
-> (GTM و GA4 و Meta CAPI و Consent Mode v2). كلهم بيشتغلوا تحت إشراف **Hermes**، مشرف تقني مستضاف على سيرفر
-> خاص بينا ومتوصل بيهم عن طريق **MCP**. الوكلاء بيقترحوا، والكود الحتمي بيتحقق، والإنسان هو اللي بيوافق:
-> مفيش أي تعديل بيوصل لحاوية GTM حية من غير موافقة بشرية صريحة.
-
-![The 8 Motahai agents in the Wesam.ai Agent Builder](docs/assets/wesam-8-agents.png)
+![tests](https://img.shields.io/badge/tests-574%20passed%20%C2%B7%203%20skipped-brightgreen)
+![license](https://img.shields.io/badge/license-BUSL--1.1-blue)
+![python](https://img.shields.io/badge/python-3.12-blue)
 
 ---
 
-## Why this is not "just a system prompt"
+## The problem
 
-| A prompt-only agent              | Motahai                                                                                   |
-|----------------------------------|-------------------------------------------------------------------------------------------|
-| Lives only inside the platform   | **Hermes runs on our own VPS** and is wired into every Wesam agent as an MCP server        |
-| The LLM grades its own output    | **Deterministic `gtm-container-linter`** (stdlib Python, no LLM): same input → same findings |
-| Can ship whatever it writes      | **3 HITL gates**: workforce engine halt · Hermes `REJECTED`/`BLOCKED` verdicts · gateway tool policy |
-| Forgets between chats            | **Persistent memory** on the VPS: `SOUL.md`, `MEMORY.md`, standing decisions (`D-001…D-004`) |
-| One model, one point of failure  | **LLM router** with failover (NVIDIA → OpenRouter → Gemini) and a stale-if-error cache     |
-| "Trust me"                       | **68 automated tests** + a reproducible evidence script that writes a timestamped JSON report |
+In Cash on Delivery markets (Saudi Arabia, UAE, Egypt, Kuwait) a large share of placed orders is refused at the
+door, faked or cancelled in transit. Industry sources often cite 20 to 45 percent; Motahai has not measured this rate
+on its own pilot stores yet. Standard tracking fires a Meta `Purchase` the moment checkout completes, so:
 
----
+- Meta optimizes toward people who press "Order Now" easily, including people who never intended to pay the courier.
+- Ads Manager can show a strong ROAS while refused parcels and return shipping eat the cash.
+- The naive fix, delaying `Purchase` until delivery 3 to 7 days later, starves ad sets of events (Meta's guideline is
+  roughly 50 events per ad set per week) and runs into Meta's 7-day limit on event age.
 
-## Architecture
+## The 3-step signal ladder (Rule D-005, "Coexist")
+
+Motahai leaves the merchant's native `Purchase` alone and adds two custom server-side events. Buyers optimize on the
+deepest step that still gives their ad sets enough volume.
 
 ```mermaid
 flowchart LR
-    H([Human operator]):::human
-
-    subgraph W["Wesam.ai workspace — 8 AI employees"]
-        LO[Lead GTM Orchestrator]
-        DA[DataLayer Architect]
-        PC[Pixel & CAPI Specialist]
-        QS[QA Network Sniffer]
-        AF[Auto-Fix Engineer]
-        BI[Growth BI Analyst]
-        GS[GTM Strategy & Acquisition]
-        CR[CRO & Experimentation]
-        LO --> DA & PC & QS & AF & BI & GS & CR
-    end
-
-    subgraph VPS["Contabo VPS — self-hosted"]
-        NG["Nginx edge<br/>secret capability URL · rate limits · SSE"]
-        PG["policy_guard.py<br/>role allowlists · budgets · SSRF · audit log"]
-        HM["Hermes MCP server<br/>18 tools exposed"]
-        SM[("SOUL.md + MEMORY.md<br/>persistent memory")]
-        LN["gtm-container-linter<br/>deterministic skill"]
-        RT["LLM router<br/>NVIDIA → OpenRouter → Gemini"]
-        NG --> PG --> HM
-        HM --- SM
-        HM --> LN
-        HM --> RT
-    end
-
-    W == "MCP over SSE<br/>https://api.motahai.com/mcp/‹secret›/sse" ==> NG
-    HM -. "Verdict Envelope (JSON)" .-> W
-    W -- "proposed change + rollback" --> H
-    H -- "approves & publishes" --> GTM[(Live GTM container)]
-
-    classDef human fill:#fde68a,stroke:#b45309,color:#111;
+    A["Order placed on the storefront"] --> B["Step 1: Purchase (native, browser)"]
+    A --> C{"Merchant confirms: tag, status, call, WhatsApp, or shipment"}
+    C --> D["Step 2: ConfirmedOrder (server-side CAPI)"]
+    D --> E{"Courier outcome at the door"}
+    E -- "Accepted and cash paid" --> F["Step 3: DeliveredPurchase (server-side CAPI)"]
+    E -- "Refused or cancelled" --> G["No event; counted as a refusal"]
 ```
 
-**How it fits together**
+| Step | Event | Trigger | What Motahai sends |
+|---|---|---|---|
+| 1 | `Purchase` | Checkout submit | Nothing. The merchant's own Shopify or Salla Meta integration sends it; Motahai never does, so there is no double counting. |
+| 2 | `ConfirmedOrder` | Merchant tag, merchant-configured status, manual trigger, or shipment (`implicit_on_ship`, on by default) | Server-side CAPI, `event_id = confirmed_<order_id>`, `event_time` = confirmation time, value = order total. |
+| 3 | `DeliveredPurchase` | Courier reports delivery and cash is collected, after a settlement window (default 12 h) | Server-side CAPI, `event_id = delivered_<order_id>`, `event_time` = **order placement time**, value = net collected (order total minus successful refunds on Shopify). |
 
-1. **Wesam.ai** hosts the 9 AI employees (instructions, workflows, chat). Wesam's MCP connector is shared by the
-   whole workspace, so **every agent sees the same 18 Hermes tools** in its tool list.
-2. **Hermes** is the technical supervisor ("CTO / Senior Tracking Architect"). It runs on our VPS, loads
-   [`SOUL.md`](ops/hermes/home/SOUL.md) (identity, engineering standards, refusal rules) and
-   [`MEMORY.md`](ops/hermes/home/MEMORY.md) (standing decisions) into every session, and answers in a strict
-   JSON **Verdict Envelope** that downstream agents parse.
-3. **The connection** is MCP over SSE. Wesam can only take a URL (no custom headers), so the URL carries a
-   64-hex secret: Nginx accepts only `/mcp/<secret>/`, injects the bearer token for the gateway, keeps the
-   secret out of logs, and returns 404 for everything else under `/mcp/`
-   ([`gateway/nginx-mcp.conf`](ops/hermes/gateway/nginx-mcp.conf), [`deploy/mcp-capability.conf.tpl`](ops/hermes/deploy/mcp-capability.conf.tpl)).
-4. **The gateway** ([`policy_guard.py`](ops/hermes/gateway/policy_guard.py) + [`tool-policy.yaml`](ops/hermes/gateway/tool-policy.yaml))
-   enforces what each role may call, rate limits, timeouts, token budgets, SSRF blocking, and an audit log
-   that stores argument hashes, never values.
+Details that keep the ladder honest:
 
----
+- Customer identifiers (phone, email, name, city, country, postcode, external ID) are normalized and SHA-256 hashed
+  before they leave the server. Phone numbers are normalized to E.164 first.
+- Meta rejects a whole request if any `event_time` is older than 7 days. An order whose delivery would land at
+  placed + 6.5 days or later is recorded as `late_delivery` and never sent.
+- Cancelled, voided and fully refunded orders never produce a `DeliveredPurchase`. Refusals feed a hashed exclusion
+  list (customers with 2 or more refusals in 180 days) and a hashed seed list of delivered buyers.
+- Tenants start in `shadow` mode: events are computed and recorded but nothing is sent to Meta until the operator
+  switches the tenant to `live`.
 
-## The 18 Hermes tools the Wesam agents use
+Full specification, state machine and event matrix: [`docs/MOTAHAI_PLAYBOOK.md`](docs/MOTAHAI_PLAYBOOK.md).
+Media-buyer setup (custom conversions, bidding phases): [`docs/pilot/media_buyer_handbook.md`](docs/pilot/media_buyer_handbook.md).
 
-Hermes has 21 tools. **18 are exposed to the Wesam workspace; 3 are human-only** (SSH tunnel, never through
-the public URL), because they can change Hermes's future behaviour or touch the host.
+## Platforms and couriers
 
-| Group | Tools | What the agents use them for |
+| | Bosta (Egypt) | OTO (KSA and GCC aggregator) |
 |---|---|---|
-| **Advice & review** | `hermes_consult`, `hermes_audit_code` | Engineering verdicts; code review of every patch before it leaves the swarm |
-| **Deterministic skills** | `hermes_run_task`, `hermes_skill_execute`, `hermes_skills_list`, `hermes_skill_get` | Run allowlisted skills on the VPS, e.g. `gtm-container-linter` on a live container version |
-| **Memory (read)** | `hermes_memory_read`, `hermes_session_search` | Recall standing decisions, client ledger, past incidents |
-| **Research** | `hermes_web_search`, `hermes_web_extract` | Vendor docs and public pages (SSRF-checked, treated as untrusted data) |
-| **Evidence browser** | `hermes_browser_navigate`, `_snapshot`, `_screenshot`, `_scroll`, `_click`, `_type`, `_evaluate`, `_close` | Capture `window.dataLayer`, fired beacons and page state on the client's site |
-| ~~Human-only~~ | `hermes_terminal_exec`, `hermes_skill_create`, `hermes_memory_update` | **Not exposed.** Agents propose memory writes via the `memory_write` field; a human applies them |
+| **Shopify** | Supported | Supported |
+| **Salla** | Supported | Supported |
 
-### Who calls what
+| Layer | How it works |
+|---|---|
+| Order source | Signed order webhooks from Shopify (`X-Shopify-Hmac-Sha256`) and Salla (`X-Salla-Signature`). |
+| Courier status | `POST /webhooks/bosta/{shop_domain}` (delivered = state 45) and `POST /webhooks/oto/{shop_domain}` (delivered status; HMAC over `orderId:status:timestamp`). |
+| Attribution capture | Storefront snippets for [Shopify](storefront/shopify/README.md) and [Salla](storefront/salla/README.md) capture `_fbp`, `_fbc`, `fbclid` and UTM parameters. Captures are quarantined and merged into an order only when the signed order webhook exists, the tenant matches and the order total matches. |
+| Tenant isolation | The tenant comes from the shop domain in the URL or signed headers, never from the order id. Courier webhook secrets are per tenant and stored encrypted; a tenant without a secret gets `401`. Every order, event and credential row is keyed by tenant. |
 
-Request/verdict contracts and JSON-RPC recipes are in the [agent SOP](ops/hermes/sop/WESAM_AGENT_SOP.md).
+Torod and SMSA couriers are not implemented.
 
-| Wesam agent | Typical Hermes call | Why |
-|---|---|---|
-| Lead GTM Orchestrator | `hermes_consult` | Sequencing (audit → fix → QA) and go/no-go verdicts |
-| DataLayer Architect | `hermes_browser_evaluate` → `hermes_consult` | Capture the real `dataLayer` payload, then get a schema ruling |
-| Pixel & CAPI Specialist | `hermes_consult` | `event_id` parity browser ↔ server (decision **D-002**) |
-| QA Network Sniffer | `hermes_browser_*` | Evidence of what actually fires, and how often |
-| Auto-Fix Engineer | `hermes_audit_code` | Every patch is reviewed. Deliberately **no** execution tools: the code writer never runs code on the VPS |
-| Growth BI Analyst | `hermes_memory_read`, `hermes_consult` | Attribution rules and known data-quality incidents |
-| GTM Strategy & Acquisition Lead | `hermes_consult`, `hermes_web_search` | Channel and platform constraints |
-| CRO & Experimentation Engineer | `hermes_consult` | Experiment tracking design that won't break dedup |
-| Ziad (AI Creative Video Director) | `video_produce_package`, `video_job_wait`, `hermes_consult` | 120 BPM video manifests, syllable checks, and automated animatics |
+## Security and zero trust
 
-Container audits go through `hermes_run_task` / `hermes_skill_execute` with the `gtm-container-linter`
-skill: SOUL §4 makes Hermes answer `NEEDS_EVIDENCE` to any audit request that has no linter report.
+| Control | What it does |
+|---|---|
+| **Ed25519 human-in-the-loop gate (D-003)** | No live Google Tag Manager publish goes through without a token a human operator mints through `POST /approvals/gtm-publish`. The token is Ed25519-signed, bound to one container and one workspace, single-use and valid for 30 minutes. The verifier holds only the public key, so a compromised agent host cannot mint approvals. There is no HMAC fallback. Code: [`src/ameen_workforce/hitl_tokens.py`](src/ameen_workforce/hitl_tokens.py). |
+| **Fernet identity vault (D-006)** | Checkout IP and user agent are stored Fernet-encrypted and decrypted only when the CAPI payload is built. They are purged after a successful live `DeliveredPurchase`, or 14 days after capture. Platform and Meta credentials use the same vault and fail closed if `MOTAHAI_FERNET_KEY` is missing. Code: [`credentials.py`](src/ameen_workforce/credentials.py), [`checkout_context.py`](src/ameen_workforce/checkout_context.py). |
+| **Host isolation** | The money path (API, scheduler, Postgres, Fernet key, Ed25519 private key) runs as a separate user or container from the LLM runtime, which holds only the public key and a scoped service token. Compose file, systemd units and secrets inventory: [`deployment/isolation/`](deployment/isolation/README.md). |
+| **Webhook verification** | HMAC checks over the raw request bytes in constant time; a missing secret or header fails closed with `401`. Deliveries are recorded by payload hash only and are idempotent. Code: [`webhook_signatures.py`](src/ameen_workforce/webhook_signatures.py). |
 
----
+Vulnerability reporting and the supported-versions policy: [`SECURITY.md`](SECURITY.md).
 
-## Human-in-the-loop: three independent gates
+## Verified evidence
 
-| Gate | Where | What it stops |
-|---|---|---|
-| **1. Workforce engine** | [`src/ameen_workforce/hitl_escalation.py`](src/ameen_workforce/hitl_escalation.py) | Payment, confidential/legal and irreversible tasks (e.g. *delete container*) halt in `AWAITING_HITL_APPROVAL` until a supervisor resolves them via `POST /escalations/{id}/resolve` |
-| **2. Hermes verdicts** | [`SOUL.md` §4](ops/hermes/home/SOUL.md), decision **D-003** | Any proposal to publish to a live container or theme, disable consent checks, remove dedup, hard-code secrets, or ship without a rollback → `REJECTED` / `BLOCKED` |
-| **3. Gateway policy** | [`policy_guard.py`](ops/hermes/gateway/policy_guard.py), [`tool-policy.yaml`](ops/hermes/gateway/tool-policy.yaml) | Shell, skill creation and memory writes are unreachable from the public URL; per-tool rate/time/token limits; private-IP browsing blocked |
-
-Every verdict that proposes a change must carry an applicable `diff` **and** a `rollback`
-([Verdict Envelope](ops/hermes/home/SOUL.md#7-output-contract--the-verdict-envelope)).
-
----
-
-## Verify in 60 seconds
-
-Requires Python 3.11+.
+**Test suite.** `574 passed, 3 skipped` on Windows with Python 3.12. The 3 skips are POSIX file-permission tests.
 
 ```bash
-pip install -r requirements.txt
-pytest -q                                   # 68 passed
-
-# Deterministic linter on a container with planted defects
-python ops/hermes/home/skills/gtm-container-linter/scripts/lint_container.py \
-  ops/hermes/home/skills/gtm-container-linter/tests/fixtures/sample_container.json --format md --fail-on never
-
-# Offline proof: exact counts, clean container = 100/100, live mutation = exactly 2 new findings
-python ops/hermes/demo/competition_demo.py --only 3
+python -m pytest -q          # about 80 seconds
 ```
 
-Expected linter result on the broken fixture: **health 0/100 · critical 1 · high 8 · medium 8 · low 4**,
-including a leaked Meta access token in client-side HTML, a Meta Purchase without `eventID` (CAPI dedup
-impossible), a GA4 purchase without `transaction_id`, and exact-duplicate tags. A recorded run is in
-[`docs/evidence/`](docs/evidence/).
+**Sunday Signal Hygiene digest.** A weekly email per merchant, sent on Sunday from 10:00 in the tenant's timezone
+(Arabic by default, English available) by the scheduler. Every number comes from a named SQL query over the tenant's
+own rows (`q_week_orders`, `q_cohort_delivery`, `q_refused_cod`, `q_signal_health`, `q_creatives`,
+[`digest.py`](src/ameen_workforce/digest.py)). There is no LLM in the path and no default or canned figure; missing
+data is printed as "no data yet". It reports placed, confirmed and delivered orders, delivery rate on matured cohorts,
+refused COD value, signal health and the best and worst ads by delivery rate. The job is skipped when SMTP is not
+configured. Tests: [`tests/test_digest.py`](tests/test_digest.py).
 
-The live proofs (Hermes over MCP: SOUL fingerprint, memory canary **D-002**, refusal of a live publish, SSRF
-and tool-catalogue checks) need the secret URL and are described in [`ops/hermes/demo/DEMO.md`](ops/hermes/demo/DEMO.md).
+**Pilot simulation.** One command replays four invented Shopify orders through the real pipeline, with no network
+access: an in-memory database, a tenant in `shadow` mode, a sender that only records payloads and a throwaway
+encryption key.
 
----
+```bash
+python scripts/run_pilot_simulation.py
+```
+
+It prints a timeline for each order and ends with this summary (exit code 0):
+
+```
+SUMMARY (all events are shadow or held: nothing reached Meta)
+  Order     Scenario                                                      ConfirmedOrder    DeliveredPurchase             Value sent
+  SIM-1001  COD confirmed by tag, then delivered                          shadow            shadow                        1250.00
+  SIM-1002  COD shipped, then refused (cancelled after shipping)          shadow            none (cancelled)              -
+  SIM-1003  Prepaid order, paid (no checkout user agent captured)         shadow            shadow                        1250.00
+  SIM-1004  COD delivered after the placed+6.5d cutoff (late_delivery)    shadow            late_delivery (never sent)    1250.00
+
+Meta calls made: 0 (recording sender invoked 0 times; tenant mode is shadow).
+```
+
+A refused order never reaches `DeliveredPurchase`, and a parcel delivered after the cutoff is held back instead of
+being rejected by Meta. The live pilot-account validation plan is in
+[`docs/pilot/S2-7_validation_plan.md`](docs/pilot/S2-7_validation_plan.md).
+
+## Quickstart: local simulation in 30 seconds
+
+```bash
+git clone https://github.com/Mo-ha33/Motahai.git
+cd Motahai
+python -m venv .venv
+# Windows: .venv\Scripts\activate      macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+
+python scripts/run_pilot_simulation.py     # the four-order ladder simulation above
+python -m pytest -q                        # full suite
+```
+
+No `.env` is needed for either command. Running the real service needs per-tenant configuration; see
+[`deployment/isolation/`](deployment/isolation/README.md) for the environment templates and
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) for operations.
 
 ## Repository map
 
 ```
 .
-├── src/ameen_workforce/         Workforce engine (FastAPI): workflows, HITL escalation, Hermes bridge, beacon sniffer
-├── run_workforce_cli.py         Interactive CLI to run a workflow and watch a HITL escalation halt it
-├── tests/                       Engine tests (HITL, workflows, API, PII detection)
-├── ops/hermes/                  Everything deployed to the VPS
-│   ├── home/SOUL.md             Hermes identity, engineering standards, refusal rules, Verdict Envelope
-│   ├── home/MEMORY.md           Always-loaded memory index + standing decisions D-001…D-004
-│   ├── home/memories/           Client ledger template, battle-tested GTM patterns, incident log
-│   ├── home/skills/             gtm-container-linter (built + tested) and specs for 4 more skills
-│   ├── gateway/                 policy_guard.py, tool-policy.yaml, nginx-mcp.conf, systemd limits
-│   ├── llm-router/              Multi-provider router with failover, circuit breakers, budgets
-│   ├── integration/             SOUL + MEMORY injection into every LLM call, with provenance hash
-│   ├── deploy/                  Blueprint deploy script with backup, self-test and rollback
-│   ├── demo/                    competition_demo.py: proofs → timestamped evidence JSON
-│   └── sop/WESAM_AGENT_SOP.md   Request/verdict contracts + JSON-RPC recipes for the Wesam agents
-├── cloudflare-browser-mcp/      Cloudflare Worker exposing Playwright as an MCP server
-├── deployment/                  Contabo deploy script, Nginx, DNS and systemd units
-└── docs/                        Architecture, agent specifications, runbook, screenshots, evidence
+├── src/ameen_workforce/        Engine: CAPI sender, order pipeline, webhooks, capture, scheduler, digest, HITL tokens, vault
+├── scripts/                    onboard_store.py (operator CLI), run_pilot_simulation.py
+├── storefront/                 Capture snippets for Shopify and Salla
+├── tests/                      Engine tests (pipeline, couriers, digest, HITL tokens, capture, onboarding)
+├── deployment/                 isolation/ (Core vs agent runtime), systemd/, nginx/, contabo/, dns/
+├── ops/hermes/                 Optional MCP agent runtime: gateway policy, linter skill, LLM router
+│   └── consultation.py         MCP tool module; verifies the D-003 approval token before a live GTM publish
+├── tools/
+│   ├── board/                  manage_board.py: project-board helper
+│   └── video/                  Video production scripts
+├── cloudflare-browser-mcp/     Cloudflare Worker exposing Playwright as an MCP server
+├── docs/                       Playbook, runbook, pilot handbook, commercial docs, research notes
+├── LICENSE                     BUSL-1.1 (converts to Apache-2.0 on 2030-10-10)
+└── SECURITY.md                 Vulnerability reporting
 ```
 
-## Screenshots
-
-| Lead Orchestrator: scheduled workflows | Lead Orchestrator: build view |
-|---|---|
-| ![workflows](docs/assets/wesam-orchestrator-workflows.png) | ![build](docs/assets/wesam-orchestrator-build.png) |
+Demo videos are attached to the [v1.0.0 release](https://github.com/Mo-ha33/Motahai/releases/tag/v1.0.0), not stored
+in the repository.
 
 ---
 
-## Known limitations (stated up front)
+## ملخص تنفيذي بالعربية
 
-- **One connector per workspace.** Wesam shares the MCP connection across all agents, so today the 8 agents
-  reach Hermes as one principal. `tool-policy.yaml` already defines per-agent principals, ready for when
-  per-agent connectors are available.
-- **Role names.** `SOUL.md` and `tool-policy.yaml` use the v1 role names from the original design (e.g.
-  *Container Sanitation Auditor*, *Drift Sentinel*); the Wesam roster above is the current one.
-- **Free-tier LLMs.** The router degrades gracefully (failover, then a labelled stale cache, then an honest
-  `BLOCKED`), but it cannot guarantee availability.
-- **Technical, not legal, compliance.** Hermes reports technical conformance with Consent Mode v2 / PDPL
-  151/2020; legal questions are escalated to a human.
-- **Host hardening** is tracked as a checklist in [`ops/hermes/README.md`](ops/hermes/README.md#d0-threat-model).
-  Host-specific values (IPs, ports, secrets) are kept out of this repository by design.
-
----
-
-## Commercial Packaging & Pricing
-
-Motahai operates on a 3-tier commercial model with an 80%+ gross margin target:
-
-| Tier | Package | Monthly Price | Scope |
-|---|---|---|---|
-| **Tier 1** | **The Solo Fixer** (باقة الموظف المنقذ) | **$99 / mo** (399 SAR / 4,950 EGP) | 1 AI Employee (Auto-Fix Engineer) for single domains & dropshippers |
-| **Tier 2** | **The Core Growth Trio** (باقة فريق التتبع والأداء) | **$449 / mo** (1,699 SAR / 22,500 EGP) | 3 AI Employees (Lead Orchestrator + Auto-Fix + CAPI Specialist) |
-| **Tier 3** | **Autonomous Department** (باقة القسم المؤتمت بالكامل) | **$1,499 / mo** (5,699 SAR / 74,900 EGP) | Full 8-Agent Swarm with real-time beacon sniffer & BI |
-
-📖 **Explore Commercial Docs:**
-- [Full Pricing & Packaging Playbook](docs/commercial/MOTAHAI_PRICING_PLAYBOOK.md)
-- [Unit Economics & Financial Model](docs/commercial/01_unit_economics_model.md)
-- [Packaging & Expansion Loops](docs/commercial/05_packaging_and_expansion_loops.md)
-- [Sales Battlecards & Discovery Scripts](docs/commercial/06_sales_battlecards_and_scripts.md)
+**Motahai (مُتاح)** محرك خادمي لمطابقة التحويلات والتسليم في التجارة الإلكترونية التي تعتمد على الدفع عند الاستلام (COD)
+في منطقة الشرق الأوسط وشمال أفريقيا ودول الخليج. تشير تقديرات القطاع إلى أن نسبة كبيرة من هذه الطلبات، تتراوح غالباً
+بين 20% و45%، تُرفض عند الباب، فتتعلم خوارزمية Meta من عمليات `Purchase` لم يُدفع ثمنها فعلياً. يعتمد النظام «سلّم
+الإشارات» ذا الخطوات الثلاث (القاعدة D-005): يبقى `Purchase` الأصلي من المتجر كما هو، ثم يُرسَل `ConfirmedOrder`
+عند تأكيد الطلب، ثم `DeliveredPurchase` عند التسليم وتحصيل المبلغ، عبر Conversions API من الخادم مع تجزئة معرّفات
+العميل بخوارزمية SHA-256. يدعم النظام منصتَي Shopify وSalla، وشركتَي الشحن Bosta (مصر) وOTO (السعودية ودول الخليج)،
+مع عزل كامل لبيانات كل متجر. على صعيد الأمان، لا يُنشر أي تعديل مباشر على Google Tag Manager دون رمز موافقة بشري
+موقّع بخوارزمية Ed25519، وتُخزَّن بيانات الاتصال بالعميل مشفّرة بـ Fernet وتُحذف بعد الإرسال أو بعد 14 يوماً،
+ويُفصل مسار المال عن بيئة الذكاء الاصطناعي. أما الأدلة، فقد اجتاز النظام 574 اختباراً آلياً مع تخطي 3 اختبارات،
+ويُرسل رسالة «ملخص نظافة الإشارة» كل أحد بالبريد الإلكتروني اعتماداً على استعلامات SQL فقط، ويمكن تشغيل محاكاة
+كاملة بأمر واحد دون أي اتصال بالإنترنت.
 
 ---
 
-## Autonomous Video Production Pipeline
+## License
 
-In addition to GTM tracking, the workforce integrates an enterprise video generation extension:
-- **10-Second Modular Blocks:** Calibrated to 18–20 words per block with a 2-second audio buffer.
-- **Brand Governance:** Strict HEX palette enforcement and 3D character consistency.
-- **Production Artifacts:** Automated generation of Omni visual prompts, BPM-curved audio prompts, per-block JSON manifests, and synchronized `.srt` subtitles.
+Motahai is licensed under the Business Source License 1.1 ([`LICENSE`](LICENSE)). On 2030-10-10 the license converts
+to Apache-2.0. Read `LICENSE` for the exact terms of permitted use before that date.
 
-📖 Read the full [Video Production Pipeline Specification](docs/VIDEO_PRODUCTION_PIPELINE.md).
+## Security
 
----
-
-## Further reading
-
-- [Architecture & HITL state machine](docs/ARCHITECTURE.md) · [Agent specifications](docs/AGENTS_SPECIFICATION.md) · [Runbook](docs/RUNBOOK.md)
-- [Hermes supervisor blueprint & security policy](ops/hermes/README.md) · [LLM router decision record](ops/hermes/llm-router/README.md)
-- [Commercial Playbook](docs/commercial/MOTAHAI_PRICING_PLAYBOOK.md) · [Video Production Pipeline](docs/VIDEO_PRODUCTION_PIPELINE.md)
-
+Please report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md). Do not open public issues for
+security reports.

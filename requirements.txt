@@ -10,3 +10,4 @@ sqlalchemy>=2.0.25,<2.1
 cryptography>=42,<49
 pytest>=8
 pytest-asyncio>=0.23
+tzdata
