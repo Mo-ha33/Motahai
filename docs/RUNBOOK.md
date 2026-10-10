@@ -76,17 +76,3 @@ Verify communication with Hermes Agent on Contabo VPS (`<VPS_IP>`):
 curl.exe -I -k https://hermes.motahai.com/health
 ```
 
----
-
-## 6. Autonomous Video Production Workflow (Ziad)
-
-Triggering pre-production bible generation via Wesam AI employee (`Ziad | AI Creative Video Director`):
-1. **Commission Commission Request:**
-   Navigate to Ziad's direct channel (`/dm/ziad-ai-creative-vid-ca4e`) on Wesam.
-2. **Issue Video Brief Prompt:**
-   Provide the brand colors, master length (e.g. 60 seconds / 6 blocks), and tempo constraint (120 BPM).
-3. **Automated Verification:**
-   - 10-Second Atomic Blocks (5 bars per block at 120 BPM).
-   - 8-Second Speech Window (~18-20 words / 150 WPM) + 2-Second Buffer Window.
-   - Master Music Prompt ducking targets and 3D Omni prompts.
-   - Output Deliverable: `VID-XX` Pre-Production Bible with Block JSONs and `.srt`.
