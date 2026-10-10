@@ -1,5 +1,6 @@
 """
-hermes-llm-router — loopback OpenAI-compatible router: NVIDIA NIM → OpenRouter → Gemini.
+hermes-llm-router — loopback OpenAI-compatible failover router over configurable tiers
+(default order: NVIDIA NIM → OpenRouter → Gemini).
 
 Hermes points at this as its single primary provider. Per request the router:
   1. estimates prompt size and skips providers whose context window is too small
@@ -13,7 +14,9 @@ Hermes points at this as its single primary provider. Per request the router:
 Cross-provider hygiene: strips reasoning fields before forwarding history, caches
 Gemini thought signatures by tool-call id and re-attaches them (a dummy for calls
 another model made), and keeps a session on its fallback provider for a while so a
-tool loop doesn't flip between models.
+tool loop doesn't flip between models (only onto providers marked `sticky`, never the
+scarcest daily quotas). Gemini daily-quota 429s bench a provider until Pacific midnight,
+and a per-provider daily request budget stops the router before Google's 429 does.
 
 Health (cooldowns, failure counts, daily tokens) is persisted to a JSON file, so a
 restart does not hammer a provider that is still rate-limited.
@@ -23,6 +26,7 @@ Run:  ROUTER_API_KEY=... uvicorn router:app --host 127.0.0.1 --port 47311
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import email.utils
@@ -30,6 +34,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -37,10 +42,11 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, field, fields
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import yaml
@@ -61,6 +67,35 @@ CONTEXT_ERROR = re.compile(
 LEAKED_TOOL_CALL = re.compile(r"^\s*(?:<tool_call>|<\|python_tag\|>|\{\s*\"(?:name|function)\"\s*:)")
 REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_details", "thinking")
 GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
+PER_DAY = re.compile(r"per.?day", re.I)
+# Outcomes that mean "this provider is just rate-limited", for the exhausted-kind header.
+RATE_LIMITED_OUTCOMES = {"rate_limited", "rate_limited:daily", "skipped:cooldown", "skipped:daily_requests",
+                         "skipped:local_rpm"}
+
+
+def _load_pacific() -> tzinfo:
+    try:
+        return ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:          # Windows without tzdata: fixed UTC-8 (off by 1 h in DST, harmless)
+        return timezone(timedelta(hours=-8))
+
+
+PACIFIC = _load_pacific()
+
+
+def _pacific_day() -> str:
+    """Gemini free-tier quotas reset at midnight America/Los_Angeles."""
+    return datetime.now(PACIFIC).strftime("%Y-%m-%d")
+
+
+def _seconds_to_pacific_reset() -> float:
+    now = datetime.now(PACIFIC)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return nxt.timestamp() - now.timestamp() + 60.0
+
+
+async def _sleep(seconds: float) -> None:      # indirection so tests can skip real waiting
+    await asyncio.sleep(seconds)
 
 
 # ─────────────────────────────── config ─────────────────────────────────
@@ -83,6 +118,8 @@ class Provider:
     extra_headers: dict[str, str] = field(default_factory=dict)
     strip_schema_keys: list[str] = field(default_factory=list)
     gemini_thought_signatures: bool = False
+    daily_request_budget: int = 0      # 0 = unlimited; set to the provider's RPD minus headroom
+    sticky: bool = True                # may a session stay pinned here after failover?
 
 
 @dataclass
@@ -92,6 +129,9 @@ class Health:
     last_error: str = ""
     tokens_day: str = ""
     tokens_used: int = 0
+    requests_day: str = ""             # America/Los_Angeles date (Gemini's quota reset)
+    requests_used: int = 0
+    last_kind: str = ""                # kind of the last failure ("" after a success)
 
 
 @dataclass
@@ -116,12 +156,20 @@ class _Bucket:
         self.tokens = float(rpm)
         self.updated = time.monotonic()
 
+    def peek(self) -> float:
+        """Current tokens, refill-computed without consuming."""
+        return min(self.rpm, self.tokens + (time.monotonic() - self.updated) * self.rpm / 60.0)
+
+    def seconds_until_token(self) -> float:
+        if self.rpm <= 0 or (have := self.peek()) >= 1:
+            return 0.0
+        return (1 - have) * 60.0 / self.rpm
+
     def try_take(self) -> bool:
         if self.rpm <= 0:
             return True
-        now = time.monotonic()
-        self.tokens = min(self.rpm, self.tokens + (now - self.updated) * self.rpm / 60.0)
-        self.updated = now
+        self.tokens = self.peek()
+        self.updated = time.monotonic()
         if self.tokens >= 1:
             self.tokens -= 1
             return True
@@ -138,9 +186,12 @@ class Router:
         self.advertised_context = int(cfg.get("advertised_context", max(p.context_window for p in self.providers)))
         self.deadline_s = float(cfg.get("overall_deadline_s", 270))
         self.sticky_s = float(cfg.get("sticky_seconds", 600))
+        self.local_wait_max_s = float(cfg.get("local_wait_max_s", 8.0))
+        self.local_retry_rounds = int(cfg.get("local_retry_rounds", 2))
         self.breaker_threshold = int(cfg.get("breaker_threshold", 3))
         self.bytes_per_token = float(cfg.get("bytes_per_token", 3.2))
         self.state_path = Path(cfg["state_file"]) if cfg.get("state_file") else None
+        self.by_name = {p.name: p for p in self.providers}
         self.health: dict[str, Health] = {p.name: Health() for p in self.providers}
         self.buckets = {p.name: _Bucket(p.rpm) for p in self.providers}
         self.inflight: dict[str, int] = {p.name: 0 for p in self.providers}
@@ -163,10 +214,11 @@ class Router:
             return
         try:
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            known = {f.name for f in fields(Health)}   # old state lacks new keys; newer state may have extras
             for name, h in raw.get("health", {}).items():
                 if name in self.health:
-                    self.health[name] = Health(**h)
-        except (OSError, ValueError, TypeError):
+                    self.health[name] = Health(**{k: v for k, v in h.items() if k in known})
+        except (OSError, ValueError, TypeError, AttributeError):
             log.warning("router state unreadable, starting clean")
 
     def _save_state(self, force: bool = False) -> None:
@@ -206,7 +258,7 @@ class Router:
         now = time.time()
         order = list(self.providers)
         stick = self.sticky.get(session)
-        if stick and stick[1] > now:
+        if stick and stick[1] > now and (sp := self.by_name.get(stick[0])) and sp.sticky:
             order.sort(key=lambda p: p.name != stick[0])
         eligible, skipped = [], []
         for p in order:
@@ -222,6 +274,8 @@ class Router:
                 skipped.append(Attempt(p.name, "skipped:cooldown", detail=f"{int(h.cooldown_until - now)}s left"))
             elif p.daily_token_budget and h.tokens_used >= p.daily_token_budget:
                 skipped.append(Attempt(p.name, "skipped:daily_budget"))
+            elif p.daily_request_budget and h.requests_used >= p.daily_request_budget:
+                skipped.append(Attempt(p.name, "skipped:daily_requests", detail=f"{h.requests_used} used today"))
             else:
                 eligible.append(p)
         return eligible, skipped
@@ -231,6 +285,8 @@ class Router:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         if h.tokens_day != today:
             h.tokens_day, h.tokens_used = today, 0
+        if h.requests_day != (pday := _pacific_day()):
+            h.requests_day, h.requests_used = pday, 0
 
     # ── stale-if-error cache ──
     @staticmethod
@@ -292,17 +348,19 @@ class Router:
                 continue
             for f in REASONING_FIELDS:  # other providers reject or mis-handle foreign reasoning
                 m.pop(f, None)
+            self._capture_signatures(m)         # signatures Hermes echoed back; read before popping
             for tc in m.get("tool_calls") or []:
+                incoming = ((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")
                 tc.pop("extra_content", None)
-                if p.gemini_thought_signatures:
-                    sig = self.signatures.get(tc.get("id", ""), GEMINI_SKIP_SIGNATURE)
+                if p.gemini_thought_signatures:    # incoming (Gemini's own) > cache > documented dummy
+                    sig = incoming or self.signatures.get(tc.get("id", "")) or GEMINI_SKIP_SIGNATURE
                     tc["extra_content"] = {"google": {"thought_signature": sig}}
         return out
 
     def _capture_signatures(self, msg: dict[str, Any]) -> None:
         for tc in msg.get("tool_calls") or []:
             sig = ((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature")
-            if sig and tc.get("id"):
+            if sig and sig != GEMINI_SKIP_SIGNATURE and tc.get("id"):
                 self.signatures[tc["id"]] = sig
                 self.signatures.move_to_end(tc["id"])
                 while len(self.signatures) > 5000:
@@ -346,8 +404,11 @@ class Router:
         h = self.health[p.name]
         h.consecutive_failures += 1
         h.last_error = f"{kind}: {detail}"[:300]
+        h.last_kind = kind
         n = h.consecutive_failures
-        if kind == "rate_limited":
+        if kind == "daily_quota":                  # exhausted daily quota: bench until the Pacific reset
+            cd = _seconds_to_pacific_reset()
+        elif kind == "rate_limited":
             cd = retry_after if retry_after is not None else min(30 * 2 ** (n - 1), 900)
         elif kind == "payment":
             cd = 3600
@@ -361,15 +422,16 @@ class Router:
         if cd:
             # A provider-declared window (e.g. Gemini free tier: "retry in 8h") is honoured up to
             # 24 h, so an exhausted daily quota isn't re-probed every few minutes.
-            cap = 86400.0 if kind == "rate_limited" and retry_after is not None else 3600.0
-            cd = max(5.0, min(cd, cap)) * random.uniform(1.0, 1.15)  # noqa: S311 — jitter only
+            declared = kind == "daily_quota" or (kind == "rate_limited" and retry_after is not None)
+            jitter = (1.0, 1.02) if kind == "daily_quota" else (1.0, 1.15)   # don't overshoot the reset
+            cd = max(5.0, min(cd, 86400.0 if declared else 3600.0)) * random.uniform(*jitter)  # noqa: S311
             h.cooldown_until = time.time() + cd
         self._save_state(force=True)
 
     def _ok(self, p: Provider, usage: dict[str, Any] | None) -> None:
         h = self.health[p.name]
         changed = h.consecutive_failures or h.cooldown_until
-        h.consecutive_failures, h.cooldown_until, h.last_error = 0, 0.0, ""
+        h.consecutive_failures, h.cooldown_until, h.last_error, h.last_kind = 0, 0.0, "", ""
         self._roll_day(h)
         h.tokens_used += int((usage or {}).get("total_tokens") or 0)
         self._save_state(force=bool(changed))
@@ -386,87 +448,149 @@ class Router:
             timeout=httpx.Timeout(budget_s, connect=p.connect_timeout_s),
         )
 
+    @staticmethod
+    def _note(attempts: list[Attempt], att: Attempt) -> None:
+        """Append, but record each skip once even across several passes."""
+        if att.outcome.startswith("skipped:") and any(
+                a.provider == att.provider and a.outcome == att.outcome for a in attempts):
+            return
+        attempts.append(att)
+
+    def exhausted_kind(self, attempts: list[Attempt]) -> str:
+        """'rate_limited' if every provider we tried or skipped was merely rate-limited, else 'mixed'."""
+        seen = False
+        for a in attempts:
+            if a.provider == "router":
+                continue
+            seen = True
+            if a.outcome == "skipped:cooldown":     # a cooldown only counts if a 429 caused it
+                ok = self.health[a.provider].last_kind in ("rate_limited", "daily_quota")
+            else:
+                ok = a.outcome in RATE_LIMITED_OUTCOMES
+            if not ok:
+                return "mixed"
+        return "rate_limited" if seen else "mixed"
+
     async def complete(self, body: dict[str, Any]) -> tuple[dict[str, Any], Provider, list[Attempt]]:
         session = self.session_key(body.get("messages", []))
         eligible, attempts = self.plan(body, session)
         tool_names = {t.get("function", {}).get("name") for t in body.get("tools") or []} - {None}
         start = time.monotonic()
         primary = self.providers[0].name
+        tried: set[str] = set()                    # providers already sent a request: never retried
+        waits: list[float] = []                    # local_rpm waits seen in the latest pass
 
-        for p in eligible:
-            remaining = self.deadline_s - (time.monotonic() - start)
-            if remaining < 5:
-                attempts.append(Attempt(p.name, "skipped:deadline"))
-                continue
-            if self.inflight[p.name] >= p.max_concurrency:
-                attempts.append(Attempt(p.name, "skipped:busy"))
-                continue
-            if not self.buckets[p.name].try_take():
-                attempts.append(Attempt(p.name, "skipped:local_rpm"))
-                continue
-
-            t0 = time.monotonic()
-            self.inflight[p.name] += 1
-            try:
-                resp = await self._post(p, self.build_payload(p, body), min(p.timeout_s, remaining))
-            except httpx.TimeoutException as exc:
-                self._fail(p, "timeout", None, type(exc).__name__)
-                attempts.append(Attempt(p.name, "timeout", latency_ms=_ms(t0)))
-                continue
-            except httpx.TransportError as exc:
-                self._fail(p, "network", None, type(exc).__name__)
-                attempts.append(Attempt(p.name, "network", latency_ms=_ms(t0), detail=type(exc).__name__))
-                continue
-            finally:
-                self.inflight[p.name] -= 1
-
-            att = Attempt(p.name, "", resp.status_code, _ms(t0))
-            attempts.append(att)
-            text = resp.text[:500]
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except ValueError:
-                    data = {}
-                problem = self.validate(data, tool_names)
-                if problem:
-                    att.outcome, att.detail = "invalid_output", problem
-                    self._fail(p, "invalid_output", None, problem)
+        for rnd in range(max(1, self.local_retry_rounds)):
+            waits, busy = [], False
+            for p in eligible:
+                remaining = self.deadline_s - (time.monotonic() - start)
+                if remaining < 5:
+                    self._note(attempts, Attempt(p.name, "skipped:deadline"))
                     continue
-                att.outcome = "ok"
-                self._ok(p, data.get("usage"))
-                if p.gemini_thought_signatures:
-                    self._capture_signatures(data["choices"][0]["message"])
-                if p.name != primary and self.sticky_s > 0:
-                    self.sticky[session] = (p.name, time.time() + self.sticky_s)
-                    self.sticky.move_to_end(session)
-                    while len(self.sticky) > 2000:
-                        self.sticky.popitem(last=False)
-                elif p.name == primary:
-                    self.sticky.pop(session, None)
-                self.cache_put(body, data, p.name)
-                return data, p, attempts
+                if self.inflight[p.name] >= p.max_concurrency:
+                    busy = True
+                    self._note(attempts, Attempt(p.name, "skipped:busy"))
+                    continue
+                if not self.buckets[p.name].try_take():
+                    waits.append(self.buckets[p.name].seconds_until_token())
+                    self._note(attempts, Attempt(p.name, "skipped:local_rpm"))
+                    continue
+                tried.add(p.name)
+                data = await self._try(p, body, tool_names, session, primary, attempts, remaining)
+                if data is not None:
+                    return data, p, attempts
 
-            status = resp.status_code
-            if status == 429:
-                att.outcome = "rate_limited"
-                self._fail(p, "rate_limited", _retry_after(resp), text)
-            elif status == 402:
-                att.outcome = "payment"
-                self._fail(p, "payment", None, text)
-            elif status in (401, 403):
-                att.outcome = "auth"
-                self._fail(p, "auth", None, text)
-            elif status in (400, 413, 422) and CONTEXT_ERROR.search(text):
-                att.outcome = "context_too_long"            # request-level: no penalty
-            elif status >= 500 or status == 408:
-                att.outcome = "server_error"
-                self._fail(p, "server_error", _retry_after(resp), text)
-            else:
-                att.outcome, att.detail = "rejected", text[:200]   # e.g. schema the provider dislikes
+            # Everything left was only locally throttled: a short wait beats a 503 (and the
+            # caller's break-glass fallback surfacing a raw upstream 429).
+            cands = waits + ([1.0] if busy else [])
+            if rnd + 1 >= self.local_retry_rounds or not cands:
+                break
+            wait = min(cands)
+            if wait > self.local_wait_max_s or self.deadline_s - (time.monotonic() - start) <= wait + 5:
+                break
+            attempts.append(Attempt("router", f"waited:{wait:.1f}s"))
+            await _sleep(wait)
+            waits = []
+            eligible = [q for q in self.plan(body, session)[0] if q.name not in tried]   # honours new cooldowns
+            if not eligible:
+                break
 
-        cds = [h.cooldown_until - time.time() for h in self.health.values() if h.cooldown_until > time.time()]
-        raise ExhaustedError(attempts, int(min(cds)) + 1 if cds else 30)
+        now = time.time()
+        left = [self.health[p.name].cooldown_until - now for p in self.providers
+                if os.environ.get(p.key_env, "").strip() and self.health[p.name].cooldown_until > now]
+        left += waits
+        raise ExhaustedError(attempts, max(1, math.ceil(min(left))) if left else 30)
+
+    async def _try(self, p: Provider, body: dict[str, Any], tool_names: set[Any], session: str, primary: str,
+                   attempts: list[Attempt], remaining: float) -> dict[str, Any] | None:
+        """One upstream request; the answer on success, else None with the attempt recorded."""
+        h = self.health[p.name]
+        self._roll_day(h)
+        h.requests_used += 1
+        self._save_state()
+        t0 = time.monotonic()
+        self.inflight[p.name] += 1
+        try:
+            resp = await self._post(p, self.build_payload(p, body), min(p.timeout_s, remaining))
+        except httpx.TimeoutException as exc:
+            self._fail(p, "timeout", None, type(exc).__name__)
+            attempts.append(Attempt(p.name, "timeout", latency_ms=_ms(t0)))
+            return None
+        except httpx.TransportError as exc:
+            self._fail(p, "network", None, type(exc).__name__)
+            attempts.append(Attempt(p.name, "network", latency_ms=_ms(t0), detail=type(exc).__name__))
+            return None
+        finally:
+            self.inflight[p.name] -= 1
+
+        att = Attempt(p.name, "", resp.status_code, _ms(t0))
+        attempts.append(att)
+        text = resp.text[:500]
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            problem = self.validate(data, tool_names)
+            if problem:
+                att.outcome, att.detail = "invalid_output", problem
+                self._fail(p, "invalid_output", None, problem)
+                return None
+            att.outcome = "ok"
+            self._ok(p, data.get("usage"))
+            if p.gemini_thought_signatures:
+                self._capture_signatures(data["choices"][0]["message"])
+            if p.name == primary:
+                self.sticky.pop(session, None)
+            elif p.sticky and self.sticky_s > 0:       # never pin onto scarce-quota providers
+                self.sticky[session] = (p.name, time.time() + self.sticky_s)
+                self.sticky.move_to_end(session)
+                while len(self.sticky) > 2000:
+                    self.sticky.popitem(last=False)
+            self.cache_put(body, data, p.name)
+            return data
+
+        status = resp.status_code
+        if status == 429 and _is_daily_quota(resp):
+            att.outcome = "rate_limited:daily"
+            self._fail(p, "daily_quota", None, text)
+        elif status == 429:
+            att.outcome = "rate_limited"
+            self._fail(p, "rate_limited", _retry_after(resp), text)
+        elif status == 402:
+            att.outcome = "payment"
+            self._fail(p, "payment", None, text)
+        elif status in (401, 403):
+            att.outcome = "auth"
+            self._fail(p, "auth", None, text)
+        elif status in (400, 413, 422) and CONTEXT_ERROR.search(text):
+            att.outcome = "context_too_long"            # request-level: no penalty
+        elif status >= 500 or status == 408:
+            att.outcome = "server_error"
+            self._fail(p, "server_error", _retry_after(resp), text)
+        else:
+            att.outcome, att.detail = "rejected", text[:200]   # e.g. schema the provider dislikes
+        return None
 
 
 # ─────────────────────────────── helpers ────────────────────────────────
@@ -535,6 +659,26 @@ def _retry_after_from_body(resp: httpx.Response) -> float | None:
     return None
 
 
+def _is_daily_quota(resp: httpx.Response) -> bool:
+    """Gemini 429 for an exhausted DAILY quota (its retryDelay is short and misleading)."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    for item in body if isinstance(body, list) else [body]:
+        err = (item or {}).get("error") if isinstance(item, dict) else None
+        if not isinstance(err, dict):
+            continue
+        for d in err.get("details") or []:
+            if isinstance(d, dict) and str(d.get("@type", "")).endswith("QuotaFailure"):
+                for v in d.get("violations") or []:
+                    if isinstance(v, dict) and "perday" in str(v.get("quotaId", "")).lower():
+                        return True
+        if PER_DAY.search(str(err.get("message", ""))):
+            return True
+    return False
+
+
 def _chaos_for(provider: str) -> Any:
     """Fault injection for failover drills. Off unless ROUTER_ENABLE_CHAOS=1."""
     if os.environ.get("ROUTER_ENABLE_CHAOS") != "1":
@@ -558,6 +702,14 @@ def _chaos_response(fault: Any, payload: dict[str, Any]) -> httpx.Response:
             {"id": "call_chaos", "type": "function", "function": {"name": name, "arguments": "{bad json"}}]}
         return httpx.Response(200, json={"choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls"}]},
                               request=req)
+    if fault == "429daily":                       # Gemini-shaped: exhausted daily quota, short retryDelay
+        err = {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": (
+            "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+            "limit: 20. Please retry in 51.2s."), "details": [
+            {"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+             "violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "51s"}]}
+        return httpx.Response(429, json=[{"error": err}], request=req)
     return httpx.Response(int(fault), json={"error": {"message": f"chaos {fault}"}},
                           headers={"retry-after": "60"} if int(fault) == 429 else {}, request=req)
 
@@ -596,6 +748,7 @@ def create_app(cfg: dict[str, Any] | None = None, transport: httpx.AsyncBaseTran
     if cfg is None:
         with Path(os.environ.get("ROUTER_CONFIG", "providers.yaml")).open(encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
+    config_name = Path(os.environ["ROUTER_CONFIG"]).name if os.environ.get("ROUTER_CONFIG") else "inline"
     api_key = os.environ.get("ROUTER_API_KEY", "")
     if len(api_key) < 24:
         raise RuntimeError("ROUTER_API_KEY must be set (>= 24 chars)")
@@ -629,7 +782,8 @@ def create_app(cfg: dict[str, Any] | None = None, transport: httpx.AsyncBaseTran
             return JSONResponse(
                 {"error": {"message": "all upstream providers unavailable", "type": "router_exhausted",
                            "attempts": [asdict(a) for a in exc.attempts]}},
-                status_code=503, headers={"retry-after": str(exc.retry_after)})
+                status_code=503, headers={"retry-after": str(exc.retry_after),   # never relay an upstream 429
+                                          "x-router-exhausted-kind": router.exhausted_kind(exc.attempts)})
         _log_request(body, p, attempts, t0)
         data["model"] = f"{p.name}/{p.model}"
         headers = {"x-router-provider": p.name, "x-router-attempts": str(len(attempts))}
@@ -652,12 +806,20 @@ def create_app(cfg: dict[str, Any] | None = None, transport: httpx.AsyncBaseTran
         if not authorized(request):
             return JSONResponse({"error": {"message": "unauthorized"}}, status_code=401)
         now = time.time()
-        return JSONResponse({"providers": [
-            {"name": p.name, "model": p.model, "cooling_down_s": max(0, int(router.health[p.name].cooldown_until - now)),
-             "consecutive_failures": router.health[p.name].consecutive_failures,
-             "last_error": router.health[p.name].last_error, "tokens_today": router.health[p.name].tokens_used,
-             "key_present": bool(os.environ.get(p.key_env))}
-            for p in router.providers]})
+        rows = []
+        for p in router.providers:
+            h, bucket = router.health[p.name], router.buckets[p.name]
+            router._roll_day(h)
+            rows.append({
+                "name": p.name, "model": p.model, "cooling_down_s": max(0, int(h.cooldown_until - now)),
+                "cooldown_kind": h.last_kind if h.cooldown_until > now else "",
+                "consecutive_failures": h.consecutive_failures, "last_error": h.last_error,
+                "tokens_today": h.tokens_used, "requests_today": h.requests_used,
+                "daily_request_budget": p.daily_request_budget,
+                "rpm_tokens": round(bucket.peek(), 1) if p.rpm > 0 else None,
+                "inflight": router.inflight[p.name], "key_present": bool(os.environ.get(p.key_env))})
+        return JSONResponse({"providers": rows, "sticky_sessions": len(router.sticky),
+                             "stale_cache_entries": len(router._cache), "config": config_name})
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:

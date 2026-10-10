@@ -20,7 +20,10 @@
 public_model: hermes-auto
 advertised_context: 120000         # smallest window below (NVIDIA/OpenRouter 128k) minus margin
 overall_deadline_s: 120            # free endpoints are slow when busy; fail over, don't wait
-sticky_seconds: 600
+sticky_seconds: 600                # applies ONLY to providers with `sticky: true`. NVIDIA is the primary, so
+                                   # free-tier traffic always returns to NVIDIA first once it has recovered.
+local_wait_max_s: 8                # all providers merely locally throttled (rpm/busy)? wait up to this long
+local_retry_rounds: 2              # ...and retry (max passes per request) instead of 503ing to a raw 429 fallback
 breaker_threshold: 2               # free endpoints flap — bench sooner
 bytes_per_token: 3.2
 state_file: /var/lib/hermes-llm-router/state.json
@@ -39,8 +42,9 @@ providers:
     model: meta/llama-3.3-70b-instruct      # tool-calling capable on NIM; NOT deepseek-r1 (no tools, <think> noise)
     context_window: 131072
     max_output_tokens: 2048
-    rpm: 35                                  # stay under the ~40 RPM free limit; spill early
+    rpm: 30                                  # ~40 RPM free limit; 25% headroom, spill early
     max_concurrency: 2
+    sticky: true
     timeout_s: 60
 
   - name: gemini-flash
@@ -50,9 +54,12 @@ providers:
     context_window: 1048576
     max_output_tokens: 2048
     rpm: 8                                   # free-tier per-minute limits are low; check AI Studio
+    daily_request_budget: 18                 # = AI Studio RPD for this model minus ~10%: the reserve stops the router before Google 429s
+    sticky: false                            # never pin sessions onto the scarcest daily quota
     max_concurrency: 2
     timeout_s: 60
-    gemini_thought_signatures: false         # set true if the alias points at a Gemini 3.x model and tool loops 400
+    gemini_thought_signatures: true          # flash-latest resolves to Gemini 3.x, which REQUIRES signatures on function calls;
+                                             # the dummy validator token is accepted by 2.5 too, so true is safe for both
     strip_schema_keys: ["$schema"]
 
   - name: gemini-flash-lite                  # separate model = separate free daily quota
@@ -62,9 +69,11 @@ providers:
     context_window: 1048576
     max_output_tokens: 2048
     rpm: 12
+    daily_request_budget: 18                 # same reserve logic as gemini-flash (check this model's RPD)
+    sticky: false
     max_concurrency: 2
     timeout_s: 60
-    gemini_thought_signatures: false
+    gemini_thought_signatures: true
     strip_schema_keys: ["$schema"]
 
   - name: openrouter-free
@@ -74,6 +83,8 @@ providers:
     context_window: 131072
     max_output_tokens: 2048
     rpm: 15
+    daily_request_budget: 45                 # 50/day without purchased credits, 1000/day with >=10 credits: raise if credits bought
+    sticky: false
     max_concurrency: 2
     timeout_s: 60
     extra_body:
