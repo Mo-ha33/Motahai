@@ -92,7 +92,7 @@
 | M6-4 | Pre-dispatch WhatsApp confirmation to cut refusals — [#61](https://github.com/Mo-ha33/Motahai/issues/61) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M2-2. (updated 2026-10-10) |
 | M6-5 | Checkout refusal-risk score — [#62](https://github.com/Mo-ha33/Motahai/issues/62) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M1-7. (updated 2026-10-10) |
 | M6-6 | Billing and subscriptions — [#63](https://github.com/Mo-ha33/Motahai/issues/63) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
-| B-1 | Board automation: set Project #3 status from Actions — [#64](https://github.com/Mo-ha33/Motahai/issues/64) | Haiku 5.5 | P1 | IN_PROGRESS | phase-1, infra, board | Wave 1 dispatched 2026-10-10. (updated 2026-10-10) |
+| B-1 | Board automation: set Project #3 status from Actions — [#64](https://github.com/Mo-ha33/Motahai/issues/64) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | In PR #27 (6fb20c6); 18 unit tests, full suite 662 passed. Live run needs #27 on main. (updated 2026-10-10) |
 
 ---
 
