@@ -9,22 +9,17 @@ tenant_key_routes.py — operator endpoints to manage per-tenant API keys (M3-3)
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from .auth import require_operator
 from .db import Tenant, TenantApiKey
 from .tenant_auth import DEFAULT_SCOPES, create_tenant_key, revoke_tenant_key
 from .webhook_routes import get_session_factory_dep
 
 router = APIRouter(prefix="/v1/operator/tenants/{tenant_id}/api-keys", tags=["tenant-api-keys"])
-
-
-def _operator(authorization: Optional[str] = Header(None)) -> None:
-    # Late import: service.py includes this router, so it cannot be imported at module load.
-    from .service import require_operator
-    require_operator(authorization)
 
 
 class CreateKeyRequest(BaseModel):
@@ -68,7 +63,7 @@ def _get_key(session, tenant_id: int, key_id: int) -> TenantApiKey:
 
 
 @router.post("", response_model=CreatedKey, status_code=201)
-def create_key(tenant_id: int, req: CreateKeyRequest, _op: None = Depends(_operator),
+def create_key(tenant_id: int, req: CreateKeyRequest, _op: None = Depends(require_operator),
                factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         _require_tenant(session, tenant_id)
@@ -77,7 +72,7 @@ def create_key(tenant_id: int, req: CreateKeyRequest, _op: None = Depends(_opera
 
 
 @router.get("", response_model=List[KeyInfo])
-def list_keys(tenant_id: int, _op: None = Depends(_operator),
+def list_keys(tenant_id: int, _op: None = Depends(require_operator),
               factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         _require_tenant(session, tenant_id)
@@ -87,7 +82,7 @@ def list_keys(tenant_id: int, _op: None = Depends(_operator),
 
 
 @router.post("/{key_id}/rotate", response_model=CreatedKey, status_code=201)
-def rotate_key(tenant_id: int, key_id: int, _op: None = Depends(_operator),
+def rotate_key(tenant_id: int, key_id: int, _op: None = Depends(require_operator),
                factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         old = _get_key(session, tenant_id, key_id)
@@ -97,7 +92,7 @@ def rotate_key(tenant_id: int, key_id: int, _op: None = Depends(_operator),
 
 
 @router.post("/{key_id}/revoke", response_model=KeyInfo)
-def revoke_key(tenant_id: int, key_id: int, _op: None = Depends(_operator),
+def revoke_key(tenant_id: int, key_id: int, _op: None = Depends(require_operator),
                factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         row = _get_key(session, tenant_id, key_id)

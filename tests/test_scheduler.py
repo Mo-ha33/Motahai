@@ -145,23 +145,25 @@ def make_order_payload(order_id=1001, placed=None, status="paid", fulfillment="f
 
 @pytest.mark.asyncio
 async def test_scheduler_tick_records_all_job_runs_and_heartbeat(memory_db):
-    """A fresh tick with empty tables runs all 6 jobs (merge skipped when capture is absent) and writes JobRun entries."""
+    """A fresh tick with empty tables runs all 7 jobs (merge skipped when capture is absent) and writes JobRun entries."""
     sender = FakeSender()
     summary = await run_scheduler_tick(session_factory=memory_db, now=NOW, sender=sender)
 
+    assert "replay_staged_webhooks" in summary["jobs"]
     assert "send_due_events" in summary["jobs"]
     assert "retry_failed_events" in summary["jobs"]
     assert "purge_expired_checkout_context" in summary["jobs"]
     assert MERGE_JOB in summary["jobs"]
     assert "scheduler_heartbeat" in summary["jobs"]
     assert summary["jobs"]["scheduler_heartbeat"]["detail"]["all_jobs_succeeded"] is True
-    assert summary["jobs"]["scheduler_heartbeat"]["detail"]["active_jobs_count"] == 5
+    assert summary["jobs"]["scheduler_heartbeat"]["detail"]["active_jobs_count"] == 6
 
     with memory_db() as session:
         runs = session.scalars(select(JobRun).order_by(JobRun.id)).all()
-        assert len(runs) == 6
+        assert len(runs) == 7
         job_names = [r.job_name for r in runs]
         assert job_names == [
+            "replay_staged_webhooks",
             "send_due_events",
             "retry_failed_events",
             "purge_expired_checkout_context",
@@ -380,7 +382,7 @@ async def test_scheduler_error_isolation(memory_db, monkeypatch):
 
     with memory_db() as session:
         runs = session.scalars(select(JobRun).order_by(JobRun.id)).all()
-        assert len(runs) == 6
+        assert len(runs) == 7
         failed_run = next(r for r in runs if r.job_name == "send_due_events")
         assert failed_run.ok is False
         assert failed_run.error_type == "RuntimeError"

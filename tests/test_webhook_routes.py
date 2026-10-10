@@ -82,7 +82,7 @@ def factory(db_session):
 
 
 @pytest.fixture
-def client(factory, monkeypatch):
+def client(factory, fernet_key, monkeypatch):
     monkeypatch.setenv(webhook_routes.SHOPIFY_SECRET_ENV, SHOPIFY_SECRET)
     monkeypatch.setenv(webhook_routes.SALLA_SECRET_ENV, SALLA_SECRET)
     app.dependency_overrides[webhook_routes.get_session_factory_dep] = lambda: factory

@@ -1,5 +1,10 @@
 # 05. Commercial Conversion, Expansion Loops & Packaging Mechanics
 
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
+
 ## 1. The "Trojan Horse" Customer Acquisition & Expansion Flywheel
 
 To minimize Customer Acquisition Cost (CAC) and maximize Lifetime Value (LTV), Motahai employs a frictionless **4-stage expansion engine**:

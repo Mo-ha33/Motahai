@@ -19,13 +19,22 @@ Request flow (each step fails closed):
      SHOPIFY_APP_SECRET (app-level client secret) / SALLA_WEBHOOK_SECRET. Missing secret, missing header or
      mismatch -> 401 and a webhook_deliveries row with signature_ok=False (payload hash only, never the payload).
   3. Invalid JSON -> 400. Unknown tenant -> 404 (+ recorded row). Unhandled topic -> 200 "ignored" (+ recorded row).
-  4. Otherwise answer 200 IMMEDIATELY and run order_pipeline.process_webhook in a FastAPI background task with its
-     OWN session: platforms expect an answer within ~5 s and the Meta call can take longer.
+  4. Stage the verified payload (webhook_staging.stage_webhook: Fernet-encrypted row, committed). If staging fails
+     -> 503, so the platform retries. Only then answer 200 and run order_pipeline.process_webhook in a FastAPI
+     background task with its OWN session: platforms expect an answer within ~5 s and the Meta call can take longer.
 
-DELIVERY GUARANTEE: because we answer 200 before processing, a background task that is lost (process killed between
-the 200 and the commit) is NOT redelivered by the platform. The S1-5 reconciliation sweep (polling recent orders
-through the platform API) is the safety net. An exception inside the task is recorded on the delivery row by
-process_webhook and as an `incidents` row (kind webhook_processing_error) here.
+DELIVERY GUARANTEE: the 200 is sent only after the payload is durably staged. A background task that is lost (process
+killed between the 200 and the commit) or that raises leaves its staged row in place, and the scheduler job
+replay_staged_webhooks replays it (webhook_staging.py has the backoff and dead-letter rules). An exception inside the
+task is also recorded on the delivery row by process_webhook and as an `incidents` row (kind
+webhook_processing_error) here.
+
+Courier dedupe: Bosta and OTO send several status updates per parcel with the same tracking number, so the tracking
+number is NOT a delivery id. Courier deliveries are deduplicated by payload hash (an exact redelivery is skipped; a
+new status for the same parcel is processed).
+
+OTO replay protection: the signed `timestamp` must be within OTO_WEBHOOK_MAX_AGE_SECONDS (default 3600) in the past
+and OTO_MAX_FUTURE_SKEW_SECONDS (default 300) in the future, otherwise 401 (error_type stale_timestamp).
 
 Tenant lookup: Shopify by header X-Shopify-Shop-Domain -> tenants.shop_domain. Salla by the payload's top-level
 `merchant` (INFERRED from Salla's payload format, verify against a real delivery) -> tenants.shop_domain, which holds
@@ -49,9 +58,10 @@ from .credentials import CredentialError, get_credential
 from .db import Incident, Order, Tenant, WebhookDelivery, get_session_factory, get_tenant_by_shop_domain
 from .order_pipeline import process_webhook
 from .webhook_signatures import (
-    BOSTA_AUTH_HEADER, OTO_SIGNATURE_HEADER, SALLA_SIGNATURE_HEADER, SHOPIFY_HMAC_HEADER,
-    verify_bosta_auth, verify_oto_signature, verify_salla_signature, verify_shopify_hmac
+    BOSTA_AUTH_HEADER, BOSTA_MIN_SECRET_LENGTH, OTO_SIGNATURE_HEADER, SALLA_SIGNATURE_HEADER, SHOPIFY_HMAC_HEADER,
+    oto_timestamp_is_fresh, verify_bosta_auth, verify_oto_signature, verify_salla_signature, verify_shopify_hmac
 )
+from .webhook_staging import process_staged, stage_webhook
 
 logger = logging.getLogger("ameen_workforce.webhooks")
 
@@ -61,6 +71,10 @@ SALLA_SECRET_ENV = "SALLA_WEBHOOK_SECRET"
 BOSTA_SECRET_KIND = "bosta_webhook_secret"
 OTO_SECRET_KIND = "oto_webhook_secret"
 MAX_BODY_BYTES = 1_000_000  # 1 MB
+OTO_MAX_AGE_ENV = "OTO_WEBHOOK_MAX_AGE_SECONDS"
+OTO_MAX_FUTURE_ENV = "OTO_MAX_FUTURE_SKEW_SECONDS"
+DEFAULT_OTO_MAX_AGE_SECONDS = 3600
+DEFAULT_OTO_MAX_FUTURE_SECONDS = 300
 INCIDENT_KIND = "webhook_processing_error"
 
 # Topics the pipeline can interpret. Anything else is acknowledged (so the platform stops retrying) and recorded.
@@ -137,16 +151,12 @@ def _record_delivery(
 
 
 async def _process_in_background(
-    factory: sessionmaker, tenant_id: int, platform: str, topic: str, payload: Dict[str, Any],
-    delivery_id: Optional[str]
+    factory: sessionmaker, staged_id: int, tenant_id: int, platform: str, topic: str
 ) -> None:
-    """Runs after the 200 is sent, with its own session. Never raises."""
+    """Runs after the 200 is sent, with its own session. Never raises; a failed row stays staged for the replay job."""
     session = factory()
     try:
-        tenant = session.get(Tenant, tenant_id)
-        if tenant is None:
-            raise LookupError("tenant vanished")
-        await process_webhook(session, tenant, platform, topic, payload, delivery_id=delivery_id, signature_ok=True)
+        await process_staged(session, staged_id, processor=process_webhook)
     except Exception as exc:
         error_type = type(exc).__name__
         logger.error("Webhook background processing failed (%s/%s, tenant %s): %s", platform, topic, tenant_id,
@@ -161,6 +171,27 @@ async def _process_in_background(
             logger.error("Could not record webhook incident: %s", type(inc_exc).__name__)
     finally:
         session.close()
+
+
+def _stage_or_503(
+    session: Session, tenant_id: int, platform: str, topic: str, payload: Dict[str, Any], delivery_id: Optional[str]
+) -> int:
+    """Durably stages a verified webhook before the 200. Any failure -> 503 so the platform redelivers later."""
+    try:
+        return stage_webhook(session, tenant_id, platform, topic, payload, delivery_id)
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not stage %s webhook for tenant %s: %s", platform, tenant_id, type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Webhook could not be stored; retry later") from None
+
+
+def _env_seconds(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 async def _ingest(
@@ -221,10 +252,11 @@ async def _ingest(
             return {"status": "ignored"}
 
         tenant_id = tenant.id
+        staged_id = _stage_or_503(session, tenant_id, platform, topic, payload, delivery_id)
     finally:
         session.close()
 
-    background_tasks.add_task(_process_in_background, factory, tenant_id, platform, topic, payload, delivery_id)
+    background_tasks.add_task(_process_in_background, factory, staged_id, tenant_id, platform, topic)
     return {"status": "accepted"}
 
 
@@ -283,10 +315,14 @@ async def _ingest_bosta(
         secret = _courier_secret(session, tenant, BOSTA_SECRET_KIND)
         auth_header = headers.get(BOSTA_AUTH_HEADER) or headers.get("X-Bosta-Signature")
         if not verify_bosta_auth(auth_header, secret):
-            logger.warning("Rejected Bosta webhook for tenant %s: %s", tenant.id,
-                           "secret not configured" if not secret else "invalid auth header")
-            await _reject_courier(session, tenant.id, "bosta", "delivery_update", raw,
-                                  "signature_not_configured" if not secret else "invalid_signature", 401,
+            if not secret:
+                reason, error_type = "secret not configured", "signature_not_configured"
+            elif len(secret.strip()) < BOSTA_MIN_SECRET_LENGTH:
+                reason, error_type = "stored secret too short", "secret_too_weak"
+            else:
+                reason, error_type = "invalid auth header", "invalid_signature"
+            logger.warning("Rejected Bosta webhook for tenant %s: %s", tenant.id, reason)
+            await _reject_courier(session, tenant.id, "bosta", "delivery_update", raw, error_type, 401,
                                   "Invalid webhook authentication")
 
         payload = _try_json(raw)
@@ -294,15 +330,13 @@ async def _ingest_bosta(
             await _reject_courier(session, tenant.id, "bosta", "delivery_update", raw, "invalid_json", 400,
                                   "Body must be a JSON object", signature_ok=True)
 
-        data = payload.get("data") or payload.get("delivery") or payload
-        data = data if isinstance(data, dict) else payload
-        delivery_id = str(data.get("trackingNumber") or data.get("_id") or "") or None
+        # No delivery id: the tracking number repeats on every status update (see "Courier dedupe" above).
         tenant_id = tenant.id
+        staged_id = _stage_or_503(session, tenant_id, "bosta", "delivery_update", payload, None)
     finally:
         session.close()
 
-    background_tasks.add_task(_process_in_background, factory, tenant_id, "bosta", "delivery_update", payload,
-                              delivery_id)
+    background_tasks.add_task(_process_in_background, factory, staged_id, tenant_id, "bosta", "delivery_update")
     return {"status": "accepted"}
 
 
@@ -337,16 +371,25 @@ async def _ingest_oto(
                                   "signature_not_configured" if not secret else "invalid_signature", 401,
                                   "Invalid webhook signature")
 
+        if not oto_timestamp_is_fresh(timestamp_val, max_age_seconds=_env_seconds(OTO_MAX_AGE_ENV,
+                                                                                 DEFAULT_OTO_MAX_AGE_SECONDS),
+                                      max_future_seconds=_env_seconds(OTO_MAX_FUTURE_ENV,
+                                                                      DEFAULT_OTO_MAX_FUTURE_SECONDS)):
+            logger.warning("Rejected OTO webhook for tenant %s: stale or unparseable timestamp", tenant.id)
+            await _reject_courier(session, tenant.id, "oto", "orderStatus", raw, "stale_timestamp", 401,
+                                  "Webhook timestamp outside the accepted window", signature_ok=True)
+
         if payload is None:
             await _reject_courier(session, tenant.id, "oto", "orderStatus", raw, "invalid_json", 400,
                                   "Body must be a JSON object", signature_ok=True)
 
-        delivery_id = str(data.get("trackingNumber") or data.get("orderId") or "") or None
+        # No delivery id: the tracking number repeats on every status update (see "Courier dedupe" above).
         tenant_id = tenant.id
+        staged_id = _stage_or_503(session, tenant_id, "oto", "orderStatus", payload, None)
     finally:
         session.close()
 
-    background_tasks.add_task(_process_in_background, factory, tenant_id, "oto", "orderStatus", payload, delivery_id)
+    background_tasks.add_task(_process_in_background, factory, staged_id, tenant_id, "oto", "orderStatus")
     return {"status": "accepted"}
 
 
