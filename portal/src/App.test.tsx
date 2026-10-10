@@ -62,13 +62,14 @@ describe('App shell', () => {
     expect(screen.getByText('اختر متجرًا')).toBeTruthy();
   });
 
-  it('shows the empty state for a known route and not-found for an unknown one', () => {
+  it('shows the audiences page (tenant prompt) for its route', () => {
     window.location.hash = '#/audiences';
-    const { unmount } = renderOperator();
+    renderOperator();
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('الجماهير');
-    expect(screen.getByText('لا توجد بيانات بعد')).toBeTruthy();
-    unmount();
+    expect(screen.getByText('اختر متجرًا')).toBeTruthy();
+  });
 
+  it('shows not-found for an unknown route', () => {
     window.location.hash = '#/nope';
     renderOperator();
     expect(screen.getByText('الصفحة غير موجودة')).toBeTruthy();

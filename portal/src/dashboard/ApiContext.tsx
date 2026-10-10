@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, type ReactNode } from 'react';
 import { statsClient } from '../api';
 import { bearerAuth, sameOriginAuth } from '../api/auth';
 import { createStatsClient, type StatsClient } from '../api/client';
+import { audiencesClient, createAudiencesClient, type AudiencesClient } from '../api/audiences';
 import { createOnboardingClient, onboardingClient, type OnboardingClient } from '../api/onboarding';
 import { useSession } from '../auth/SessionContext';
 
@@ -9,6 +10,12 @@ import { useSession } from '../auth/SessionContext';
 export const ApiContext = createContext<StatsClient>(statsClient);
 
 export const OnboardingApiContext = createContext<OnboardingClient>(onboardingClient);
+
+export const AudiencesApiContext = createContext<AudiencesClient>(audiencesClient);
+
+export function useAudiencesClient(): AudiencesClient {
+  return useContext(AudiencesApiContext);
+}
 
 export function useOnboardingClient(): OnboardingClient {
   return useContext(OnboardingApiContext);
@@ -35,9 +42,19 @@ export function ApiProvider({ children, fetchImpl }: { children: ReactNode; fetc
   );
   // Onboarding is operator-only: it always uses the same-origin (proxy-keyed) auth, never a tenant key.
   const onboarding = useMemo(() => createOnboardingClient({ auth: sameOriginAuth, fetchImpl }), [fetchImpl]);
+  const audiences = useMemo(
+    () =>
+      createAudiencesClient({
+        auth: key === null ? sameOriginAuth : bearerAuth(() => key),
+        fetchImpl,
+      }),
+    [key, fetchImpl],
+  );
   return (
     <ApiContext.Provider value={client}>
-      <OnboardingApiContext.Provider value={onboarding}>{children}</OnboardingApiContext.Provider>
+      <AudiencesApiContext.Provider value={audiences}>
+        <OnboardingApiContext.Provider value={onboarding}>{children}</OnboardingApiContext.Provider>
+      </AudiencesApiContext.Provider>
     </ApiContext.Provider>
   );
 }

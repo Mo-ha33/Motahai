@@ -11,6 +11,7 @@ import { ApiProvider } from './dashboard/ApiContext';
 import { SessionProvider, useSession } from './auth/SessionContext';
 import { SignIn } from './auth/SignIn';
 import { OnboardingPage } from './onboarding/OnboardingPage';
+import { AudiencesPage } from './audiences/AudiencesPage';
 import { DashboardPage } from './dashboard/DashboardPage';
 import { FiltersProvider } from './filters/FiltersContext';
 import {
@@ -121,6 +122,8 @@ function Shell({ config }: { config: DashboardConfig }) {
           <h1 className="page-title">{pageTitle}</h1>
           {route === 'onboarding' ? (
             <OnboardingPage lang={lang} />
+          ) : route === 'audiences' ? (
+            <AudiencesPage lang={lang} />
           ) : page ? (
             <DashboardPage key={route} config={page} lang={lang} />
           ) : (
