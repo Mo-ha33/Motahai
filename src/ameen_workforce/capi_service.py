@@ -21,6 +21,7 @@ Rule D-005 (decision "Option A: Coexist", 2026-10-09):
 """
 
 import hashlib
+import os
 import time
 import re
 from datetime import date
@@ -37,6 +38,19 @@ logger = logging.getLogger("ameen_workforce.capi")
 # https://developers.facebook.com/docs/graph-api/changelog/versions (tests fail 90 days before the pinned one expires).
 META_GRAPH_API_VERSION = "v22.0"
 META_GRAPH_API_VERSION_EXPIRES = date(2027, 5, 20)
+# Operator override (e.g. to move to a newer version before a release); must look like "v23.0". Read per send.
+META_GRAPH_API_VERSION_ENV = "MOTAHAI_META_GRAPH_API_VERSION"
+_GRAPH_VERSION = re.compile(r"^v[0-9]{2,3}\.0$")
+
+
+def graph_api_version() -> str:
+    """The Graph API version to call: the env override when it is a valid version string, else the pinned default."""
+    override = (os.environ.get(META_GRAPH_API_VERSION_ENV) or "").strip()
+    if not override:
+        return META_GRAPH_API_VERSION
+    if not _GRAPH_VERSION.match(override):
+        raise ValueError(f"{META_GRAPH_API_VERSION_ENV} must look like 'v23.0'")
+    return override
 
 # Rule D-005 (Coexist): custom events, never the standard Purchase the native integration sends.
 DELIVERED_EVENT_NAME = "DeliveredPurchase"
@@ -133,6 +147,8 @@ PHONE_PLANS = {
     "BH": ("973", (8,), False),
     "OM": ("968", (8,), False),
 }
+# E.164 allows at most 15 digits; nothing shorter than 8 (calling code + subscriber) is a real number.
+E164_MIN_DIGITS, E164_MAX_DIGITS = 8, 15
 # Longest calling code first, so "966" is tried before shorter prefixes.
 _PLANS_BY_CODE = sorted(PHONE_PLANS.values(), key=lambda plan: -len(plan[0]))
 
@@ -154,8 +170,9 @@ def normalize_phone(phone: Optional[str], default_country: str = "EG") -> Option
     - Otherwise the number is national for `default_country` (EG, SA, AE, KW, QA, BH, OM): one trunk 0 is dropped
       where that country uses one, and the calling code is prefixed when the length fits its numbering plan. A
       number written without its trunk 0 is only prefixed at the mobile length, the one unambiguous case.
-    - Unknown country or a length that fits no plan: the digits are returned unchanged (never guessed into a country),
-      except the historical rule that a bare 9-digit 5XXXXXXXX with a non-GCC default is Saudi.
+    - Never guessed into a country. A national number that fits no plan of a known default country returns None (its
+      hash could never match), except the historical rule that a bare 9-digit 5XXXXXXXX is Saudi. International
+      numbers and numbers for an unknown default country are kept only at 8 to 15 digits, else None.
     """
     if not phone:
         return None
@@ -164,7 +181,8 @@ def normalize_phone(phone: Optional[str], default_country: str = "EG") -> Option
     if not digits:
         return None
     if raw.startswith("+") or digits.startswith("00"):
-        return _strip_trunk_after_code(digits[2:] if digits.startswith("00") else digits)
+        international = _strip_trunk_after_code(digits[2:] if digits.startswith("00") else digits)
+        return international if E164_MIN_DIGITS <= len(international) <= E164_MAX_DIGITS else None
 
     country = (default_country or "").upper()
     plan = PHONE_PLANS.get(country)
@@ -187,7 +205,9 @@ def normalize_phone(phone: Optional[str], default_country: str = "EG") -> Option
         # Historical rule: a Saudi mobile written without the trunk zero or country code (5XXXXXXXX). SA and AE
         # defaults already resolved it above, so this only applies to other defaults.
         return "966" + digits
-    return digits
+    if plan:
+        return None  # fits no numbering plan we know: a hash of it could never match, so send no phone at all
+    return digits if E164_MIN_DIGITS <= len(digits) <= E164_MAX_DIGITS else None
 
 def hash_email(email: Optional[str]) -> Optional[str]:
     """SHA-256 of the normalized (trimmed, lower-cased) email, or None. Safe to store; the raw email is not."""
@@ -355,13 +375,13 @@ class MetaCAPISender:
         """
         Sends the event payload to Meta Graph API.
         """
-        url = f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{pixel_id}/events"
         # Meta documents the token as the `access_token` parameter (no Authorization header).
         # It goes in the JSON body, not the URL, so HTTP client/proxy URL logs never contain it.
         headers = {"Content-Type": "application/json"}
         body = {**payload, "access_token": access_token}
 
         try:
+            url = f"https://graph.facebook.com/{graph_api_version()}/{pixel_id}/events"  # bad override -> ValueError
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.post(url, headers=headers, json=body)
                 data = res.json()

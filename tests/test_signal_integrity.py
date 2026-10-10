@@ -12,8 +12,8 @@ from sqlalchemy import select
 
 from scripts.onboard_store import main
 from src.ameen_workforce.capi_service import (
-    META_GRAPH_API_VERSION, META_GRAPH_API_VERSION_EXPIRES, MetaCAPISender, hash_phone, hash_sha256,
-    normalize_phone, phone_default_country, quality_flags_for
+    META_GRAPH_API_VERSION, META_GRAPH_API_VERSION_ENV, META_GRAPH_API_VERSION_EXPIRES, MetaCAPISender,
+    graph_api_version, hash_phone, hash_sha256, normalize_phone, phone_default_country, quality_flags_for
 )
 from src.ameen_workforce.credentials import store_credential
 from src.ameen_workforce.db import (
@@ -55,8 +55,11 @@ from tests.test_order_pipeline import DELIVERED, FakeSender, shopify_order
     ("92123456", "OM", "96892123456"),
     # Never guessed into a country
     ("+447911123456", "EG", "447911123456"),
-    ("12345", "EG", "12345"),
-    ("99123456", "EG", "99123456"),                 # a KW-looking number with an EG default stays as-is
+    ("12345", "EG", None),                          # fits no plan: no phone rather than a hash that never matches
+    ("99123456", "EG", None),                       # a KW-looking number with an EG default is not guessed
+    ("+20 12", "EG", None),                         # too short for E.164
+    ("+1234567890123456", "EG", None),              # more than 15 digits
+    ("4155550123", "US", "4155550123"),             # unknown default country: kept at a plausible length
     ("", "EG", None),
     (None, "EG", None),
     ("abc", "EG", None),
@@ -127,8 +130,23 @@ def test_graph_api_version_not_within_90_days_of_expiry():
         "(https://developers.facebook.com/docs/graph-api/changelog/versions)")
 
 
+def test_graph_api_version_env_override(monkeypatch):
+    monkeypatch.delenv(META_GRAPH_API_VERSION_ENV, raising=False)
+    assert graph_api_version() == META_GRAPH_API_VERSION
+    monkeypatch.setenv(META_GRAPH_API_VERSION_ENV, " v25.0 ")
+    assert graph_api_version() == "v25.0"
+
+
+@pytest.mark.parametrize("bad", ["22.0", "v22", "v22.1", "v22.0/../me", "latest"])
+def test_graph_api_version_env_override_rejects_garbage(monkeypatch, bad):
+    monkeypatch.setenv(META_GRAPH_API_VERSION_ENV, bad)
+    with pytest.raises(ValueError, match=META_GRAPH_API_VERSION_ENV):
+        graph_api_version()
+
+
 @pytest.mark.asyncio
 async def test_send_event_posts_to_pinned_version(monkeypatch):
+    monkeypatch.delenv(META_GRAPH_API_VERSION_ENV, raising=False)
     seen = {}
 
     class FakeResponse:
