@@ -26,6 +26,7 @@ from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
+from .operator_routes import router as operator_router, require_operator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -60,6 +61,7 @@ app = FastAPI(
 )
 app.include_router(webhook_router)
 app.include_router(capture_router)
+app.include_router(operator_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [
@@ -99,27 +101,6 @@ class ResolveEscalationRequest(BaseModel):
 class GtmPublishApprovalRequest(BaseModel):
     container_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
     workspace_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
-
-def require_operator(authorization: Optional[str] = Header(None)) -> None:
-    """
-    Authenticates a HUMAN operator for Rule D-003 approvals via env OPERATOR_API_KEY.
-    This key is deliberately separate from HERMES_API_KEY / any agent or webhook credential:
-    an agent that can call the tools must never be able to mint its own approval.
-    Used as a dependency so authentication runs before request-body validation.
-    Fails closed: if OPERATOR_API_KEY is unset (or equals HERMES_API_KEY) nobody is authenticated.
-    """
-    operator_key = os.environ.get("OPERATOR_API_KEY", "")
-    if not operator_key:
-        logger.error("OPERATOR_API_KEY is not configured; refusing all approval requests")
-        raise HTTPException(status_code=401, detail="Operator authentication required")
-    if settings.HERMES_API_KEY and hmac.compare_digest(operator_key.encode(), settings.HERMES_API_KEY.encode()):
-        logger.error("OPERATOR_API_KEY must differ from HERMES_API_KEY; refusing all approval requests")
-        raise HTTPException(status_code=401, detail="Operator authentication required")
-    presented = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        presented = authorization[7:].strip()
-    if not presented or not hmac.compare_digest(presented.encode(), operator_key.encode()):
-        raise HTTPException(status_code=401, detail="Operator authentication required", headers={"WWW-Authenticate": "Bearer"})
 
 # -----------------------------------------------------------------------------
 # Endpoints

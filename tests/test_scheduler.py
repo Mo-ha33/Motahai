@@ -159,7 +159,7 @@ async def test_scheduler_tick_records_all_job_runs_and_heartbeat(memory_db):
 
     with memory_db() as session:
         runs = session.scalars(select(JobRun).order_by(JobRun.id)).all()
-        assert len(runs) == 6
+        assert len(runs) == 7  # + export_weekly_audiences (first tick)
         job_names = [r.job_name for r in runs]
         assert job_names == [
             "send_due_events",
@@ -168,6 +168,7 @@ async def test_scheduler_tick_records_all_job_runs_and_heartbeat(memory_db):
             MERGE_JOB,
             "send_weekly_digests",
             "scheduler_heartbeat",
+            "export_weekly_audiences",
         ]
         for r in runs:
             assert r.ok is True
@@ -380,7 +381,7 @@ async def test_scheduler_error_isolation(memory_db, monkeypatch):
 
     with memory_db() as session:
         runs = session.scalars(select(JobRun).order_by(JobRun.id)).all()
-        assert len(runs) == 6
+        assert len(runs) == 7  # + export_weekly_audiences (first tick)
         failed_run = next(r for r in runs if r.job_name == "send_due_events")
         assert failed_run.ok is False
         assert failed_run.error_type == "RuntimeError"
