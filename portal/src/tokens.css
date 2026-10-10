@@ -1,0 +1,57 @@
+/* Design tokens. Light is the default; dark follows prefers-color-scheme
+   unless the document forces a theme with data-theme. */
+
+:root {
+  --color-bg: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-muted: #eef1f5;
+  --color-border: #d9dee6;
+  --color-text: #1b2430;
+  --color-text-muted: #5b6878;
+  --color-accent: #0f766e;
+  --color-accent-text: #ffffff;
+  --color-focus: #2563eb;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+
+  --font-family:
+    system-ui, -apple-system, "Segoe UI", "Noto Sans Arabic", Tahoma, "Geeza Pro",
+    "Arial", sans-serif;
+
+  --header-height: 56px;
+  --sidebar-width: 240px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #0f141b;
+    --color-surface: #171e27;
+    --color-surface-muted: #1f2935;
+    --color-border: #2c3846;
+    --color-text: #e6ebf1;
+    --color-text-muted: #9aa6b5;
+    --color-accent: #2dd4bf;
+    --color-accent-text: #0b1210;
+    --color-focus: #60a5fa;
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #0f141b;
+  --color-surface: #171e27;
+  --color-surface-muted: #1f2935;
+  --color-border: #2c3846;
+  --color-text: #e6ebf1;
+  --color-text-muted: #9aa6b5;
+  --color-accent: #2dd4bf;
+  --color-accent-text: #0b1210;
+  --color-focus: #60a5fa;
+}

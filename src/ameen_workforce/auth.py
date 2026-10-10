@@ -37,3 +37,13 @@ def require_operator(authorization: Optional[str] = Header(None)) -> None:
         presented = authorization[7:].strip()
     if not presented or not hmac.compare_digest(presented.encode(), operator_key.encode()):
         raise HTTPException(status_code=401, detail="Operator authentication required", headers={"WWW-Authenticate": "Bearer"})
+
+
+def require_hermes(authorization: Optional[str] = Header(None)) -> None:
+    """Authenticates the Hermes agent on /webhook/hermes via Bearer HERMES_API_KEY. Fails closed if unset."""
+    key = settings.HERMES_API_KEY
+    presented = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        presented = authorization[7:].strip()
+    if not key or not presented or not hmac.compare_digest(presented.encode(), key.encode()):
+        raise HTTPException(status_code=401, detail="Hermes authentication required", headers={"WWW-Authenticate": "Bearer"})
