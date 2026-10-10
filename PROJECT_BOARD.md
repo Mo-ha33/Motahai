@@ -1,6 +1,6 @@
 # 📋 Motahai Project Task Board (Sprint & Architecture Plan)
 > **Autonomous Multi-Agent Task Orchestration Board**  
-> *Last Updated:* 2026-10-09  
+> *Last Updated:* 2026-10-10  
 > *Repository:* [https://github.com/Mo-ha33/Motahai](https://github.com/Mo-ha33/Motahai)
 
 ---
@@ -53,6 +53,9 @@
 | S2-7 | Pilot validation plan: required CAPI fields, custom-conversion optimization, ROAS bidding, A/B test | Haiku 5.5 | P1 | DONE | research, pilot | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
 | S2-8 | Thank-you page capture (Salla App Snippet + Shopify checkout_completed): order_id + UA + IP + fbp/fbc → Core | Sonnet 5.5 | P1 | IN_PROGRESS | capture, salla, emq | Salla webhooks carry no UA/IP; Meta requires client_user_agent for website events. Wave 2. Also: handle_order_update made decision-only. |
 | S1-8 | Ed25519 asymmetric HITL signing + user separation | Sonnet 5.5 | P1 | DONE | hitl, security | Ed25519 D-003 tokens (no HMAC), deployment/isolation manifests. (updated 2026-10-10 00:24) |
+| TASK-101 | Fix E.164 phone normalization for EG (+20), KSA (+966), UAE (+971), KW (+965) — [#24](https://github.com/Mo-ha33/Motahai/issues/24) | Sonnet 5.5 | P0 | REVIEW | p0, bug, capi | Implemented in draft PR [#22](https://github.com/Mo-ha33/Motahai/pull/22). (updated 2026-10-10) |
+| TASK-102 | Meta Graph API v20.0 → v22.0 + `test_event_code` support — [#25](https://github.com/Mo-ha33/Motahai/issues/25) | Sonnet 5.5 | P0 | REVIEW | p0, capi | Implemented in draft PR [#22](https://github.com/Mo-ha33/Motahai/pull/22). (updated 2026-10-10) |
+| TASK-103 | S1-5 reconciliation sweep + Bosta/OTO webhook replay protection — [#26](https://github.com/Mo-ha33/Motahai/issues/26) | Sonnet 5.5 | P0 | REVIEW | p0, security, webhooks | Draft PR [#23](https://github.com/Mo-ha33/Motahai/pull/23): staged-before-200 replay sweep, OTO timestamp window, Bosta 24-char secret min, Salla KAT. Remaining: poll Shopify/Salla/couriers for never-arrived webhooks. (updated 2026-10-10) |
 
 ---
 
@@ -86,3 +89,5 @@
 ### 5. Verification Log & Evidence
 - **TASK-001 Evidence:** Verified via `pytest -q`: `68 passed, 26 warnings in 7.57s`. `httpx` pinned to `0.27.2` in `requirements.txt`.
 - **Review 2026-10-09 (Opus):** TASK-003, TASK-021 and TASK-022 reopened to IN_PROGRESS for defects B1–B4 found in d51dcf0 and the gate code. TASK-031 and TASK-040 retitled and narrowed to the 2026-10-09 scope change. TASK-030 reassigned to Haiku 5.5 because Gemini cannot be dispatched from the Claude Code session. Sprint S1 rows S1-0 to S1-7 added. Board edits only; no code changed and no tests re-run.
+- **Board sync 2026-10-10:** TASK-101..103 logged as GitHub issues #24, #25, #26 (labels `p0`, `bug`, `capi`, `security`, `webhooks`). Status REVIEW = GitHub board "In Progress (in review)". Adding them to the [GitHub Project #3](https://github.com/users/Mo-ha33/projects/3) failed from the Claude Code session: user-level Projects API (GraphQL and REST `users/Mo-ha33/projectsV2/3`) returned HTTP 403 because the session is scoped to repository endpoints only. `.github/workflows/project-sync.yml` adds labelled issues to the board once the `ADD_TO_PROJECT_PAT` secret is set.
+- **Token-saving helpers:** `scripts/dev/qtest.py` (targeted pytest, summary + one line per failure) and `scripts/dev/logscan.py` (level/grep filter, repeat collapsing, short tail for files, stdin or `journalctl -u`).
