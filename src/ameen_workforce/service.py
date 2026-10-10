@@ -26,6 +26,7 @@ from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
+from .tenant_key_routes import router as tenant_key_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -60,6 +61,7 @@ app = FastAPI(
 )
 app.include_router(webhook_router)
 app.include_router(capture_router)
+app.include_router(tenant_key_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [

@@ -333,6 +333,26 @@ class JobRun(Base):
     detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class TenantApiKey(Base):
+    """M3-3: per-tenant scoped API key (`mtk_<prefix>_<secret>`). Only the SHA-256 of the full key is stored; the
+    plaintext is shown once at creation. Use tenant_auth.create_tenant_key / require_tenant_key."""
+    __tablename__ = "tenant_api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    key_prefix: Mapped[str] = mapped_column(String(8), unique=True, index=True)
+    key_hash: Mapped[str] = mapped_column(String(64))
+    label: Mapped[str] = mapped_column(String(100), default="")
+    scopes: Mapped[str] = mapped_column(String(255), default="stats:read")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+
+    def __repr__(self) -> str:
+        # Deliberately omits key_hash.
+        return f"TenantApiKey(id={self.id!r}, tenant_id={self.tenant_id!r}, key_prefix={self.key_prefix!r})"
+
+
 # --- Engine / session ------------------------------------------------------------------------------------
 
 def make_engine(url: Optional[str] = None) -> Engine:
