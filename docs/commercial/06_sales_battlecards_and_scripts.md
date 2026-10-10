@@ -1,5 +1,10 @@
 # 06. Sales Enablement, Battlecards & Competitive Positioning
 
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
+
 ## 1. Competitive Battlecards Matrix
 
 ### Battlecard 1: Motahai vs. Traditional Tracking Agencies & Freelancers
@@ -83,4 +88,4 @@ Ameen Digital / Motahai Workforce
 3. **Quantifying the Cost of Inaction:**  
    *"If you're spending \$10,000/month, a 15% untracked signal means \$1,500 of monthly ad spend is essentially feeding blind algorithms. How much would your ROAS improve if Meta knew exactly who purchased?"*
 4. **The No-Brainer Closing Pitch:**  
-   *"Instead of paying an agency \$3,000 to look at this two weeks from now, you can hire our Core Growth Trio today for \$449/mo, and have your CAPI deduplicated and EMQ score boosted past 8.5 by this evening."*
+   *"Instead of paying an agency \$3,000 to look at this two weeks from now, you can hire our Core Growth Trio today for \$449/mo, and have your container audited and the COD signal ladder recording in shadow mode, with nothing sent to Meta until you approve."*
