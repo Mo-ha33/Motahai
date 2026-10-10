@@ -28,6 +28,7 @@ from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
+from .tenant_key_routes import router as tenant_key_router
 from .stats_routes import router as stats_router
 from .auth import require_operator, require_hermes  # noqa: F401  (defined in auth.py; re-exported for routes + tests)
 
@@ -64,6 +65,7 @@ app = FastAPI(
 )
 app.include_router(webhook_router)
 app.include_router(capture_router)
+app.include_router(tenant_key_router)
 app.include_router(stats_router)
 
 # CORS Policy
