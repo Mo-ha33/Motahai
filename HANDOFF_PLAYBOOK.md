@@ -52,7 +52,6 @@ We heard your feedback loud and clear, and we **executed and pushed the code dir
 - **OUT OF SCOPE (Say NO):**
   - No creative dashboards, thumbstops, or hook rate analytics (leave to Motion).
   - No creator marketplace.
-  - **Paused:** Ziad autonomous video generation is strictly for Motahai's internal marketing, not sold in the core product.
 
 ### Decision 4: Honest Retention Loop & Sunday WhatsApp Report
 - **Never claim "Saved ad budget"** (unprovable metric).

@@ -1,7 +1,7 @@
 # Motahai (مُتاح)
 
-**Server-side conversion and delivery reconciliation for cash-on-delivery (COD) e-commerce in MENA and the GCC.**
-Motahai tells Meta which orders were confirmed and which were actually delivered and paid, so ad optimization stops
+**An AI go-to-market workforce for cash-on-delivery (COD) e-commerce in MENA and the GCC: Tariq on Wesam.ai and the Hermes agent runtime, with conversion events and production changes gated by a deterministic COD reconciliation core.**
+The core tells Meta which orders were confirmed and which were actually delivered and paid, so ad optimization stops
 learning from orders that are refused at the door.
 
 ![tests](https://img.shields.io/badge/tests-574%20passed%20%C2%B7%203%20skipped-brightgreen)
@@ -20,6 +20,32 @@ on its own pilot stores yet. Standard tracking fires a Meta `Purchase` the momen
 - Ads Manager can show a strong ROAS while refused parcels and return shipping eat the cash.
 - The naive fix, delaying `Purchase` until delivery 3 to 7 days later, starves ad sets of events (Meta's guideline is
   roughly 50 events per ad set per week) and runs into Meta's 7-day limit on event age.
+
+## Agent architecture
+
+Motahai has three layers. The agents propose and gather evidence; the deterministic core and a human decide.
+
+```mermaid
+flowchart LR
+    T["Tariq on Wesam.ai"] -->|"MCP over SSE"| H["Hermes: MCP tools, audits, verdicts"]
+    H -->|"HTTPS, agent side to Core only"| C["Motahai Core: Python and FastAPI"]
+    W["Shopify, Salla and courier webhooks"] --> C
+    C -->|"D-005 signal ladder"| M["Meta CAPI"]
+    O["Human operator"] -->|"requests a token"| C
+    C -->|"Ed25519 approval token"| O
+    O -->|"supplies the token"| H
+    H -->|"publish only with a valid token"| G["Google Tag Manager"]
+```
+
+| Layer | Role | What it can and cannot do |
+|---|---|---|
+| **Tariq** (Wesam.ai) | AI technical marketer on the Wesam.ai platform. It works through its chat interface and reaches Hermes over MCP. It also prepares client deliverables such as the tracking asset matrix ([`asset_matrix.py`](src/ameen_workforce/asset_matrix.py)). | **Can** ask Hermes for tracking verdicts and evidence. **Cannot** reach Core's database or keys, and cannot mint an approval; it only sees the tools the MCP gateway policy grants. |
+| **Hermes** (agent runtime) | Self-hosted runtime that exposes tools over the Model Context Protocol (MCP): consults and verdicts, code audits, allowlisted skills such as the GTM container linter, and browser evidence collection behind SSRF limits. Its memory index carries the D-005 rule. | **Can** execute allowed tools, check tracking signals and verify an approval token. **Cannot** sign a token (it holds only the Ed25519 public key), cannot publish to GTM without a valid token, and cannot use the human-only tools (terminal, memory update, skill creation). Gateway policy: [`tool-policy.yaml`](ops/hermes/gateway/tool-policy.yaml). |
+| **Motahai Core** (Python, FastAPI) | Deterministic guardrail engine with no LLM in the money path: the Rule D-005 signal ladder, the Ed25519 human-approval gate (D-003) and the Fernet vault (D-006). | **Can** decide whether a Meta event is sent, and issue approval tokens to an authenticated human operator. **Cannot** be overridden by an agent: Core never relies on a Hermes answer for a money-path decision. |
+
+Agents act without a human in the loop only inside these limits. A live Google Tag Manager publish needs a token that a human
+operator minted for one container and one workspace (see [Security and zero trust](#security-and-zero-trust)).
+Agent runtime details: [`ops/hermes/`](ops/hermes/README.md). Host isolation: [`deployment/isolation/`](deployment/isolation/README.md).
 
 ## The 3-step signal ladder (Rule D-005, "Coexist")
 
@@ -153,16 +179,12 @@ No `.env` is needed for either command. Running the real service needs per-tenan
 ├── ops/hermes/                 Optional MCP agent runtime: gateway policy, linter skill, LLM router
 │   └── consultation.py         MCP tool module; verifies the D-003 approval token before a live GTM publish
 ├── tools/
-│   ├── board/                  manage_board.py: project-board helper
-│   └── video/                  Video production scripts
+│   └── board/                  manage_board.py: project-board helper
 ├── cloudflare-browser-mcp/     Cloudflare Worker exposing Playwright as an MCP server
 ├── docs/                       Playbook, runbook, pilot handbook, commercial docs, research notes
 ├── LICENSE                     BUSL-1.1 (converts to Apache-2.0 on 2030-10-10)
 └── SECURITY.md                 Vulnerability reporting
 ```
-
-Demo videos are attached to the [v1.0.0 release](https://github.com/Mo-ha33/Motahai/releases/tag/v1.0.0), not stored
-in the repository.
 
 ---
 
@@ -176,7 +198,7 @@ in the repository.
 العميل بخوارزمية SHA-256. يدعم النظام منصتَي Shopify وSalla، وشركتَي الشحن Bosta (مصر) وOTO (السعودية ودول الخليج)،
 مع عزل كامل لبيانات كل متجر. على صعيد الأمان، لا يُنشر أي تعديل مباشر على Google Tag Manager دون رمز موافقة بشري
 موقّع بخوارزمية Ed25519، وتُخزَّن بيانات الاتصال بالعميل مشفّرة بـ Fernet وتُحذف بعد الإرسال أو بعد 14 يوماً،
-ويُفصل مسار المال عن بيئة الذكاء الاصطناعي. أما الأدلة، فقد اجتاز النظام 574 اختباراً آلياً مع تخطي 3 اختبارات،
+ويُفصل مسار المال عن بيئة الذكاء الاصطناعي. وتتألف طبقة الوكلاء من ثلاثة مستويات: «طارق» (Tariq) وكيل التسويق التقني على منصة Wesam.ai، ووقت التشغيل Hermes الذي يتيح الأدوات عبر بروتوكول سياق النموذج (MCP) ولا يملك سوى المفتاح العام، ثم نواة Motahai الحتمية المبنية بلغة Python التي تفرض القواعد؛ فالوكلاء يقترحون، أما القرار فللنواة والإنسان. أما الأدلة، فقد اجتاز النظام 574 اختباراً آلياً مع تخطي 3 اختبارات،
 ويُرسل رسالة «ملخص نظافة الإشارة» كل أحد بالبريد الإلكتروني اعتماداً على استعلامات SQL فقط، ويمكن تشغيل محاكاة
 كاملة بأمر واحد دون أي اتصال بالإنترنت.
 
