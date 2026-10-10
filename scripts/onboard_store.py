@@ -44,8 +44,14 @@ Secret sources (a secret may come from any of them):
 
 Options:
     --meta-capi-token         Meta CAPI access token (required, from the flag or a secret source above)
-    --verify-capi-ping        Send a MotahaiConnectionTest event to Meta to verify dataset + token (opt-in).
-                              REQUIRES --test-event-code: without it the CLI exits non-zero and sends nothing.
+    --meta-test-event-code CODE  Store the Meta Events Manager test code on the tenant (same as
+                              --pipeline-test-event-code). Never logged. Pass '' to clear it.
+    --verify-capi-ping        Verify the store against Meta's Test Events (opt-in). Uses the tenant's most recent shadow
+                              event, rebuilt exactly as the live path would, sent WITH the test code, and records
+                              tenants.test_event_verified_at on success. A brand-new store has no shadow event yet, so
+                              it falls back to a MotahaiConnectionTest event (also test-code only).
+                              REQUIRES a test code (--meta-test-event-code or --test-event-code): without one the CLI
+                              exits non-zero and sends NOTHING. This script never sends a real DeliveredPurchase.
     --test-event-code         Meta test event code (e.g. TEST12345) from Events Manager; keeps the ping out of live data
     --skip-ping               Skip the ping even if --verify-capi-ping is given
     --bosta-webhook-secret    Bosta webhook secret (stored encrypted as bosta_webhook_secret)
@@ -151,6 +157,48 @@ async def verify_capi_ping(
             "message": result.get("error_message") or result.get("error") or "Meta dispatch failed",
             "raw": result.get("raw")
         }
+
+
+async def run_verification(args: argparse.Namespace, onboard_result: Dict[str, Any],
+                           sender: Optional[MetaCAPISender] = None) -> Dict[str, Any]:
+    """
+    The CLI's Meta check. Never sends a real DeliveredPurchase/ConfirmedOrder and never sends at all without a test code.
+      1. A code exists (--test-event-code, used one-shot and not stored; else the tenant's stored meta_test_event_code
+         from --meta-test-event-code): verify_test_event re-sends its latest shadow event with that code and sets
+         tenants.test_event_verified_at.
+      2. That tenant has no shadow event yet (a store onboarded minutes ago): fall back to verify_capi_ping, a custom
+         MotahaiConnectionTest event, again only with the test code.
+      3. No code at all: send nothing and say so.
+    """
+    from src.ameen_workforce.order_pipeline import verify_test_event
+
+    one_shot = args.test_event_code.strip() if args.test_event_code and args.test_event_code.strip() else None
+    with session_scope() as session:
+        tenant = get_tenant_by_shop_domain(session, onboard_result["shop_domain"])
+        stored_code = tenant.meta_test_event_code if tenant else None
+        if tenant is not None and (one_shot or stored_code):
+            logger.info("Verifying tenant %s against Meta Test Events...", tenant.id)
+            # --test-event-code is a one-shot replay: it is NOT stored, so it never diverts live pipeline events.
+            result = await verify_test_event(session, tenant, sender=sender or capi_sender, test_event_code=one_shot)
+            if result.get("error") != "no_shadow_event":
+                return result
+    code = one_shot or stored_code
+    if not code:
+        return {"status": "skipped", "message": "No Meta test event code configured; nothing was sent to Meta. "
+                "Set one with --meta-test-event-code (from Events Manager > Test Events) and re-run."}
+    logger.info("Executing Meta CAPI connection test for dataset %s...", args.meta_dataset_id)
+    result = await verify_capi_ping(
+        meta_dataset_id=args.meta_dataset_id,
+        meta_capi_token=args.meta_capi_token,
+        currency=onboard_result.get("currency", "EGP"),
+        country=onboard_result.get("country", "EG"),
+        test_event_code=code,
+        storefront_url=args.storefront_url,
+        sender=sender,
+    )
+    if tenant is not None and result.get("status") == "success":
+        result["note"] = "no shadow event yet: sent a MotahaiConnectionTest instead; re-run after the first order"
+    return result
 
 
 # Secret flags -> argparse dest. Every one of them can also come from --secrets-file / --secrets-stdin.
@@ -310,7 +358,7 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-ping", action="store_true", help="Skip the Meta connection ping even if --verify-capi-ping is set")
     parser.add_argument("--test-event-code", default=None,
                         help="Meta test event code (e.g. TEST12345). Required by --verify-capi-ping; keeps the ping out of live data.")
-    parser.add_argument("--pipeline-test-event-code", default=None, metavar="CODE",
+    parser.add_argument("--pipeline-test-event-code", "--meta-test-event-code", default=None, metavar="CODE",
                         help="Send ALL of this tenant's pipeline CAPI events with this Meta test event code, so they show in "
                              "Test Events. Test sends use up each order's one-time send claim: use on a test dataset or "
                              "before launch. Pass an empty string ('') to clear it.")
@@ -331,9 +379,10 @@ def validate_cli_args(args: argparse.Namespace) -> Optional[str]:
     if not (args.meta_capi_token and args.meta_capi_token.strip()):
         return ("a Meta CAPI token is required: pass --meta-capi-token, or META_CAPI_TOKEN in --secrets-file / "
                 "--secrets-stdin. Nothing was stored.")
-    if args.verify_capi_ping and not (args.test_event_code and args.test_event_code.strip()):
-        return ("--verify-capi-ping requires --test-event-code (the Meta test event code from Events Manager). "
-                "Nothing was sent and nothing was stored.")
+    if args.verify_capi_ping and not ((args.test_event_code and args.test_event_code.strip())
+                                      or (args.pipeline_test_event_code and args.pipeline_test_event_code.strip())):
+        return ("--verify-capi-ping requires --meta-test-event-code or --test-event-code (the Meta test event code "
+                "from Events Manager). Nothing was sent and nothing was stored.")
     if args.generate_courier_secrets and (args.bosta_webhook_secret is not None or args.oto_webhook_secret is not None):
         return "--generate-courier-secrets cannot be combined with --bosta-webhook-secret or --oto-webhook-secret"
     for flag, value in (("--bosta-webhook-secret", args.bosta_webhook_secret), ("--oto-webhook-secret", args.oto_webhook_secret)):
@@ -418,17 +467,14 @@ def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
                 if courier_result["generated"]:
                     onboard_result["generated_courier_webhooks"] = courier_result["generated"]
 
+        if onboard_result.get("pipeline_test_event_code") and onboard_result.get("mode") == "live":
+            print("warning: this tenant is LIVE and has a test event code: every pipeline CAPI send now goes to Test "
+                  "Events instead of the live dataset. Clear it (--meta-test-event-code '') before real traffic.",
+                  file=sys.stderr)
+
         ping_result = None
         if args.verify_capi_ping and not args.skip_ping and not args.dry_run:
-            logger.info("Executing Meta CAPI test ping for dataset %s...", args.meta_dataset_id)
-            ping_result = asyncio.run(verify_capi_ping(
-                meta_dataset_id=args.meta_dataset_id,
-                meta_capi_token=args.meta_capi_token,
-                currency=onboard_result.get("currency", "EGP"),
-                country=onboard_result.get("country", "EG"),
-                test_event_code=args.test_event_code,
-                storefront_url=args.storefront_url
-            ))
+            ping_result = asyncio.run(run_verification(args, onboard_result))
             onboard_result["verification_ping"] = ping_result
 
         if args.json:
@@ -471,8 +517,12 @@ def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
                 status_str = ping_result.get("status", "").upper()
                 if status_str == "SUCCESS":
                     print(f"    * Status: SUCCESS (Trace ID: {ping_result.get('fbtrace_id')})")
+                    if ping_result.get("note"):
+                        print(f"    * Note: {ping_result['note']}")
+                elif status_str == "SKIPPED":
+                    print(f"    * Status: SKIPPED ({ping_result.get('message')})")
                 else:
-                    print(f"    * Status: WARNING/FAILED ({ping_result.get('message')})")
+                    print(f"    * Status: WARNING/FAILED ({ping_result.get('message') or ping_result.get('error')})")
             print("=" * 65)
             print("Store successfully onboarded!\n")
 

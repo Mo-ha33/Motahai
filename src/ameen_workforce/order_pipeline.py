@@ -54,7 +54,7 @@ from .confirmation import (
     SOURCE_IMPLICIT_SHIPPED, SOURCE_MANUAL, effective_confirmation_rules
 )
 from .credentials import CredentialError, get_credential
-from .db import CapiEvent, Order, OrderStatusEvent, Tenant, WebhookDelivery, utcnow
+from .db import CapiEvent, Order, OrderStatusEvent, Tenant, WebhookDelivery, normalize_test_event_code, utcnow
 from .webhook_listener import OrderWebhookProcessor, fulfillment_context_decision, match_hashes_from_parsed
 
 logger = logging.getLogger("ameen_workforce.pipeline")
@@ -716,3 +716,105 @@ async def retry_failed_events(
         status = await _send(session, tenant, event, decision["payload"], sender)
         counts["sent" if status == "sent" else "failed"] += 1
     return counts
+
+
+# --- S3-3 test-event verification ---------------------------------------------------------------------------
+
+# How many of the newest shadow events verify_test_event will look through for one that is still sendable.
+VERIFY_CANDIDATE_LIMIT = 10
+
+
+def _verify_error(error: str, **extra: Any) -> Dict[str, Any]:
+    """Error result of verify_test_event: a short machine-readable type, never a message from Meta or a credential."""
+    return {"status": "error", "error": error, **extra}
+
+
+async def verify_test_event(session: Session, tenant: Tenant, sender=capi_sender,
+                            now: Optional[datetime] = None, test_event_code: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Proves a new store's events arrive in Meta Events Manager -> Test Events WITHOUT touching live data or the pipeline.
+
+    Takes the tenant's most recent `shadow` DeliveredPurchase/ConfirmedOrder, rebuilds its payload with the SAME code the
+    live path uses (_decide, with the stored checkout IP/UA and the CURRENT order state) and sends it with the tenant's
+    test code. The code is `test_event_code` if given (a ONE-SHOT replay: nothing is stored on the tenant, so a live
+    tenant's events keep counting as live) else tenants.meta_test_event_code (whose always-on pipeline behavior is
+    unchanged by this function). Hard guarantees:
+      - no test code (neither argument nor stored), dataset id or token -> error result, NO network call;
+      - the CapiEvent row is never modified (it stays `shadow`), no `sent` row is created, and checkout IP/UA is NOT
+        purged (the D-006 purge belongs to a real live send);
+      - on HTTP success tenant.test_event_verified_at = now (committed); on failure it is left untouched.
+    Works in shadow mode (the point) and in live mode. The newest shadow event is tried first; if its order has since
+    been cancelled/refunded, or its event_time is past Meta's limits (LATE_DELIVERY at placed+6.5d, STALE at 7d), the
+    next newest is tried, up to VERIFY_CANDIDATE_LIMIT. If none can be sent the error is `event_too_old` (every candidate
+    was past the window) or `not_eligible`, and nothing is sent.
+
+    Returns {"status": "success", "event_name", "event_id", "event_time", "events_received", "fbtrace_id", "verified_at"}
+    or {"status": "error", "error": <type>, ...}. Error types: no_test_event_code, invalid_test_event_code, no_shadow_event, missing_dataset_id,
+    missing_credential, credential_error, event_too_old, not_eligible, a send exception class name, or meta_api_error
+    (with http_code). Results never contain the access token or Meta's free-text message.
+    """
+    now = now or utcnow()
+    try:
+        code = normalize_test_event_code(test_event_code) or getattr(tenant, "meta_test_event_code", None)
+    except ValueError:
+        return _verify_error("invalid_test_event_code")
+    if not code:
+        return _verify_error("no_test_event_code")
+    if not tenant.meta_dataset_id:
+        return _verify_error("missing_dataset_id")
+
+    candidates = session.scalars(
+        select(CapiEvent).where(
+            CapiEvent.tenant_id == tenant.id,
+            CapiEvent.status == "shadow",
+            CapiEvent.event_name.in_([DELIVERED_EVENT_NAME, CONFIRMED_EVENT_NAME])
+        ).order_by(CapiEvent.id.desc()).limit(VERIFY_CANDIDATE_LIMIT)
+    ).all()
+    if not candidates:
+        return _verify_error("no_shadow_event")
+
+    chosen: Optional[Dict[str, Any]] = None
+    skipped = []
+    for event in candidates:
+        order = session.get(Order, event.order_id)
+        if order is None:
+            continue
+        decision = _decide(session, sender, tenant, order, now, EVENT_TYPES[event.event_name],
+                           event_time=event.event_time, with_context=True)
+        if decision["action"] == "READY_TO_EMIT":
+            chosen = decision
+            break
+        skipped.append(decision["action"])
+    if chosen is None:
+        too_old = bool(skipped) and all(a in ("LATE_DELIVERY", "STALE") for a in skipped)
+        return _verify_error("event_too_old" if too_old else "not_eligible", skipped=skipped)
+
+    payload = dict(chosen["payload"])
+    payload["test_event_code"] = code  # same top-level key build_event_payload sets; covers the one-shot override
+
+    try:
+        token = get_credential(session, tenant.id, META_CAPI_TOKEN_KIND)
+    except CredentialError as e:
+        logger.error("Cannot read Meta token for tenant %s: %s", tenant.id, type(e).__name__)
+        return _verify_error("credential_error")
+    if not token:
+        return _verify_error("missing_credential")
+
+    result = await sender.send_event(pixel_id=tenant.meta_dataset_id, access_token=token, payload=payload)
+    if result.get("status") != "success":
+        error = result.get("error") or "meta_api_error"
+        logger.warning("Test event verification failed for tenant %s: %s", tenant.id, error)
+        return _verify_error(error, http_code=result.get("http_code"))
+
+    tenant.test_event_verified_at = now
+    session.commit()
+    logger.info("Test event verified for tenant %s (%s)", tenant.id, chosen["event_name"])  # the code is never logged
+    return {
+        "status": "success",
+        "event_name": chosen["event_name"],
+        "event_id": chosen["event_id"],
+        "event_time": payload["data"][0]["event_time"],
+        "events_received": result.get("events_received", 1),
+        "fbtrace_id": result.get("fbtrace_id"),
+        "verified_at": now,
+    }
