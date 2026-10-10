@@ -6,8 +6,8 @@ export interface KpiOptions {
   metric: MetricId;
 }
 
-export function KpiWidget({ data, instance, lang }: WidgetProps<KpiOptions>) {
-  const metric = resolveMetric(instance.options.metric, data, lang);
+export function KpiWidget({ data, envelope, instance, lang }: WidgetProps<KpiOptions>) {
+  const metric = resolveMetric(instance.options.metric, data, lang, envelope.currency);
   return (
     <WidgetFrame instance={instance} lang={lang}>
       <div className="kpi">

@@ -63,14 +63,23 @@ uses tokens only and logical properties so RTL mirrors. Override at runtime with
 
 ## Auth model
 
-The browser never reads a key, token or env var. Requests are same-origin (`sameOriginAuth`).
+The portal opens on a sign-in screen with two modes (`src/auth/`):
 
-- Dev (`npm run dev` / `npm run preview`): Vite proxies `/v1` to `MOTAHAI_API_URL`
-  (default `http://127.0.0.1:8000`) and, when `OPERATOR_API_KEY` is set in the shell that starts
-  Vite, adds `Authorization: Bearer ...` server-side in the proxy. The key is not `VITE_`-prefixed
-  and never `define`d, so it cannot reach the bundle:
-  `OPERATOR_API_KEY=... npm run dev`.
-- Served build at `/app`: no proxy adds a key, so stats calls return 401 (shown as "the API proxy has
-  no operator key configured") until per-tenant keys (#43) land. Then swap `sameOriginAuth` for
-  `bearerAuth(getToken)` in `src/api/index.ts` and drop the tenant input in favour of the tenant
-  derived from the key.
+- **Tenant mode** (production): the merchant pastes a tenant API key (`mtk_` + 8 hex + `_` + secret,
+  scope `stats:read`). The format is checked client-side, then `GET /v1/tenant/me` validates it; a 401
+  shows "key not valid" and nothing is stored. On success the key and profile are kept in
+  `sessionStorage` only (gone when the tab closes; never `localStorage`, never logged, never in a
+  URL). Every API call then sends `Authorization: Bearer <key>` (`bearerAuth(() => session.key)`),
+  the tenant comes from the profile (the tenant filter is hidden), and money uses the tenant's
+  `currency` from the stats envelope. Any 401 from a stats call signs out and shows "session expired".
+  The backend answers 404 for another tenant's id and the same 401 for any bad key.
+- **Operator mode** (local dev, "Operator mode (local proxy)"): no browser credential
+  (`sameOriginAuth`); Vite proxies `/v1` to `MOTAHAI_API_URL` (default `http://127.0.0.1:8000`) and,
+  when `OPERATOR_API_KEY` is set in the shell that starts Vite, adds `Authorization: Bearer ...`
+  server-side. A browser-supplied `Authorization` header (tenant mode) is never overwritten. The key
+  is not `VITE_`-prefixed and never `define`d, so it cannot reach the bundle:
+  `OPERATOR_API_KEY=... npm run dev`. The tenant is chosen with the tenant filter. The served build at
+  `/app` has no proxy, so operator mode returns 401 there; use a tenant key.
+
+`ApiProvider` (`src/dashboard/ApiContext.tsx`) builds the app-wide client from the session; tests can
+inject `fetchImpl` via `<App fetchImpl={...} />`.

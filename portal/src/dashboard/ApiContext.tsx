@@ -1,10 +1,30 @@
-import { createContext, useContext } from 'react';
+import { createContext, useContext, useMemo, type ReactNode } from 'react';
 import { statsClient } from '../api';
-import type { StatsClient } from '../api/client';
+import { bearerAuth, sameOriginAuth } from '../api/auth';
+import { createStatsClient, type StatsClient } from '../api/client';
+import { useSession } from '../auth/SessionContext';
 
-/** Lets tests (and later the app) inject a different client, e.g. one with a fake fetch. */
+/** Lets tests inject a different client, e.g. one with a fake fetch. <ApiProvider> overrides it from the session. */
 export const ApiContext = createContext<StatsClient>(statsClient);
 
 export function useStatsClient(): StatsClient {
   return useContext(ApiContext);
+}
+
+/**
+ * Builds the app-wide client from the session: `bearerAuth(() => session.key)` in tenant mode, `sameOriginAuth`
+ * (the dev proxy adds the operator key) in operator mode.
+ */
+export function ApiProvider({ children, fetchImpl }: { children: ReactNode; fetchImpl?: typeof fetch }) {
+  const { session } = useSession();
+  const key = session?.mode === 'tenant' ? session.key : null;
+  const client = useMemo(
+    () =>
+      createStatsClient({
+        auth: key === null ? sameOriginAuth : bearerAuth(() => key),
+        fetchImpl,
+      }),
+    [key, fetchImpl],
+  );
+  return <ApiContext.Provider value={client}>{children}</ApiContext.Provider>;
 }

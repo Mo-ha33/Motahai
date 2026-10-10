@@ -7,6 +7,9 @@ import {
   type Lang,
 } from './i18n';
 import { defaultDashboard, type DashboardConfig } from './config/dashboard';
+import { ApiProvider } from './dashboard/ApiContext';
+import { SessionProvider, useSession } from './auth/SessionContext';
+import { SignIn } from './auth/SignIn';
 import { DashboardPage } from './dashboard/DashboardPage';
 import { FiltersProvider } from './filters/FiltersContext';
 import {
@@ -18,7 +21,25 @@ import {
 } from './theme';
 import { hrefFor, ROUTES, useHashRoute, type Route } from './router';
 
-export default function App({ config = defaultDashboard }: { config?: DashboardConfig }) {
+export default function App({
+  config = defaultDashboard,
+  fetchImpl,
+}: {
+  config?: DashboardConfig;
+  /** Tests inject a fake fetch; the app uses the global one. */
+  fetchImpl?: typeof fetch;
+}) {
+  return (
+    <SessionProvider fetchImpl={fetchImpl}>
+      <ApiProvider fetchImpl={fetchImpl}>
+        <Shell config={config} />
+      </ApiProvider>
+    </SessionProvider>
+  );
+}
+
+function Shell({ config }: { config: DashboardConfig }) {
+  const { session, signOut } = useSession();
   const [lang, setLang] = useState<Lang>(() => readStoredLang());
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredThemeMode());
   const route = useHashRoute('signal');
@@ -39,12 +60,23 @@ export default function App({ config = defaultDashboard }: { config?: DashboardC
   const page = route ? config.pages[route] : undefined;
   const pageTitle = route ? t.pages[route].title : t.productName;
 
+  const identity =
+    session?.mode === 'tenant' ? session.profile.name : session ? t.auth.operator : null;
+
   return (
     <FiltersProvider>
     <div className="app">
       <header className="app-header">
         <span className="brand">{t.productName}</span>
         <div className="header-actions">
+        {identity !== null ? (
+          <>
+            <span className="session-identity">{identity}</span>
+            <button type="button" className="lang-toggle" onClick={() => signOut()}>
+              {t.auth.signOut}
+            </button>
+          </>
+        ) : null}
         <button
           type="button"
           className="lang-toggle"
@@ -64,6 +96,9 @@ export default function App({ config = defaultDashboard }: { config?: DashboardC
         </div>
       </header>
 
+      {session === null ? (
+        <SignIn lang={lang} />
+      ) : (
       <div className="app-body">
         <nav className="sidebar" aria-label={t.productName}>
           <ul>
@@ -90,6 +125,7 @@ export default function App({ config = defaultDashboard }: { config?: DashboardC
           )}
         </main>
       </div>
+      )}
     </div>
     </FiltersProvider>
   );

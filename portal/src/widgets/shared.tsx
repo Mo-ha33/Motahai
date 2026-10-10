@@ -32,7 +32,12 @@ export interface ResolvedMetric {
   text: string;
 }
 
-export function resolveMetric(id: MetricId, data: StatsSummaryData, lang: Lang): ResolvedMetric {
+export function resolveMetric(
+  id: MetricId,
+  data: StatsSummaryData,
+  lang: Lang,
+  currency?: string,
+): ResolvedMetric {
   const t = dictionaries[lang];
   const def = getMetric(id);
   const value = def.select(data);
@@ -41,7 +46,7 @@ export function resolveMetric(id: MetricId, data: StatsSummaryData, lang: Lang):
     label: t.metrics[def.labelKey],
     hint: def.hintKey ? t.metricHints[def.hintKey] : undefined,
     value,
-    text: formatMetric(value, def.format, lang),
+    text: formatMetric(value, def.format, lang, currency),
   };
 }
 

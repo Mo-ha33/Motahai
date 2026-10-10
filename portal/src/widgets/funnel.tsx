@@ -8,9 +8,9 @@ export interface FunnelOptions {
   steps: MetricId[];
 }
 
-export function FunnelWidget({ data, instance, lang }: WidgetProps<FunnelOptions>) {
+export function FunnelWidget({ data, envelope, instance, lang }: WidgetProps<FunnelOptions>) {
   const t = dictionaries[lang];
-  const steps = instance.options.steps.map((id) => ({ id, metric: resolveMetric(id, data, lang) }));
+  const steps = instance.options.steps.map((id) => ({ id, metric: resolveMetric(id, data, lang, envelope.currency) }));
   const first = steps[0]?.metric.value ?? 0;
   return (
     <WidgetFrame instance={instance} lang={lang}>

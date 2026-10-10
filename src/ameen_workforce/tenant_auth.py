@@ -7,6 +7,10 @@ Key format: `mtk_<prefix>_<secret>`; prefix = 8 hex chars (lookup/display), secr
 
 require_tenant_key(scope) is a FastAPI dependency returning the Tenant. Every failure (missing/malformed/unknown/wrong/
 revoked/missing scope/inactive tenant) is the same 401 body, so responses are not an oracle for key existence.
+
+require_operator_or_tenant_key(scope) accepts either credential on one route: a bearer token starting with `mtk_` is
+authenticated as a tenant key (uniform 401 on failure, never falling back to the operator key); anything else goes
+through auth.require_operator unchanged. It returns the Tenant, or None for the operator.
 """
 
 import hashlib
@@ -19,6 +23,7 @@ from fastapi import Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from .auth import require_operator
 from .db import Tenant, TenantApiKey, utcnow
 from .webhook_routes import get_session_factory_dep
 
@@ -107,3 +112,22 @@ def ensure_tenant_matches(tenant: Tenant, url_tenant_id: int) -> None:
     """For routes with a tenant in the URL: a key may only act on its own tenant. Mismatch -> 404 (no existence leak)."""
     if tenant.id != url_tenant_id:
         raise HTTPException(status_code=404, detail="Not found")
+
+
+def require_operator_or_tenant_key(scope: str = DEFAULT_SCOPES) -> Callable[..., Optional[Tenant]]:
+    """Dependency factory: Tenant for a valid `mtk_` key holding `scope`; None for the operator key; else 401/503-as-before."""
+    def dependency(authorization: Optional[str] = Header(None),
+                   factory: sessionmaker = Depends(get_session_factory_dep)) -> Optional[Tenant]:
+        presented = ""
+        if authorization and authorization.lower().startswith("bearer "):
+            presented = authorization[7:].strip()
+        if presented.startswith(KEY_TAG):
+            with factory() as session:
+                tenant = authenticate_key(session, presented, scope)
+                if tenant is None:
+                    raise _unauthorized()
+                session.expunge(tenant)
+                return tenant
+        require_operator(authorization)
+        return None
+    return dependency

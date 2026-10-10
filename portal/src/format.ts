@@ -10,8 +10,13 @@ export function localeFor(lang: Lang): string {
   return LOCALES[lang];
 }
 
-/** Formats a metric value. `null` (undefined ratio) renders as an em dash. The API has no currency, so money is a plain number. */
-export function formatMetric(value: number | null, format: MetricFormat, lang: Lang): string {
+/** Formats a metric value. `null` (undefined ratio) renders as an em dash. Money uses the envelope's ISO 4217 `currency` when given and valid, else a plain number. */
+export function formatMetric(
+  value: number | null,
+  format: MetricFormat,
+  lang: Lang,
+  currency?: string,
+): string {
   if (value === null || !Number.isFinite(value)) return NO_VALUE;
   const locale = localeFor(lang);
   switch (format) {
@@ -24,10 +29,7 @@ export function formatMetric(value: number | null, format: MetricFormat, lang: L
         maximumFractionDigits: 1,
       }).format(value);
     case 'money':
-      return new Intl.NumberFormat(locale, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      }).format(value);
+      return formatMoney(value, locale, currency);
     case 'ratio':
       return `×${new Intl.NumberFormat(locale, {
         minimumFractionDigits: 2,
@@ -44,4 +46,16 @@ export function formatDate(iso: string, lang: Lang): string {
     dateStyle: 'medium',
     timeZone: 'UTC',
   }).format(date);
+}
+
+function formatMoney(value: number, locale: string, currency?: string): string {
+  const digits = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+  if (currency) {
+    try {
+      return new Intl.NumberFormat(locale, { style: 'currency', currency, ...digits }).format(value);
+    } catch {
+      // Not a valid ISO 4217 code: fall through to the plain number.
+    }
+  }
+  return new Intl.NumberFormat(locale, digits).format(value);
 }

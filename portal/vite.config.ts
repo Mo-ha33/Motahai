@@ -15,10 +15,16 @@ const apiProxy = {
   '/v1': {
     target: apiTarget,
     changeOrigin: true,
-    configure: (proxy: { on(event: 'proxyReq', cb: (req: { setHeader(k: string, v: string): void }) => void): void }) => {
+    configure: (proxy: {
+      on(
+        event: 'proxyReq',
+        cb: (req: { getHeader(k: string): unknown; setHeader(k: string, v: string): void }) => void,
+      ): void;
+    }) => {
       proxy.on('proxyReq', (proxyReq) => {
         const key = process.env.OPERATOR_API_KEY;
-        if (key) proxyReq.setHeader('Authorization', `Bearer ${key}`);
+        // A browser-supplied tenant key (Authorization header) always wins over the operator key.
+        if (key && !proxyReq.getHeader('authorization')) proxyReq.setHeader('Authorization', `Bearer ${key}`);
       });
     },
   },

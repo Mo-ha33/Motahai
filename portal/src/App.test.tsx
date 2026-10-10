@@ -2,9 +2,19 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import App from './App';
 
+/** Past the sign-in screen, in operator mode (the pre-sign-in behaviour). */
+function renderOperator() {
+  const view = render(<App />);
+  // The operator choice is kept in sessionStorage, so a re-render in the same test may already be past sign-in.
+  const button = screen.queryByRole('button', { name: /وضع المشغّل/ });
+  if (button) fireEvent.click(button);
+  return view;
+}
+
 describe('App shell', () => {
   beforeEach(() => {
     window.localStorage.clear();
+    window.sessionStorage.clear();
     window.location.hash = '';
     document.documentElement.lang = '';
     document.documentElement.dir = '';
@@ -16,7 +26,7 @@ describe('App shell', () => {
   });
 
   it('renders Arabic by default with an RTL document', () => {
-    render(<App />);
+    renderOperator();
 
     expect(document.documentElement.dir).toBe('rtl');
     expect(document.documentElement.lang).toBe('ar');
@@ -25,7 +35,7 @@ describe('App shell', () => {
   });
 
   it('toggles to English and flips the document direction', () => {
-    render(<App />);
+    renderOperator();
 
     fireEvent.click(screen.getByRole('button', { name: 'English' }));
 
@@ -48,19 +58,19 @@ describe('App shell', () => {
 
   it('prompts for a tenant on dashboard pages instead of calling the API', () => {
     window.location.hash = '#/roas';
-    render(<App />);
+    renderOperator();
     expect(screen.getByText('اختر متجرًا')).toBeTruthy();
   });
 
   it('shows the empty state for a known route and not-found for an unknown one', () => {
     window.location.hash = '#/audiences';
-    const { unmount } = render(<App />);
+    const { unmount } = renderOperator();
     expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('الجماهير');
     expect(screen.getByText('لا توجد بيانات بعد')).toBeTruthy();
     unmount();
 
     window.location.hash = '#/nope';
-    render(<App />);
+    renderOperator();
     expect(screen.getByText('الصفحة غير موجودة')).toBeTruthy();
   });
 });
