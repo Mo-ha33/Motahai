@@ -1,11 +1,16 @@
 # 04. Tier 3: "The Full Autonomous Department" (باقة القسم المؤتمت بالكامل — 8 AI Employees)
 
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
+
 ## 1. Overview & Vision
 - **Tier Name:** The Full Autonomous Department (`باقة القسم المؤتمت بالكامل`)
 - **Assigned Workforce:** The Complete 8-Agent Swarm supervised by **Hermes**:
   1. `Lead GTM Orchestrator` (`LO`) — Chief Supervisor & Client SLA Manager.
   2. `DataLayer Architect` (`DA`) — E-commerce Taxonomy & PDPL/GDPR Data Governance.
-  3. `Pixel & CAPI Specialist` (`PC`) — Omnichannel Server-Side Attribution (Meta, Google, TikTok, Snap).
+  3. `Pixel & CAPI Specialist` (`PC`) — Server-side Meta CAPI COD signal ladder (Google, TikTok and Snap senders _Not built_).
   4. `QA Network Sniffer` (`QS`) — Real-Time Chrome DevTools & Beacon Traffic Interception.
   5. `Auto-Fix Engineer` (`AF`) — Autonomous Container Sanitation & Code Deployment.
   6. `Growth BI Analyst` (`BI`) — GA4 BigQuery Modeling, ROAS & Funnel Drop-off Intelligence.

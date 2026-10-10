@@ -81,6 +81,7 @@ from src.ameen_workforce.credentials import (
     FERNET_KEY_ENV, CredentialConfigError, encrypt_value, generate_key, store_credential
 )
 from src.ameen_workforce.config import settings
+from src.ameen_workforce.webhook_signatures import BOSTA_MIN_SECRET_LENGTH
 from src.ameen_workforce.db import (
     PLATFORMS, TENANT_MODES, Tenant, create_tenant, get_session_factory, get_tenant_by_shop_domain, init_db,
     normalize_test_event_code, session_scope, set_meta_test_event_code
@@ -524,6 +525,10 @@ def validate_cli_args(args: argparse.Namespace) -> Optional[str]:
     for flag, value in (("--bosta-webhook-secret", args.bosta_webhook_secret), ("--oto-webhook-secret", args.oto_webhook_secret)):
         if value is not None and not value.strip():
             return f"{flag} must not be empty"
+    bosta = args.bosta_webhook_secret
+    if bosta is not None and len(bosta.strip()) < BOSTA_MIN_SECRET_LENGTH:
+        return (f"--bosta-webhook-secret must be at least {BOSTA_MIN_SECRET_LENGTH} characters: Bosta sends it back as "
+                "a static header, so it must be unguessable. Use --generate-courier-secrets for a strong one.")
     return None
 
 

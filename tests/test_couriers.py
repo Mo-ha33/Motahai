@@ -545,7 +545,9 @@ def two_oto_tenants(db_session, fernet_key):
     return a, b
 
 
-def oto_payload(order_id, secret, status="delivered", timestamp="2026-10-10T01:00:00Z"):
+def oto_payload(order_id, secret, status="delivered", timestamp=None):
+    if timestamp is None:  # signed timestamps must be fresh (OTO replay window)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     msg = f"{order_id}:{status}:{timestamp}".encode("utf-8")
     sig = base64.b64encode(hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).digest()).decode("ascii")
     return {"orderId": order_id, "status": status, "timestamp": timestamp, "signature": sig}
