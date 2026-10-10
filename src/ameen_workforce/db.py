@@ -317,6 +317,9 @@ class StagedWebhook(Base):
     platform: Mapped[str] = mapped_column(String(32))
     topic: Mapped[str] = mapped_column(String(64))
     delivery_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Platform order reference (order id / courier business reference), not PII. Kept on dead letters so an operator
+    # can reconcile the missing update with the merchant after the payload is wiped.
+    order_ref: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
     payload_ciphertext: Mapped[str] = mapped_column(Text)
     received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     next_attempt_at: Mapped[datetime] = mapped_column(UTCDateTime)

@@ -16,7 +16,9 @@ Replays are safe: process_webhook skips a delivery already processed (webhook_de
 UNIQUE per (tenant, event_id), so at worst a replay re-derives a decision that is already recorded.
 
 After MAX_ATTEMPTS failures the row becomes status "dead": its ciphertext is wiped (no PII kept) and an `incidents`
-row (kind webhook_dead_letter) tells the operator. Encrypted payloads therefore live at most until processed, or
+row (kind webhook_dead_letter) tells the operator. The dead row and the incident keep the non-sensitive metadata needed
+to reconcile by hand: tenant, platform, topic, delivery id, platform order reference (order_ref), received time,
+attempts and the last error type. Encrypted payloads therefore live at most until processed, or
 about BACKOFF total (~10 h) for a webhook that keeps failing.
 
 Privacy: payloads are only ever stored encrypted; logs carry ids, platform, topic and exception TYPE names only.
@@ -46,6 +48,35 @@ DEFAULT_REPLAY_LIMIT = 200
 DEAD_LETTER_INCIDENT = "webhook_dead_letter"
 
 
+def order_ref_from_payload(platform: str, payload: Any) -> Optional[str]:
+    """
+    Best-effort platform order reference for dead-letter reconciliation (never PII): Shopify order `id` (or
+    `order_id` on fulfillment topics), Salla `data.id` / `data.reference_id`, Bosta `businessReference`, OTO
+    `orderId`. Courier fields may sit under `data`/`delivery`. Returns None when nothing usable is present.
+    """
+    if not isinstance(payload, dict):
+        return None
+    candidates: list = []
+    nested = [payload.get(k) for k in ("data", "delivery") if isinstance(payload.get(k), dict)]
+    if platform == "shopify":
+        candidates = [payload.get("order_id"), payload.get("id")]
+    elif platform == "salla":
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        candidates = [data.get("id"), data.get("reference_id")]
+    elif platform == "bosta":
+        for src in [payload] + nested:
+            candidates += [src.get("businessReference"), src.get("trackingNumber")]
+    elif platform == "oto":
+        for src in [payload] + nested:
+            candidates += [src.get("orderId"), src.get("order_id"), src.get("reference_id")]
+    for value in candidates:
+        if isinstance(value, bool) or value in (None, ""):
+            continue
+        if isinstance(value, (str, int)):
+            return str(value)[:128]
+    return None
+
+
 def stage_webhook(
     session: Session, tenant_id: int, platform: str, topic: str, payload: Dict[str, Any],
     delivery_id: Optional[str], now: Optional[datetime] = None
@@ -54,7 +85,7 @@ def stage_webhook(
     now = now or utcnow()
     row = StagedWebhook(
         tenant_id=tenant_id, platform=platform, topic=(topic or "unknown")[:64],
-        delivery_id=delivery_id[:128] if delivery_id else None,
+        delivery_id=delivery_id[:128] if delivery_id else None, order_ref=order_ref_from_payload(platform, payload),
         payload_ciphertext=encrypt_value(json.dumps(payload, separators=(",", ":"))),
         received_at=now, next_attempt_at=now + STAGE_GRACE, attempts=0, status="pending"
     )
@@ -70,7 +101,10 @@ def _record_failure(session: Session, row: StagedWebhook, error_type: str, now: 
         row.status = "dead"
         row.payload_ciphertext = ""  # dead letters keep no PII
         session.add(Incident(tenant_id=row.tenant_id, kind=DEAD_LETTER_INCIDENT, severity="error",
-                             detail=f"{row.platform}/{row.topic}: {error_type} after {row.attempts} attempts"))
+                             detail=(f"{row.platform}/{row.topic} order_ref={row.order_ref or 'unknown'} "
+                                     f"delivery_id={row.delivery_id or '-'} staged_id={row.id} "
+                                     f"received_at={row.received_at.isoformat()}: {error_type} after "
+                                     f"{row.attempts} attempts")))
         logger.error("Staged webhook %s dead after %s attempts (%s)", row.id, row.attempts, error_type)
     else:
         row.next_attempt_at = now + BACKOFF[row.attempts - 1]

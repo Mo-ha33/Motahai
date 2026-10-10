@@ -24,7 +24,7 @@ from src.ameen_workforce.webhook_signatures import (
     BOSTA_MIN_SECRET_LENGTH, oto_timestamp_is_fresh, verify_bosta_auth
 )
 from src.ameen_workforce.webhook_staging import (
-    BACKOFF, MAX_ATTEMPTS, STAGE_GRACE, process_staged, replay_staged_webhooks, stage_webhook
+    BACKOFF, MAX_ATTEMPTS, STAGE_GRACE, order_ref_from_payload, process_staged, replay_staged_webhooks, stage_webhook
 )
 from tests.test_couriers import BOSTA_SECRET, OTO_SECRET, make_pending_order
 from tests.test_webhook_routes import (
@@ -177,10 +177,27 @@ async def test_repeated_failures_end_as_dead_letter_without_pii(db_session, fact
                 assert row.status == "pending" and row.next_attempt_at == now + BACKOFF[attempt - 1]
     row = rows(factory, StagedWebhook)[0]
     assert row.status == "dead" and row.payload_ciphertext == ""
+    # metadata for manual reconciliation survives the wipe
+    assert (row.tenant_id, row.platform, row.order_ref, row.delivery_id) == (live_tenant.id, "shopify", "987654321",
+                                                                             "wh-dead")
+    assert row.last_error_type == "ValueError" and row.received_at is not None
     incident = rows(factory, Incident)[0]
-    assert incident.kind == "webhook_dead_letter" and EMAIL not in incident.detail
+    assert incident.kind == "webhook_dead_letter" and incident.tenant_id == live_tenant.id
+    assert "order_ref=987654321" in incident.detail and "delivery_id=wh-dead" in incident.detail
+    assert "ValueError" in incident.detail and EMAIL not in incident.detail and PHONE not in incident.detail
     with factory() as s:  # dead rows are never replayed
         assert (await replay_staged_webhooks(s, now=now + timedelta(days=1)))["due"] == 0
+
+
+def test_order_ref_from_payload_per_platform():
+    assert order_ref_from_payload("shopify", {"id": 123, "email": EMAIL}) == "123"
+    assert order_ref_from_payload("shopify", {"id": 9, "order_id": 456}) == "456"  # fulfillment topics
+    assert order_ref_from_payload("salla", {"data": {"id": 77, "customer": {"email": EMAIL}}}) == "77"
+    assert order_ref_from_payload("bosta", {"data": {"businessReference": "ORD-1", "trackingNumber": "T"}}) == "ORD-1"
+    assert order_ref_from_payload("bosta", {"trackingNumber": "T-only"}) == "T-only"
+    assert order_ref_from_payload("oto", {"orderId": "O-9", "status": "delivered"}) == "O-9"
+    assert order_ref_from_payload("oto", {"status": "delivered"}) is None
+    assert order_ref_from_payload("shopify", ["not", "a", "dict"]) is None
 
 
 # --- courier dedupe -------------------------------------------------------------------------------------------
