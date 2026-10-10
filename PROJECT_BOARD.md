@@ -71,7 +71,7 @@
 | M2-6 | SMSA courier webhook (KSA) — [#40](https://github.com/Mo-ha33/Motahai/issues/40) | Haiku 5.5 | P2 | BACKLOG | phase-2, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
 | M3-1 | Tenant stats API on the digest.py named queries — [#41](https://github.com/Mo-ha33/Motahai/issues/41) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, feature, owner:other-thread | Repo audit thread, draft PR #68; 661 passed. Moves require_operator to auth.py; conflicts with #67 (operator_routes.py). (updated 2026-10-10) |
 | M3-2 | Tracking health score — [#42](https://github.com/Mo-ha33/Motahai/issues/42) | Sonnet 5.5 | P1 | BACKLOG | phase-3, backend, feature | Depends on: M3-1. (updated 2026-10-10) |
-| M3-3 | Tenant API auth: scoped API keys — [#43](https://github.com/Mo-ha33/Motahai/issues/43) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, backend, security, feature | Wave 2 dispatched 2026-10-10. (updated 2026-10-10) |
+| M3-3 | Tenant API auth: scoped API keys — [#43](https://github.com/Mo-ha33/Motahai/issues/43) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, security, feature | Draft PR #73; SHA-256 hashed keys, uniform 401, cross-tenant 404; Opus reviewed; 654 passed. (updated 2026-10-10) |
 | M3-4 | Operator endpoint and weekly schedule for audience export — [#44](https://github.com/Mo-ha33/Motahai/issues/44) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, feature | Draft PR #67 with M2-2; weekly export job, rolling 7-day gate. (updated 2026-10-10) |
 | M3-5 | Hermes MCP read tool get_cod_stats — [#45](https://github.com/Mo-ha33/Motahai/issues/45) | Sonnet 5.5 | P1 | BACKLOG | phase-3, hermes, feature | Depends on: M3-1. (updated 2026-10-10) |
 | M3-6 | Onboarding flow (TASK-011) — [#46](https://github.com/Mo-ha33/Motahai/issues/46) | Sonnet 5.5 | P1 | BACKLOG | phase-3, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
@@ -94,6 +94,7 @@
 | M6-6 | Billing and subscriptions — [#63](https://github.com/Mo-ha33/Motahai/issues/63) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
 | B-1 | Board automation: set Project #3 status from Actions — [#64](https://github.com/Mo-ha33/Motahai/issues/64) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | In PR #27 (6fb20c6); 18 unit tests, full suite 662 passed. Live run needs #27 on main. (updated 2026-10-10) |
 | B-2 | CI: run pytest and the portal build on every PR — [#71](https://github.com/Mo-ha33/Motahai/issues/71) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | Draft PR #72; Python 3.12 + portal job; Opus reviewed. (updated 2026-10-10) |
+| S-1 | Require authentication on /tasks and /escalations routes — [#74](https://github.com/Mo-ha33/Motahai/issues/74) | Sonnet 5.5 | P0 | IN_PROGRESS | phase-1, security, backend, bug | Found by the VPS deploy-plan thread; nginx IP allowlist is the interim guard. Dispatched 2026-10-10. (updated 2026-10-10) |
 
 ---
 
