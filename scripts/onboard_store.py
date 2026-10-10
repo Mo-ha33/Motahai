@@ -83,8 +83,8 @@ from src.ameen_workforce.credentials import (
 from src.ameen_workforce.config import settings
 from src.ameen_workforce.webhook_signatures import BOSTA_MIN_SECRET_LENGTH
 from src.ameen_workforce.db import (
-    PLATFORMS, TENANT_MODES, Tenant, create_tenant, get_session_factory,
-    get_tenant_by_shop_domain, init_db, session_scope
+    PLATFORMS, TENANT_MODES, Tenant, create_tenant, get_session_factory, get_tenant_by_shop_domain, init_db,
+    normalize_test_event_code, session_scope, set_meta_test_event_code
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -152,10 +152,13 @@ def onboard_store(
     settlement_hours: Optional[float] = 12.0,
     storefront_url: Optional[str] = None,
     dry_run: bool = False,
+    pipeline_test_event_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Core onboarding engine: validates input, registers/updates the tenant,
     and stores Fernet-encrypted credentials.
+    pipeline_test_event_code: None leaves the tenant's Meta test_event_code unchanged; "" clears it; any other value
+    routes every pipeline CAPI send for this tenant to Events Manager's Test Events (db.set_meta_test_event_code).
     """
     platform_norm = platform.strip().lower()
     if platform_norm not in PLATFORMS:
@@ -183,6 +186,9 @@ def onboard_store(
     storefront_url_clean = storefront_url.strip() if storefront_url else None
     if storefront_url_clean and not storefront_url_clean.lower().startswith(("http://", "https://")):
         raise ValueError("storefront_url must start with http:// or https://")
+
+    if pipeline_test_event_code is not None:
+        normalize_test_event_code(pipeline_test_event_code)  # validate before any write (also in dry runs)
 
     # Platform-specific sensible defaults
     if platform_norm == "salla":
@@ -253,6 +259,8 @@ def onboard_store(
     store_credential(session, tenant.id, "meta_capi_token", meta_capi_token_norm)
     if webhook_secret and webhook_secret.strip():
         store_credential(session, tenant.id, "webhook_secret", webhook_secret.strip())
+    if pipeline_test_event_code is not None:
+        set_meta_test_event_code(session, tenant, pipeline_test_event_code)
 
     return {
         "status": "success",
@@ -268,6 +276,7 @@ def onboard_store(
         "mode": tenant.mode,
         "settlement_hours": tenant.settlement_hours,
         "storefront_url": tenant.storefront_url,
+        "pipeline_test_event_code": tenant.meta_test_event_code,
         "credentials": {
             "meta_capi_token": "configured (Fernet-encrypted)",
             "webhook_secret": "configured (Fernet-encrypted)" if webhook_secret else "not provided"
@@ -487,6 +496,10 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-ping", action="store_true", help="Skip the Meta connection ping even if --verify-capi-ping is set")
     parser.add_argument("--test-event-code", default=None,
                         help="Meta test event code (e.g. TEST12345). Required by --verify-capi-ping; keeps the ping out of live data.")
+    parser.add_argument("--pipeline-test-event-code", default=None, metavar="CODE",
+                        help="Send ALL of this tenant's pipeline CAPI events with this Meta test event code, so they show in "
+                             "Test Events. Test sends use up each order's one-time send claim: use on a test dataset or "
+                             "before launch. Pass an empty string ('') to clear it.")
     parser.add_argument("--bosta-webhook-secret", default=None,
                         help="Bosta webhook secret (stored encrypted; use '-' for a hidden prompt)")
     parser.add_argument("--oto-webhook-secret", default=None,
@@ -572,7 +585,8 @@ def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
                 mode=args.mode,
                 settlement_hours=args.settlement_hours,
                 storefront_url=args.storefront_url,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                pipeline_test_event_code=args.pipeline_test_event_code,
             )
             if args.dry_run:
                 if courier_flags_given:
@@ -620,6 +634,8 @@ def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
             print(f"  Settlement Window:{onboard_result.get('settlement_hours')} hours")
             if onboard_result.get("storefront_url"):
                 print(f"  Storefront URL:   {onboard_result.get('storefront_url')}")
+            if onboard_result.get("pipeline_test_event_code"):
+                print(f"  Test Event Code:  {onboard_result.get('pipeline_test_event_code')} (pipeline sends go to Test Events)")
             print("  Credentials:")
             print(f"    * Meta CAPI Token: {onboard_result['credentials']['meta_capi_token']}")
             print(f"    * Webhook Secret:  {onboard_result['credentials']['webhook_secret']}")

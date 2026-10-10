@@ -14,11 +14,13 @@ All timestamps are timezone-aware UTC. SQLite drops tzinfo on read, so UTCDateTi
 Schema is created with create_all() for now. NOTE: create_all() never ALTERs an existing table, so the S2 columns
 (orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
 storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source, S1-4 tenants.digest_email +
-tenants.language) and the new checkout_context and staged_webhooks tables need an Alembic migration before any non-empty database is upgraded.
+tenants.language, tenants.meta_test_event_code) and the new checkout_context and staged_webhooks tables need an Alembic
+migration before any non-empty database is upgraded.
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
 import os
+import re
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Iterator, Optional
@@ -97,6 +99,10 @@ class Tenant(Base):
     # S1-4: weekly Signal Hygiene digest recipient (NULL = no digest) and its language ('ar' default, or 'en').
     digest_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     language: Mapped[str] = mapped_column(String(8), default="ar")
+    # Meta Events Manager test code. When set, every pipeline CAPI send for this tenant carries `test_event_code`, so a
+    # live tenant's events show in Test Events. Test sends still consume the (tenant, order, event) idempotency claim,
+    # so use it on a test dataset or before launch, then clear it. NULL = normal sends. Set via set_meta_test_event_code.
+    meta_test_event_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:
@@ -430,6 +436,24 @@ def get_tenant_by_shop_domain(session: Session, shop_domain: str) -> Optional[Te
     "1234567"), because Salla webhook payloads identify the store by the top-level `merchant` field, not a domain.
     """
     return session.scalar(select(Tenant).where(Tenant.shop_domain == _norm_domain(shop_domain)))
+
+
+_TEST_EVENT_CODE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def normalize_test_event_code(code: Optional[str]) -> Optional[str]:
+    """Trimmed Meta test_event_code, None for None/blank; raises ValueError for anything that is not a plain code."""
+    cleaned = code.strip() if code else None
+    if cleaned and not _TEST_EVENT_CODE.match(cleaned):
+        raise ValueError("test_event_code must be 1-64 letters, digits, '_' or '-' (e.g. TEST12345)")
+    return cleaned or None
+
+
+def set_meta_test_event_code(session: Session, tenant: Tenant, code: Optional[str]) -> Optional[str]:
+    """Sets (or with None/blank clears) the tenant's Meta test_event_code and commits. Returns the stored value."""
+    tenant.meta_test_event_code = normalize_test_event_code(code)
+    session.commit()
+    return tenant.meta_test_event_code
 
 
 def create_tenant(
