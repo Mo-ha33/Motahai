@@ -43,3 +43,6 @@ screenshots/
 Thumbs.db
 .claude/
 .antigravity/
+
+# generated exports (audience CSVs etc.)
+out/

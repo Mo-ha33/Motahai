@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException, Request, Response, status, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 from .config import settings
@@ -26,8 +28,11 @@ from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
+from .operator_routes import router as operator_router
 from .tenant_key_routes import router as tenant_key_router
 from .onboarding_routes import router as onboarding_router
+from .stats_routes import router as stats_router
+from .auth import require_operator, require_hermes  # noqa: F401  (defined in auth.py; re-exported for routes + tests)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
 logger = logging.getLogger("ameen_workforce.service")
@@ -62,8 +67,10 @@ app = FastAPI(
 )
 app.include_router(webhook_router)
 app.include_router(capture_router)
+app.include_router(operator_router)
 app.include_router(tenant_key_router)
 app.include_router(onboarding_router)
+app.include_router(stats_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [
@@ -81,6 +88,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# Merchant portal (built by `npm run build` in portal/). Served only when the build exists.
+_PORTAL_DIST = Path(__file__).resolve().parents[2] / "portal" / "dist"
+if _PORTAL_DIST.is_dir():
+    app.mount("/app", StaticFiles(directory=_PORTAL_DIST, html=True), name="portal")
 
 # -----------------------------------------------------------------------------
 # Request & Response Schemas
@@ -103,27 +115,6 @@ class ResolveEscalationRequest(BaseModel):
 class GtmPublishApprovalRequest(BaseModel):
     container_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
     workspace_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
-
-def require_operator(authorization: Optional[str] = Header(None)) -> None:
-    """
-    Authenticates a HUMAN operator for Rule D-003 approvals via env OPERATOR_API_KEY.
-    This key is deliberately separate from HERMES_API_KEY / any agent or webhook credential:
-    an agent that can call the tools must never be able to mint its own approval.
-    Used as a dependency so authentication runs before request-body validation.
-    Fails closed: if OPERATOR_API_KEY is unset (or equals HERMES_API_KEY) nobody is authenticated.
-    """
-    operator_key = os.environ.get("OPERATOR_API_KEY", "")
-    if not operator_key:
-        logger.error("OPERATOR_API_KEY is not configured; refusing all approval requests")
-        raise HTTPException(status_code=401, detail="Operator authentication required")
-    if settings.HERMES_API_KEY and hmac.compare_digest(operator_key.encode(), settings.HERMES_API_KEY.encode()):
-        logger.error("OPERATOR_API_KEY must differ from HERMES_API_KEY; refusing all approval requests")
-        raise HTTPException(status_code=401, detail="Operator authentication required")
-    presented = ""
-    if authorization and authorization.lower().startswith("bearer "):
-        presented = authorization[7:].strip()
-    if not presented or not hmac.compare_digest(presented.encode(), operator_key.encode()):
-        raise HTTPException(status_code=401, detail="Operator authentication required", headers={"WWW-Authenticate": "Bearer"})
 
 # -----------------------------------------------------------------------------
 # Endpoints
@@ -151,7 +142,7 @@ async def root():
     }
 
 @app.post("/tasks", response_model=TaskItem)
-async def create_and_run_task(req: CreateTaskRequest):
+async def create_and_run_task(req: CreateTaskRequest, _operator: None = Depends(require_operator)):
     """Creates and initiates execution of an AI Employee task."""
     task = workforce_engine.create_task(
         title=req.title,
@@ -167,18 +158,18 @@ async def create_and_run_task(req: CreateTaskRequest):
     return executed_task
 
 @app.get("/tasks/{task_id}", response_model=TaskItem)
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, _operator: None = Depends(require_operator)):
     if task_id not in workforce_engine.tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     return workforce_engine.tasks[task_id]
 
 @app.get("/escalations", response_model=List[EscalationNotice])
-async def list_pending_escalations():
+async def list_pending_escalations(_operator: None = Depends(require_operator)):
     """Supervisor view: Lists all tasks halted pending human review."""
     return hitl_manager.get_pending_escalations()
 
 @app.post("/escalations/{escalation_id}/resolve")
-async def resolve_escalation(escalation_id: str, req: ResolveEscalationRequest):
+async def resolve_escalation(escalation_id: str, req: ResolveEscalationRequest, _operator: None = Depends(require_operator)):
     """Supervisor action: Approve or reject halted task."""
     resolved = hitl_manager.resolve_escalation(
         escalation_id=escalation_id,
@@ -231,7 +222,7 @@ async def approve_gtm_publish(req: GtmPublishApprovalRequest, _operator: None = 
     }
 
 @app.post("/webhook/hermes")
-async def receive_from_hermes(request: Request, authorization: Optional[str] = Header(None)):
+async def receive_from_hermes(request: Request, _hermes: None = Depends(require_hermes)):
     """Receives task dispatches from Hermes Autonomous Agent."""
     body = await request.json()
     logger.info("Received dispatch from Hermes: %s", body.get("event_type"))

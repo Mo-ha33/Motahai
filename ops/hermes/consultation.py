@@ -126,6 +126,19 @@ _PENDING_CREDENTIALS = json.dumps({
 })
 
 
+def build_version_note(approved_by_token: bool = True) -> str:
+    """Honest GTM container-version note: states only what the code verifies (a human-issued D-003 token was
+    checked) and what it does not (PII and Consent Mode are not checked here). Contains no token, secret or
+    customer data. Called only after _hitl_gate has passed, so the approval statement is true."""
+    if approved_by_token:
+        note = ("Published by Tariq (Motahai) via GTM API v2 after a human operator approved this container and "
+                "workspace (D-003 single-use token). Not independently verified for PII or Consent Mode.")
+    else:
+        note = ("Published by Tariq (Motahai) via GTM API v2. No human approval token was recorded. "
+                "Not independently verified for PII or Consent Mode.")
+    return note
+
+
 def _hitl_gate(tool: str, container_id: str, workspace_id: str, version_name: str, token: Optional[str], precheck=None) -> Optional[str]:
     """Returns None if a valid human-issued approval token was presented (and is now spent), else a JSON refusal.
 
@@ -372,7 +385,7 @@ def register_consultation_tools(server):
             
             version_body = {
                 "name": version_name,
-                "notes": "Autonomously deployed and verified by Tariq AI via Google Tag Manager Cloud API v2 with Zero-PII and Consent Mode v2."
+                "notes": build_version_note(approved_by_token=True)
             }
             
             version_res = service.accounts().containers().workspaces().create_version(

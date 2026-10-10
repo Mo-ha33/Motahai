@@ -1,6 +1,6 @@
 # 📋 Motahai Project Task Board (Sprint & Architecture Plan)
 > **Autonomous Multi-Agent Task Orchestration Board**  
-> *Last Updated:* 2026-10-09  
+> *Last Updated:* 2026-10-10  
 > *Repository:* [https://github.com/Mo-ha33/Motahai](https://github.com/Mo-ha33/Motahai)
 
 ---
@@ -53,6 +53,48 @@
 | S2-7 | Pilot validation plan: required CAPI fields, custom-conversion optimization, ROAS bidding, A/B test | Haiku 5.5 | P1 | DONE | research, pilot | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
 | S2-8 | Thank-you page capture (Salla App Snippet + Shopify checkout_completed): order_id + UA + IP + fbp/fbc → Core | Sonnet 5.5 | P1 | IN_PROGRESS | capture, salla, emq | Salla webhooks carry no UA/IP; Meta requires client_user_agent for website events. Wave 2. Also: handle_order_update made decision-only. |
 | S1-8 | Ed25519 asymmetric HITL signing + user separation | Sonnet 5.5 | P1 | DONE | hitl, security | Ed25519 D-003 tokens (no HMAC), deployment/isolation manifests. (updated 2026-10-10 00:24) |
+| TASK-101 | Fix E.164 phone normalization for EG (+20), KSA (+966), UAE (+971), KW (+965) — [#24](https://github.com/Mo-ha33/Motahai/issues/24) | Sonnet 5.5 | P0 | DONE | p0, bug, capi | Merged in [#22](https://github.com/Mo-ha33/Motahai/pull/22) (f1d21f2); 644 tests pass on main. (updated 2026-10-10) |
+| TASK-102 | Meta Graph API v20.0 → v25.0 + `test_event_code` support — [#25](https://github.com/Mo-ha33/Motahai/issues/25) | Sonnet 5.5 | P0 | DONE | p0, capi | Merged in [#22](https://github.com/Mo-ha33/Motahai/pull/22) (f1d21f2). Pinned to v25.0 (expires 2028-07-29), override via `MOTAHAI_META_GRAPH_API_VERSION`. (updated 2026-10-10) |
+| TASK-103 | S1-5 reconciliation sweep + Bosta/OTO webhook replay protection — [#26](https://github.com/Mo-ha33/Motahai/issues/26) | Sonnet 5.5 | P0 | DONE | p0, security, webhooks | Merged in PR #23 (20f2e27); #26 closed. Platform/courier polling continues in #28/#29. (updated 2026-10-10) |
+| M1-2 | Poll Shopify and Salla order APIs for orders whose webhook never arrived — [#28](https://github.com/Mo-ha33/Motahai/issues/28) | Sonnet 5.5 | P0 | BACKLOG | phase-1, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
+| M1-3 | Poll Bosta and OTO shipment APIs for missed courier updates — [#29](https://github.com/Mo-ha33/Motahai/issues/29) | Sonnet 5.5 | P0 | BACKLOG | phase-1, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
+| M1-4 | Churn early-warning checks written as incidents — [#30](https://github.com/Mo-ha33/Motahai/issues/30) | Sonnet 5.5 | P1 | BACKLOG | phase-1, backend, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
+| M1-5 | Alembic baseline migration and models/migrations drift check — [#31](https://github.com/Mo-ha33/Motahai/issues/31) | Sonnet 5.5 | P0 | BACKLOG | phase-1, infra, backend | Depends on: #26 (PR #23) merged. (updated 2026-10-10) |
+| M1-6 | Enable SQLite WAL and busy_timeout; document Postgres pool settings — [#32](https://github.com/Mo-ha33/Motahai/issues/32) | Haiku 5.5 | P1 | BACKLOG | phase-1, infra, backend | Depends on: M1-5. (updated 2026-10-10) |
+| M1-7 | Re-hash stored phone hashes after the E.164 fix so refuser keys merge — [#33](https://github.com/Mo-ha33/Motahai/issues/33) | Sonnet 5.5 | P0 | BACKLOG | phase-1, backend, capi, bug | Raw phone is never stored (db.py:150-152); re-hash needs re-fetching orders via the M1-2 API clients. Depends on: #28. (updated 2026-10-10) |
+| M1-8 | Verify Salla signature and merchant field against a real delivery — [#34](https://github.com/Mo-ha33/Motahai/issues/34) | Sonnet 5.5 | P0 | BACKLOG | phase-1, security, webhooks, needs-human | Depends on: none. (updated 2026-10-10) |
+| M2-1 | S2-8: Salla thank-you capture of UA and IP — [#35](https://github.com/Mo-ha33/Motahai/issues/35) | Sonnet 5.5 | P1 | BACKLOG | phase-2, backend, capi, feature | Depends on: none. (updated 2026-10-10) |
+| M2-2 | Operator endpoint for manual order confirmation — [#36](https://github.com/Mo-ha33/Motahai/issues/36) | Sonnet 5.5 | P1 | REVIEW | phase-2, backend, feature | Draft PR #67 with M3-4; merging main in (conflict with #68's auth.py move). (updated 2026-10-10) |
+| M2-3 | Courier remittance CSV import — [#37](https://github.com/Mo-ha33/Motahai/issues/37) | Sonnet 5.5 | P1 | BACKLOG | phase-2, backend, feature | Depends on: M1-5. (updated 2026-10-10) |
+| M2-4 | Pilot pre-flight CLI for the S2-7 checklist — [#38](https://github.com/Mo-ha33/Motahai/issues/38) | Haiku 5.5 | P1 | REVIEW | phase-2, backend, feature | Draft PR #66; Opus reviewed; 649 passed. (updated 2026-10-10) |
+| M2-5 | Torod courier webhook (KSA) — [#39](https://github.com/Mo-ha33/Motahai/issues/39) | Sonnet 5.5 | P2 | BACKLOG | phase-2, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
+| M2-6 | SMSA courier webhook (KSA) — [#40](https://github.com/Mo-ha33/Motahai/issues/40) | Haiku 5.5 | P2 | BACKLOG | phase-2, backend, webhooks, feature | Depends on: #26 (PR #23). (updated 2026-10-10) |
+| M3-1 | Tenant stats API on the digest.py named queries — [#41](https://github.com/Mo-ha33/Motahai/issues/41) | Sonnet 5.5 | P1 | DONE | phase-3, backend, feature, owner:other-thread | Merged in PR #68 (4f90eb3). Repo audit thread. (updated 2026-10-10) |
+| M3-2 | Tracking health score — [#42](https://github.com/Mo-ha33/Motahai/issues/42) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, backend, feature | Sonnet worker dispatched; builds on #68 + #23. Mo asked to wrap up next. (updated 2026-10-10) |
+| M3-3 | Tenant API auth: scoped API keys — [#43](https://github.com/Mo-ha33/Motahai/issues/43) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, security, feature | Draft PR #73; merging main in after #68. (updated 2026-10-10) |
+| M3-4 | Operator endpoint and weekly schedule for audience export — [#44](https://github.com/Mo-ha33/Motahai/issues/44) | Sonnet 5.5 | P1 | REVIEW | phase-3, backend, feature | Draft PR #67 with M2-2; weekly export job, rolling 7-day gate. (updated 2026-10-10) |
+| M3-5 | Hermes MCP read tool get_cod_stats — [#45](https://github.com/Mo-ha33/Motahai/issues/45) | Sonnet 5.5 | P1 | BACKLOG | phase-3, hermes, feature | Depends on: M3-1. (updated 2026-10-10) |
+| M3-6 | Onboarding flow (TASK-011) — [#46](https://github.com/Mo-ha33/Motahai/issues/46) | Sonnet 5.5 | P1 | IN_PROGRESS | phase-3, backend, feature | Sonnet worker dispatched; builds on #73 + #23. Platform webhook auto-registration stays MANUAL. Mo asked to wrap up next. (updated 2026-10-10) |
+| M3-7 | Honest GTM version note in consultation.py — [#47](https://github.com/Mo-ha33/Motahai/issues/47) | Sonnet 5.5 | P1 | DONE | phase-3, hermes, bug, owner:other-thread | Merged in PR #69 (f2573f7). Repo audit thread. (updated 2026-10-10) |
+| M4-1 | Portal scaffold: React + Vite + TS with RTL/LTR i18n — [#48](https://github.com/Mo-ha33/Motahai/issues/48) | Haiku 5.5 | P2 | REVIEW | phase-4, frontend, feature | Draft PR #70; vite 6 / vitest 4 (0 audit findings); Opus reviewed; vitest 3/3, pytest 645 passed. (updated 2026-10-10) |
+| M4-2 | Portal sign-in and session — [#49](https://github.com/Mo-ha33/Motahai/issues/49) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, security, feature | Depends on: M3-3, M4-1. (updated 2026-10-10) |
+| M4-3 | Portal: signal health page — [#50](https://github.com/Mo-ha33/Motahai/issues/50) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M3-1, M3-2, M4-2. (updated 2026-10-10) |
+| M4-4 | Portal: delivered ROAS and refusals page — [#51](https://github.com/Mo-ha33/Motahai/issues/51) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M3-1, M4-2. (updated 2026-10-10) |
+| M4-5 | Portal: audiences page — [#52](https://github.com/Mo-ha33/Motahai/issues/52) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M3-4, M4-2. (updated 2026-10-10) |
+| M4-6 | Portal: onboarding wizard — [#53](https://github.com/Mo-ha33/Motahai/issues/53) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M3-6, M4-2. (updated 2026-10-10) |
+| M4-7 | Portal: agency multi-tenant view — [#54](https://github.com/Mo-ha33/Motahai/issues/54) | Haiku 5.5 | P2 | BACKLOG | phase-4, frontend, feature | Depends on: M4-3. (updated 2026-10-10) |
+| M4-8 | Weekly digest over WhatsApp — [#55](https://github.com/Mo-ha33/Motahai/issues/55) | Sonnet 5.5 | P2 | BACKLOG | phase-4, backend, feature | Depends on: M3-1. (updated 2026-10-10) |
+| M5-1 | GTM drift sentinel (TASK-030) — [#56](https://github.com/Mo-ha33/Motahai/issues/56) | Sonnet 5.5 | P2 | BACKLOG | phase-5, hermes, feature | Depends on: none. (updated 2026-10-10) |
+| M5-2 | Docs: HANDOFF_PLAYBOOK Coexist update and commercial claims cleanup — [#57](https://github.com/Mo-ha33/Motahai/issues/57) | Sonnet 5.5 | P2 | DONE | phase-5, docs, owner:other-thread | Merged in PR #65 (c37d559). Core foundation audit thread. (updated 2026-10-10) |
+| M6-1 | TikTok Events API sender for the D-005 ladder — [#58](https://github.com/Mo-ha33/Motahai/issues/58) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, capi, feature | Depends on: M2-4. (updated 2026-10-10) |
+| M6-2 | Snap Conversions API sender — [#59](https://github.com/Mo-ha33/Motahai/issues/59) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, capi, feature | Depends on: M2-4. (updated 2026-10-10) |
+| M6-3 | Cash-delivered creative scorecard (TASK-040) — [#60](https://github.com/Mo-ha33/Motahai/issues/60) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M3-1. (updated 2026-10-10) |
+| M6-4 | Pre-dispatch WhatsApp confirmation to cut refusals — [#61](https://github.com/Mo-ha33/Motahai/issues/61) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M2-2. (updated 2026-10-10) |
+| M6-5 | Checkout refusal-risk score — [#62](https://github.com/Mo-ha33/Motahai/issues/62) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M1-7. (updated 2026-10-10) |
+| M6-6 | Billing and subscriptions — [#63](https://github.com/Mo-ha33/Motahai/issues/63) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
+| B-1 | Board automation: set Project #3 status from Actions — [#64](https://github.com/Mo-ha33/Motahai/issues/64) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | In PR #27 (6fb20c6); 18 unit tests, full suite 662 passed. Live run needs #27 on main. (updated 2026-10-10) |
+| B-2 | CI: run pytest and the portal build on every PR — [#71](https://github.com/Mo-ha33/Motahai/issues/71) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | Draft PR #72; Python 3.12 + portal job; Opus reviewed. (updated 2026-10-10) |
+| S-1 | Require authentication on /tasks, /escalations and /webhook/hermes — [#74](https://github.com/Mo-ha33/Motahai/issues/74) | Sonnet 5.5 | P0 | REVIEW | phase-1, security, backend, bug | Draft PR #75 (also /webhook/hermes); merging main in after #68. Confirm Hermes sends the Bearer key before deploy. (updated 2026-10-10) |
 
 ---
 
@@ -86,3 +128,7 @@
 ### 5. Verification Log & Evidence
 - **TASK-001 Evidence:** Verified via `pytest -q`: `68 passed, 26 warnings in 7.57s`. `httpx` pinned to `0.27.2` in `requirements.txt`.
 - **Review 2026-10-09 (Opus):** TASK-003, TASK-021 and TASK-022 reopened to IN_PROGRESS for defects B1–B4 found in d51dcf0 and the gate code. TASK-031 and TASK-040 retitled and narrowed to the 2026-10-09 scope change. TASK-030 reassigned to Haiku 5.5 because Gemini cannot be dispatched from the Claude Code session. Sprint S1 rows S1-0 to S1-7 added. Board edits only; no code changed and no tests re-run.
+- **Board sync 2026-10-10:** TASK-101..103 logged as GitHub issues #24, #25, #26 (labels `p0`, `bug`, `capi`, `security`, `webhooks`). Status REVIEW = GitHub board "In Progress (in review)". Adding them to the [GitHub Project #3](https://github.com/users/Mo-ha33/projects/3) failed from the Claude Code session: user-level Projects API (GraphQL and REST `users/Mo-ha33/projectsV2/3`) returned HTTP 403 because the session is scoped to repository endpoints only. `.github/workflows/project-sync.yml` adds labelled issues to the board once the `ADD_TO_PROJECT_PAT` secret is set.
+- **Token-saving helpers:** `scripts/dev/qtest.py` (targeted pytest, summary + one line per failure) and `scripts/dev/logscan.py` (level/grep filter, repeat collapsing, short tail for files, stdin or `journalctl -u`).
+- **Master plan 2026-10-10:** `docs/MASTER_PLAN.md` phases M1–M6 logged as issues #28–#64. Older rows map onto them: S1-5 → M1-2/3/4, S2-2 → M2-2, S2-5 → M2-3/5/6, S2-8 → M2-1, TASK-011 → M3-6, TASK-030 → M5-1, TASK-040 → M6-3. BACKLOG = board Todo.
+- **2026-10-10 13:07:** #23, #68, #69 merged to main by the repo audit thread; main suite 685 passed, 1 skipped.

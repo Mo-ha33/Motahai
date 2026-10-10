@@ -14,12 +14,13 @@ Platform webhook registration (Shopify/Salla) is MANUAL: the checklist lists the
 import secrets
 from typing import Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from .auth import require_operator
 from .config import settings
 from .credentials import CredentialError, get_credential, store_credential
 from .db import (
@@ -32,12 +33,6 @@ from .webhook_routes import get_session_factory_dep
 from .webhook_signatures import BOSTA_MIN_SECRET_LENGTH
 
 router = APIRouter(prefix="/v1/operator/onboarding", tags=["onboarding"])
-
-
-def _operator(authorization: Optional[str] = Header(None)) -> None:
-    # Late import: service.py includes this router, so it cannot be imported at module load.
-    from .service import require_operator
-    require_operator(authorization)
 
 
 class CreateTenantRequest(BaseModel):
@@ -80,7 +75,7 @@ def _active_key_exists(session: Session, tenant_id: int) -> bool:
 
 
 @router.post("/tenants", status_code=201)
-def create_tenant_endpoint(req: CreateTenantRequest, _op: None = Depends(_operator),
+def create_tenant_endpoint(req: CreateTenantRequest, _op: None = Depends(require_operator),
                            factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         if get_tenant_by_shop_domain(session, req.shop_domain.strip().lower()) is not None:
@@ -100,7 +95,7 @@ def create_tenant_endpoint(req: CreateTenantRequest, _op: None = Depends(_operat
 
 
 @router.post("/tenants/{tenant_id}/meta")
-def store_meta(tenant_id: int, req: MetaRequest, _op: None = Depends(_operator),
+def store_meta(tenant_id: int, req: MetaRequest, _op: None = Depends(require_operator),
                factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         tenant = _tenant(session, tenant_id)
@@ -121,7 +116,7 @@ def store_meta(tenant_id: int, req: MetaRequest, _op: None = Depends(_operator),
 
 
 @router.post("/tenants/{tenant_id}/courier-secrets", status_code=201)
-def generate_courier_secrets(tenant_id: int, req: CourierSecretsRequest, _op: None = Depends(_operator),
+def generate_courier_secrets(tenant_id: int, req: CourierSecretsRequest, _op: None = Depends(require_operator),
                              factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         tenant = _tenant(session, tenant_id)
@@ -142,7 +137,7 @@ def generate_courier_secrets(tenant_id: int, req: CourierSecretsRequest, _op: No
 
 
 @router.post("/tenants/{tenant_id}/api-key", status_code=201)
-def issue_first_key(tenant_id: int, _op: None = Depends(_operator),
+def issue_first_key(tenant_id: int, _op: None = Depends(require_operator),
                     factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         tenant = _tenant(session, tenant_id)
@@ -173,7 +168,7 @@ def _courier_secret_ok(session: Session, tenant_id: int, courier: str, kinds: se
 
 
 @router.get("/tenants/{tenant_id}/checklist")
-def checklist(tenant_id: int, _op: None = Depends(_operator),
+def checklist(tenant_id: int, _op: None = Depends(require_operator),
               factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
         tenant = _tenant(session, tenant_id)
