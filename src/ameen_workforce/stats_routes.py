@@ -6,9 +6,11 @@ stats_routes.py — Tenant-scoped, read-only stats endpoints over the Sunday-dig
   GET /v1/tenants/{tenant_id}/stats/refused-cod       -> digest.q_refused_cod
   GET /v1/tenants/{tenant_id}/stats/signal-health     -> digest.q_signal_health
   GET /v1/tenants/{tenant_id}/stats/creatives         -> digest.q_creatives
+  GET /v1/tenants/{tenant_id}/stats/health-score      -> health_score.tenant_health_score
   GET /v1/tenants/{tenant_id}/stats/summary           -> all five in one response
 
-Every response is {"tenant_id", "window": {"start", "end"}, "data": ...}; every number comes straight from the existing
+Every response is {"tenant_id", "currency", "window": {"start", "end"}, "data": ...} ("currency" = the tenant's ISO
+4217 code, for formatting money); every number comes straight from the existing
 q_* functions (nothing is computed or defaulted here). Cohort-based endpoints (cohort-delivery, refused-cod, creatives,
 and summary) additionally carry "cohort_window".
 
@@ -18,8 +20,10 @@ digest.build_digest, week-orders and signal-health use the window itself while t
 window shifted back 7 days (COHORT_SHIFT), so for the same week the numbers match the Sunday digest. Unlike the digest,
 boundaries are UTC midnights, not tenant-local ones.
 
-Auth: until per-tenant API keys exist (M3-3) every route requires the operator key (auth.require_operator). The tenant
-comes ONLY from the path; an unknown tenant is 404. Read-only: no writes, aggregates only (no PII), nothing logged.
+Auth: every route accepts either the operator key (auth.require_operator) or a tenant API key (`mtk_...`) holding the
+`stats:read` scope (tenant_auth.require_operator_or_tenant_key). A tenant key may only read its own tenant: another
+tenant's id is 404, the same as an unknown tenant (no existence leak). Any bad tenant key is the uniform 401. The
+tenant comes ONLY from the path; an unknown tenant is 404. Read-only: no writes, aggregates only (no PII), nothing logged.
 """
 
 from datetime import datetime, time, timedelta, timezone
@@ -28,8 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, sessionmaker
 
-from .auth import require_operator
 from .db import Tenant, get_session_factory
+from .tenant_auth import ensure_tenant_matches, require_operator_or_tenant_key
 from .health_score import tenant_health_score
 from .digest import q_cohort_delivery, q_creatives, q_refused_cod, q_signal_health, q_week_orders
 
@@ -41,7 +45,9 @@ Window = Tuple[datetime, datetime]
 SECTIONS = ("week-orders", "cohort-delivery", "refused-cod", "signal-health", "creatives")
 _COHORT_BASED = {"cohort-delivery", "refused-cod", "creatives"}
 
-router = APIRouter(prefix="/v1/tenants/{tenant_id}/stats", dependencies=[Depends(require_operator)])
+require_stats_auth = require_operator_or_tenant_key("stats:read")
+
+router = APIRouter(prefix="/v1/tenants/{tenant_id}/stats")
 
 
 def get_stats_session_factory() -> sessionmaker:
@@ -91,12 +97,17 @@ def _compute(session: Session, tenant_id: int, name: str, window: Window) -> Any
     return q_creatives(session, tenant_id, cohort)
 
 
-def _respond(factory: sessionmaker, tenant_id: int, window: Window, names: List[str]) -> Dict[str, Any]:
+def _respond(factory: sessionmaker, tenant_id: int, window: Window, names: List[str],
+             caller: Optional[Tenant] = None) -> Dict[str, Any]:
+    if caller is not None:
+        ensure_tenant_matches(caller, tenant_id)
     with factory() as session:
-        if session.get(Tenant, tenant_id) is None:
+        tenant = session.get(Tenant, tenant_id)
+        if tenant is None:
             raise HTTPException(status_code=404, detail="Unknown tenant")
+        currency = tenant.currency
         data = {n: _compute(session, tenant_id, n, window) for n in names}
-    body: Dict[str, Any] = {"tenant_id": tenant_id, "window": _iso(window)}
+    body: Dict[str, Any] = {"tenant_id": tenant_id, "currency": currency, "window": _iso(window)}
     if any(n in _COHORT_BASED for n in names):
         body["cohort_window"] = _iso(_cohort(window))
     body["data"] = data if len(names) > 1 else data[names[0]]
@@ -104,9 +115,10 @@ def _respond(factory: sessionmaker, tenant_id: int, window: Window, names: List[
 
 
 def _add_route(name: str) -> None:
-    def endpoint(tenant_id: int, window: Window = Depends(get_window),
+    def endpoint(tenant_id: int, caller: Optional[Tenant] = Depends(require_stats_auth),  # auth first: before 422s
+                 window: Window = Depends(get_window),
                  factory: sessionmaker = Depends(get_stats_session_factory)) -> Dict[str, Any]:
-        return _respond(factory, tenant_id, window, [name])
+        return _respond(factory, tenant_id, window, [name], caller)
     endpoint.__name__ = "stats_" + name.replace("-", "_")
     router.get("/" + name)(endpoint)
 
@@ -116,16 +128,22 @@ for _name in SECTIONS:
 
 
 @router.get("/health-score")
-def stats_health_score(tenant_id: int, window: Window = Depends(get_window),
+def stats_health_score(tenant_id: int, caller: Optional[Tenant] = Depends(require_stats_auth),  # auth first: before 422s
+                       window: Window = Depends(get_window),
                        factory: sessionmaker = Depends(get_stats_session_factory)) -> Dict[str, Any]:
+    if caller is not None:
+        ensure_tenant_matches(caller, tenant_id)
     with factory() as session:
-        if session.get(Tenant, tenant_id) is None:
+        tenant = session.get(Tenant, tenant_id)
+        if tenant is None:
             raise HTTPException(status_code=404, detail="Unknown tenant")
         data = tenant_health_score(session, tenant_id, window)
-    return {"tenant_id": tenant_id, "window": _iso(window), "data": data}
+        currency = tenant.currency
+    return {"tenant_id": tenant_id, "currency": currency, "window": _iso(window), "data": data}
 
 
 @router.get("/summary")
-def stats_summary(tenant_id: int, window: Window = Depends(get_window),
+def stats_summary(tenant_id: int, caller: Optional[Tenant] = Depends(require_stats_auth),
+                  window: Window = Depends(get_window),
                   factory: sessionmaker = Depends(get_stats_session_factory)) -> Dict[str, Any]:
-    return _respond(factory, tenant_id, window, list(SECTIONS))
+    return _respond(factory, tenant_id, window, list(SECTIONS), caller)

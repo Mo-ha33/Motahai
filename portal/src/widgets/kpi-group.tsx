@@ -6,12 +6,12 @@ export interface KpiGroupOptions {
   metrics: MetricId[];
 }
 
-export function KpiGroupWidget({ data, instance, lang }: WidgetProps<KpiGroupOptions>) {
+export function KpiGroupWidget({ data, envelope, instance, lang }: WidgetProps<KpiGroupOptions>) {
   return (
     <WidgetFrame instance={instance} lang={lang}>
       <div className="kpi-row">
         {instance.options.metrics.map((id) => {
-          const metric = resolveMetric(id, data, lang);
+          const metric = resolveMetric(id, data, lang, envelope.currency);
           return (
             <div className="kpi" key={id} data-metric={id}>
               <div className="kpi-label">{metric.label}</div>

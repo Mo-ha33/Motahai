@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { useSession } from '../auth/SessionContext';
 import type { StatsWindow } from '../api/types';
 import { PRESET_DAYS, presetRange, validateRange, type RangeError } from './range';
 
@@ -24,6 +25,8 @@ const DEFAULT_PRESET = 7;
 export interface FiltersValue {
   /** Raw text of the tenant input. */
   tenantInput: string;
+  /** True in tenant mode: the tenant comes from the signed-in key's profile and the filter is hidden. */
+  tenantLocked: boolean;
   /** Parsed tenant id, or null when empty/invalid. */
   tenantId: number | null;
   range: RangeState;
@@ -85,6 +88,8 @@ export function FiltersProvider({
   children: ReactNode;
   now?: () => Date;
 }) {
+  const { session } = useSession();
+  const sessionTenantId = session?.mode === 'tenant' ? session.profile.tenant_id : null;
   const [state, setState] = useState(() => loadInitial(now()));
 
   useEffect(() => {
@@ -122,7 +127,8 @@ export function FiltersProvider({
     const rangeError = validateRange(state.range.start, state.range.end);
     return {
       tenantInput: state.tenantInput,
-      tenantId: parseTenantId(state.tenantInput),
+      tenantLocked: sessionTenantId !== null,
+      tenantId: sessionTenantId ?? parseTenantId(state.tenantInput),
       range: state.range,
       rangeError,
       window: rangeError ? null : { start: state.range.start, end: state.range.end },
@@ -130,7 +136,7 @@ export function FiltersProvider({
       setPreset,
       setCustomRange,
     };
-  }, [state, setTenantInput, setPreset, setCustomRange]);
+  }, [state, sessionTenantId, setTenantInput, setPreset, setCustomRange]);
 
   return <FiltersContext.Provider value={value}>{children}</FiltersContext.Provider>;
 }

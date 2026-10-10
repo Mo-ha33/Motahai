@@ -3,7 +3,8 @@ import { useFilters } from './FiltersContext';
 
 export function TenantFilter({ lang }: { lang: Lang }) {
   const t = dictionaries[lang].filters;
-  const { tenantInput, tenantId, setTenantInput } = useFilters();
+  const { tenantInput, tenantId, tenantLocked, setTenantInput } = useFilters();
+  if (tenantLocked) return null;
   const invalid = tenantInput.trim() !== '' && tenantId === null;
   return (
     <div className="filter-card">

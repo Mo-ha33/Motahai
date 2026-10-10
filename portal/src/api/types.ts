@@ -69,9 +69,21 @@ export type StatsSummaryData = SectionDataMap;
 
 export interface StatsEnvelope<D = StatsSummaryData> {
   tenant_id: number;
+  /** The tenant's ISO 4217 currency code; absent on older API versions. */
+  currency?: string;
   /** Report window as full ISO datetimes. */
   window: StatsWindow;
   /** Present on cohort-based sections and on summary (window shifted back 7 days). */
   cohort_window?: StatsWindow;
   data: D;
+}
+
+/** `GET /v1/tenant/me` (tenant key only). */
+export interface TenantProfile {
+  tenant_id: number;
+  name: string;
+  currency: string;
+  country: string;
+  mode: string;
+  platform: string;
 }
