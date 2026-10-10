@@ -63,10 +63,16 @@ def _parse_bound(name: str, raw: str) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def default_window(days: int = DEFAULT_WINDOW_DAYS, now: Optional[datetime] = None) -> Window:
+    """The `days` full UTC days ending at today's UTC midnight (what get_window uses when start/end are omitted)."""
+    now = now or datetime.now(timezone.utc)
+    end_dt = datetime.combine(now.astimezone(timezone.utc).date(), time.min, tzinfo=timezone.utc)
+    return end_dt - timedelta(days=days), end_dt
+
+
 def get_window(start: Optional[str] = Query(None), end: Optional[str] = Query(None)) -> Window:
     """Resolves and validates the [start, end) UTC window (default: the 7 full days before today's UTC midnight)."""
-    end_dt = _parse_bound("end", end) if end else datetime.combine(
-        datetime.now(timezone.utc).date(), time.min, tzinfo=timezone.utc)
+    end_dt = _parse_bound("end", end) if end else default_window()[1]
     start_dt = _parse_bound("start", start) if start else end_dt - timedelta(days=DEFAULT_WINDOW_DAYS)
     if end_dt <= start_dt:
         raise HTTPException(status_code=422, detail="end must be after start")
@@ -75,16 +81,17 @@ def get_window(start: Optional[str] = Query(None), end: Optional[str] = Query(No
     return start_dt, end_dt
 
 
-def _cohort(window: Window) -> Window:
+def cohort_window(window: Window) -> Window:
+    """The matured-cohort window for a report window: the same span shifted back COHORT_SHIFT (as digest_periods)."""
     return window[0] - COHORT_SHIFT, window[1] - COHORT_SHIFT
 
 
-def _iso(window: Window) -> Dict[str, str]:
+def window_iso(window: Window) -> Dict[str, str]:
     return {"start": window[0].isoformat(), "end": window[1].isoformat()}
 
 
-def _compute(session: Session, tenant_id: int, name: str, window: Window) -> Any:
-    cohort = _cohort(window)
+def compute_section(session: Session, tenant_id: int, name: str, window: Window) -> Any:
+    cohort = cohort_window(window)
     if name == "week-orders":
         return q_week_orders(session, tenant_id, window)
     if name == "cohort-delivery":
@@ -106,10 +113,10 @@ def _respond(factory: sessionmaker, tenant_id: int, window: Window, names: List[
         if tenant is None:
             raise HTTPException(status_code=404, detail="Unknown tenant")
         currency = tenant.currency
-        data = {n: _compute(session, tenant_id, n, window) for n in names}
-    body: Dict[str, Any] = {"tenant_id": tenant_id, "currency": currency, "window": _iso(window)}
+        data = {n: compute_section(session, tenant_id, n, window) for n in names}
+    body: Dict[str, Any] = {"tenant_id": tenant_id, "currency": currency, "window": window_iso(window)}
     if any(n in _COHORT_BASED for n in names):
-        body["cohort_window"] = _iso(_cohort(window))
+        body["cohort_window"] = window_iso(cohort_window(window))
     body["data"] = data if len(names) > 1 else data[names[0]]
     return body
 
@@ -139,7 +146,7 @@ def stats_health_score(tenant_id: int, caller: Optional[Tenant] = Depends(requir
             raise HTTPException(status_code=404, detail="Unknown tenant")
         data = tenant_health_score(session, tenant_id, window)
         currency = tenant.currency
-    return {"tenant_id": tenant_id, "currency": currency, "window": _iso(window), "data": data}
+    return {"tenant_id": tenant_id, "currency": currency, "window": window_iso(window), "data": data}
 
 
 @router.get("/summary")

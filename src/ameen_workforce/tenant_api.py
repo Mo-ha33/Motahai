@@ -12,13 +12,16 @@ the Hermes agent, deliberately separate from OPERATOR_API_KEY (the human approva
 value, or the tenant key is unset, nobody is authenticated (fail closed, 401). Auth runs as a dependency, so it answers
 before path/query validation (a bad window_days with no token is 401, not 422). An unknown tenant is a generic 404.
 
+Known risk: HERMES_TENANT_API_KEY can read ANY tenant's counts. The caller (the Hermes tool, S3-2) must bind
+tenant_key to the onboarded store of the current conversation before calling; this module does not enforce that.
+
 Read-only and PII-free: counts, flags and timestamps only. No emails, phones, names, IPs, user agents, order ids,
 addresses, credentials/ciphertext or webhook payloads are ever selected or returned; logs carry only the numeric
 tenant id. No CAPI calls, no writes.
 
 --- /status fields -----------------------------------------------------------------------------------------------
   tenant_key, platform, mode ("shadow"|"live"), active, created_at,
-  has_meta_credentials  a `meta_capi_token` row exists in `credentials` for the tenant (existence only, never the value)
+  has_meta_credentials  the checklist step `meta_capi_token` is done (a credentials row exists; never the value)
   last_webhook_at       latest webhook_deliveries.received_at with signature_ok = TRUE for the tenant (None if none)
   webhook_failures_7d   webhook_deliveries rows of the tenant received in the last 7 days that are real failures:
                         non-duplicate, error_type != 'topic_not_handled' (a deliberately ignored topic), and either
@@ -28,14 +31,23 @@ tenant id. No CAPI calls, no writes.
                         whose signature was cryptographically verified was received (regardless of whether processing
                         later succeeded). Unauthenticated or unknown-tenant deliveries are never attributed to the
                         tenant (signature_ok FALSE / tenant_id NULL), so they cannot make this true.
-  onboarded             active AND has_meta_credentials AND meta_dataset_id is set (the store can actually send)
+  checklist_ready       onboarding_routes.compute_checklist(...)["ready_for_live"], the SAME function the operator
+                        GET /v1/operator/onboarding/tenants/{id}/checklist uses (all required steps done)
+  onboarded             = checklist_ready (defined from the shared checklist so operator and Tariq cannot disagree)
+  missing_required_steps  ids of required checklist steps not done (ids only, e.g. "courier_secret", "api_key")
+  test_event_code_set   the tenant has a Meta test_event_code (the bool only, never the code)
 
 --- /signal-health fields ----------------------------------------------------------------------------------------
-Window = [now - window_days, now) UTC. Every number comes from the digest.py q_* queries (orders placed in the window,
-CapiEvent time = coalesce(sent_at, created_at)); only `failed` / `stale` CAPI counts, which digest.q_signal_health does
-not expose, use a small query here with the same event-time convention and the same event names. "delivered" counts
-orders placed in the window that reached delivered (as of now); `partially_refunded` is not reported because orders do
-not store that status (a partial refund shows as a lower net value, not a separate status).
+Same window conventions as stats_routes (hence the Sunday digest and the portal): `window` is the `window_days` full
+UTC days ending at today's UTC midnight (stats_routes.default_window); `cohort_window` is that window shifted back 7
+days. Week-based numbers use `window`, matured-cohort numbers use `cohort_window`. All of them come from
+stats_routes.compute_section (-> digest q_* queries); only the `failed` / `stale` CAPI counts, which
+digest.q_signal_health does not expose, use a small query here (same event-time convention and event names).
+  orders.{placed,cod,confirmed}      q_week_orders over `window`
+  cohort.{orders,delivered,refused}  q_cohort_delivery (all orders) and q_refused_cod over `cohort_window`
+                                     (refused = COD orders cancelled/refunded after dispatch)
+  capi_events, would_have_sent       q_signal_health over `window`; would_have_sent = the shadow count
+`partially_refunded` is not reported: orders do not store that status (a partial refund is a lower net value).
 """
 
 import hmac
@@ -48,16 +60,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .db import CapiEvent, Credential, Tenant, WebhookDelivery, get_session_factory, get_tenant_by_shop_domain
-from .digest import (
-    SIGNAL_EVENT_NAMES, q_cohort_delivery, q_incidents, q_refused_cod, q_signal_health, q_week_orders
-)
+from .db import CapiEvent, Tenant, WebhookDelivery, get_session_factory, get_tenant_by_shop_domain
+from .digest import SIGNAL_EVENT_NAMES, q_incidents
+from .onboarding_routes import compute_checklist
+from .stats_routes import cohort_window, compute_section, default_window, window_iso
 
 logger = logging.getLogger("ameen_workforce.tenant_api")
 
 TENANT_API_KEY_ENV = "HERMES_TENANT_API_KEY"
 OPERATOR_KEY_ENV = "OPERATOR_API_KEY"
-META_CAPI_TOKEN_KIND = "meta_capi_token"
 DEFAULT_WINDOW_DAYS = 7
 MAX_WINDOW_DAYS = 28
 WEBHOOK_FAILURE_DAYS = 7
@@ -126,9 +137,8 @@ def _q_unhealthy_capi(session: Session, tenant_id: int, window) -> Dict[str, int
 
 
 def _build_status(session: Session, tenant: Tenant, now: datetime) -> Dict[str, Any]:
-    has_credentials = session.scalar(
-        select(func.count(Credential.id)).where(Credential.tenant_id == tenant.id,
-                                                Credential.kind == META_CAPI_TOKEN_KIND)) or 0
+    checklist = compute_checklist(session, tenant)
+    steps = checklist["steps"]
     verified = and_(WebhookDelivery.tenant_id == tenant.id, WebhookDelivery.signature_ok.is_(True))
     last_webhook_at = session.scalar(select(func.max(WebhookDelivery.received_at)).where(verified))
     webhooks_verified = session.scalar(select(WebhookDelivery.id).where(verified).limit(1)) is not None
@@ -143,38 +153,41 @@ def _build_status(session: Session, tenant: Tenant, now: datetime) -> Dict[str, 
     last_capi_event_at = session.scalar(
         select(func.max(func.coalesce(CapiEvent.sent_at, CapiEvent.created_at))).where(
             CapiEvent.tenant_id == tenant.id, CapiEvent.status.in_(("sent", "shadow", "failed"))))
-    has_meta_credentials = bool(has_credentials)
     return {
         "tenant_key": tenant.shop_domain,
         "platform": tenant.platform,
         "mode": tenant.mode,
         "active": bool(tenant.active),
         "created_at": _iso(tenant.created_at),
-        "has_meta_credentials": has_meta_credentials,
+        "has_meta_credentials": any(s["key"] == "meta_capi_token" and s["status"] == "done" for s in steps),
         "last_webhook_at": _iso(last_webhook_at),
         "webhook_failures_7d": int(failures),
         "last_capi_event_at": _iso(last_capi_event_at),
         "webhooks_verified": webhooks_verified,
-        "onboarded": bool(tenant.active) and has_meta_credentials and bool(tenant.meta_dataset_id),
+        "checklist_ready": checklist["ready_for_live"],
+        "onboarded": checklist["ready_for_live"],
+        "missing_required_steps": [s["key"] for s in steps if s["required"] and s["status"] != "done"],
+        "test_event_code_set": tenant.meta_test_event_code is not None,
     }
 
 
 def _build_signal_health(session: Session, tenant: Tenant, window_days: int, now: datetime) -> Dict[str, Any]:
-    window = (now - timedelta(days=window_days), now)
-    week = q_week_orders(session, tenant.id, window)
-    cohort = q_cohort_delivery(session, tenant.id, window)
-    refused = q_refused_cod(session, tenant.id, window)
-    signal = q_signal_health(session, tenant.id, window)
+    window = default_window(window_days, now)
+    cohort = cohort_window(window)
+    week = compute_section(session, tenant.id, "week-orders", window)
+    cohort_delivery = compute_section(session, tenant.id, "cohort-delivery", window)["all"]
+    refused = compute_section(session, tenant.id, "refused-cod", window)
+    signal = compute_section(session, tenant.id, "signal-health", window)
     unhealthy = _q_unhealthy_capi(session, tenant.id, window)
     shadow = signal["confirmed_shadow"] + signal["delivered_shadow"]
     open_incidents = [i for i in q_incidents(session, tenant.id, window) if i["unresolved"]]
     return {
         "tenant_key": tenant.shop_domain,
-        "window": {"start": _iso(window[0]), "end": _iso(window[1]), "days": window_days},
-        "orders": {
-            "placed": week["placed"], "cod": week["cod"], "confirmed": week["confirmed"],
-            "delivered": int(cohort["delivered"]), "refused": int(refused["count"]),
-        },
+        "window": {**window_iso(window), "days": window_days},
+        "cohort_window": window_iso(cohort),
+        "orders": {"placed": week["placed"], "cod": week["cod"], "confirmed": week["confirmed"]},
+        "cohort": {"orders": int(cohort_delivery["orders"]), "delivered": int(cohort_delivery["delivered"]),
+                   "refused": int(refused["count"])},
         "capi_events": {
             "sent": signal["confirmed_sent"] + signal["delivered_sent"],
             "shadow": shadow,
@@ -191,7 +204,7 @@ def _build_signal_health(session: Session, tenant: Tenant, window_days: int, now
 @router.get("/status")
 def tenant_status(tenant_key: str, _auth: None = Depends(require_tenant_api_key),
                   factory: sessionmaker = Depends(get_tenant_api_session_factory)) -> Dict[str, Any]:
-    """Engine state for one store: mode, credentials present, webhook health, last CAPI activity. See module docs."""
+    """Engine state for one store: mode, onboarding checklist, webhook health, last CAPI activity. See module docs."""
     with factory() as session:
         tenant = _get_tenant_or_404(session, tenant_key)
         logger.info("tenant status read for tenant %s", tenant.id)
@@ -204,7 +217,7 @@ def tenant_signal_health(
     window_days: int = Query(DEFAULT_WINDOW_DAYS, ge=1, le=MAX_WINDOW_DAYS),
     factory: sessionmaker = Depends(get_tenant_api_session_factory)
 ) -> Dict[str, Any]:
-    """Order and CAPI signal counts over [now - window_days, now), from the digest q_* queries. See module docs."""
+    """Order and CAPI signal counts for the stats-aligned window and matured-cohort window. See module docs."""
     with factory() as session:
         tenant = _get_tenant_or_404(session, tenant_key)
         logger.info("tenant signal-health read for tenant %s (%dd)", tenant.id, window_days)

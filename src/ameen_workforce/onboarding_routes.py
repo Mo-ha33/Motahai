@@ -167,31 +167,39 @@ def _courier_secret_ok(session: Session, tenant_id: int, courier: str, kinds: se
     return bool(value) and len(value.strip()) >= BOSTA_MIN_SECRET_LENGTH
 
 
+def compute_checklist(session: Session, tenant: Tenant) -> dict:
+    """
+    The onboarding step computation shared by the operator checklist endpoint and the read-only tenant API
+    (tenant_api.py), so the two can never disagree. Returns tenant_id, mode, steps, platform_webhook_urls and
+    ready_for_live (every required step is done). Reads only; secrets are checked for presence/strength, never returned.
+    """
+    kinds = _kinds(session, tenant.id)
+    bosta = _courier_secret_ok(session, tenant.id, "bosta", kinds)
+    oto = _courier_secret_ok(session, tenant.id, "oto", kinds)
+    if tenant.platform == "shopify":
+        urls = [f"{_base()}/webhooks/shopify/{t}" for t in ("orders/create", "orders/updated", "orders/paid")]
+    else:
+        urls = [f"{_base()}/webhooks/salla"]
+    steps = [
+        _step("tenant_created", "Tenant created", True),
+        _step("meta_dataset", "Meta dataset id stored", bool(tenant.meta_dataset_id)),
+        _step("meta_capi_token", "Meta CAPI token stored", "meta_capi_token" in kinds),
+        _step("courier_secret", "At least one courier webhook secret (Bosta or OTO)", bosta or oto,
+              detail=f"bosta={'ok' if bosta else 'missing'}, oto={'ok' if oto else 'missing'}"),
+        _step("api_key", "Tenant API key issued", _active_key_exists(session, tenant.id)),
+        _step("platform_webhooks", f"Register {tenant.platform} webhooks (MANUAL)", False, required=False,
+              detail="; ".join(urls), manual=True),
+        _step("test_event_code", "Meta test_event_code set (optional)", tenant.meta_test_event_code is not None,
+              required=False),
+    ]
+    ready = all(s["status"] == "done" for s in steps if s["required"])
+    return {"tenant_id": tenant.id, "mode": tenant.mode, "steps": steps, "platform_webhook_urls": urls,
+            "ready_for_live": ready}
+
+
 @router.get("/tenants/{tenant_id}/checklist")
 def checklist(tenant_id: int, _op: None = Depends(require_operator),
               factory: sessionmaker = Depends(get_session_factory_dep)):
     with factory() as session:
-        tenant = _tenant(session, tenant_id)
-        kinds = _kinds(session, tenant.id)
-        bosta = _courier_secret_ok(session, tenant.id, "bosta", kinds)
-        oto = _courier_secret_ok(session, tenant.id, "oto", kinds)
-        if tenant.platform == "shopify":
-            urls = [f"{_base()}/webhooks/shopify/{t}" for t in ("orders/create", "orders/updated", "orders/paid")]
-        else:
-            urls = [f"{_base()}/webhooks/salla"]
-        steps = [
-            _step("tenant_created", "Tenant created", True),
-            _step("meta_dataset", "Meta dataset id stored", bool(tenant.meta_dataset_id)),
-            _step("meta_capi_token", "Meta CAPI token stored", "meta_capi_token" in kinds),
-            _step("courier_secret", "At least one courier webhook secret (Bosta or OTO)", bosta or oto,
-                  detail=f"bosta={'ok' if bosta else 'missing'}, oto={'ok' if oto else 'missing'}"),
-            _step("api_key", "Tenant API key issued", _active_key_exists(session, tenant.id)),
-            _step("platform_webhooks", f"Register {tenant.platform} webhooks (MANUAL)", False, required=False,
-                  detail="; ".join(urls), manual=True),
-            _step("test_event_code", "Meta test_event_code set (optional)", tenant.meta_test_event_code is not None,
-                  required=False),
-        ]
-        ready = all(s["status"] == "done" for s in steps if s["required"])
-        return {"tenant_id": tenant.id, "mode": tenant.mode, "steps": steps, "platform_webhook_urls": urls,
-                "ready_for_live": ready,
-                "note": "Switching to live is a separate operator action; this API never changes mode."}
+        result = compute_checklist(session, _tenant(session, tenant_id))
+        return {**result, "note": "Switching to live is a separate operator action; this API never changes mode."}

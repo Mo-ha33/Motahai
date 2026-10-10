@@ -3,27 +3,34 @@ test_tenant_api.py — read-only Core API for the Tariq agent (S3-1): /v1/tenant
 
 Auth is a Bearer HERMES_TENANT_API_KEY (fail closed; must differ from OPERATOR_API_KEY). Two tenants own similar rows
 and must never leak into each other. Seeded PII-like values (email/phone hashes, IP/UA ciphertext, order ids, webhook
-payload hashes) must never appear in any response.
+payload hashes) must never appear in any response. The clock is pinned to NOW (2026-10-11 12:00 UTC), so:
+  window (7d)  = [2026-10-04, 2026-10-11) UTC     (stats_routes.default_window: full UTC days ending at midnight)
+  cohort       = [2026-09-27, 2026-10-04) UTC     (window shifted back 7 days, as the digest and stats do)
 """
 
 import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
+from src.ameen_workforce import tenant_api
 from src.ameen_workforce.credentials import encrypt_value, store_credential
 from src.ameen_workforce.db import (
     CapiEvent, CheckoutContext, Incident, Order, OrderStatusEvent, WebhookDelivery, create_tenant, utcnow
 )
+from src.ameen_workforce.onboarding_routes import compute_checklist
+from src.ameen_workforce.stats_routes import compute_section
 from src.ameen_workforce.tenant_api import get_tenant_api_session_factory, router
+from src.ameen_workforce.tenant_auth import create_tenant_key
 
 TENANT_KEY = "hermes-tenant-key-for-tests"
 OPERATOR_KEY = "operator-key-for-tests"
 AUTH = {"Authorization": f"Bearer {TENANT_KEY}"}
+NOW = datetime(2026, 10, 11, 12, tzinfo=timezone.utc)
 
 SECRET_EMAIL_HASH = "e" * 64
 SECRET_PHONE_HASH = "f" * 64
@@ -31,8 +38,14 @@ SECRET_ORDER_ID = "ORDER-SECRET-98765"
 SECRET_IP = "203.0.113.77"
 SECRET_UA = "Mozilla/5.0 SecretBrowser/9.9"
 SECRET_TOKEN = "SECRET-META-TOKEN-123"
+SECRET_COURIER = "SECRET-COURIER-WEBHOOK-" + "x" * 30
+SECRET_TEST_CODE = "TESTSECRET777"
 SECRET_PAYLOAD_HASH = "d" * 64
 _n = {"i": 0}
+
+
+def day(month, d, hour=12):
+    return datetime(2026, month, d, hour, tzinfo=timezone.utc)
 
 
 def add_order(session, tenant, placed, *, cod=True, status="pending", confirmed=False, shipped=False, pii=False):
@@ -46,7 +59,7 @@ def add_order(session, tenant, placed, *, cod=True, status="pending", confirmed=
     session.flush()
     if pii:
         session.add(CheckoutContext(order_id=order.id, ip_ciphertext=encrypt_value(SECRET_IP),
-                                    ua_ciphertext=encrypt_value(SECRET_UA), expires_at=utcnow() + timedelta(days=1)))
+                                    ua_ciphertext=encrypt_value(SECRET_UA), expires_at=NOW + timedelta(days=1)))
     if shipped:
         session.add(OrderStatusEvent(order_id=order.id, status="shipped", received_at=placed))
     session.commit()
@@ -59,48 +72,54 @@ def add_event(session, tenant, order, name, status, when):
     session.commit()
 
 
-def add_delivery(session, tenant, *, signature_ok=True, processed_ok=True, error_type=None, received_at=None,
+def add_delivery(session, tenant, *, signature_ok=True, processed_ok=True, error_type=None, received_at=NOW,
                  duplicate=False, topic="orders/create"):
     _n["i"] += 1
     session.add(WebhookDelivery(
         tenant_id=tenant.id if tenant else None, platform="shopify", topic=topic, dedupe_key=f"k{_n['i']}",
         payload_sha256=SECRET_PAYLOAD_HASH, signature_ok=signature_ok, processed_ok=processed_ok,
-        error_type=error_type, is_duplicate=duplicate, received_at=received_at or utcnow()))
+        error_type=error_type, is_duplicate=duplicate, received_at=received_at))
     session.commit()
 
 
 def seed_a(session, tenant):
-    now = utcnow()
-    o1 = add_order(session, tenant, now - timedelta(days=1), cod=True, confirmed=True, pii=True)
-    o2 = add_order(session, tenant, now - timedelta(days=2), cod=True, status="delivered", confirmed=True)
-    add_order(session, tenant, now - timedelta(days=3), cod=False)
-    add_order(session, tenant, now - timedelta(days=4), cod=True, status="cancelled", shipped=True)
-    add_order(session, tenant, now - timedelta(days=20), cod=True)  # outside a 7-day window
-    add_event(session, tenant, o1, "ConfirmedOrder", "sent", now - timedelta(hours=5))
-    add_event(session, tenant, o1, "DeliveredPurchase", "failed", now - timedelta(hours=4))
-    add_event(session, tenant, o2, "ConfirmedOrder", "shadow", now - timedelta(hours=3))
-    add_event(session, tenant, o2, "DeliveredPurchase", "late_delivery", now - timedelta(hours=2))
-    add_event(session, tenant, o2, "Other", "stale", now - timedelta(hours=1))  # not a signal event: ignored
+    # week orders: 3 in window (2 COD, 2 confirmed); one placed today (after the window end); one far outside
+    o1 = add_order(session, tenant, day(10, 10), cod=True, confirmed=True, pii=True)
+    o2 = add_order(session, tenant, day(10, 9), cod=True, status="delivered", confirmed=True)
+    o3 = add_order(session, tenant, day(10, 8), cod=False)
+    add_order(session, tenant, day(10, 11, 6), cod=True)
+    add_order(session, tenant, day(9, 1), cod=True)
+    # matured cohort: 3 orders, 1 delivered, 1 COD refused after dispatch
+    add_order(session, tenant, day(9, 28), cod=True, status="delivered")
+    add_order(session, tenant, day(9, 29), cod=True)
+    add_order(session, tenant, day(9, 30), cod=True, status="cancelled", shipped=True)
+    # signal events (event time in window): sent 1, shadow 1, failed 1, stale 1, late 1; "Other" and today's ignored
+    add_event(session, tenant, o1, "ConfirmedOrder", "sent", day(10, 10, 7))
+    add_event(session, tenant, o1, "DeliveredPurchase", "failed", day(10, 10, 8))
+    add_event(session, tenant, o2, "ConfirmedOrder", "shadow", day(10, 9, 7))
+    add_event(session, tenant, o2, "DeliveredPurchase", "late_delivery", day(10, 9, 8))
+    add_event(session, tenant, o3, "ConfirmedOrder", "stale", day(10, 8, 7))
+    add_event(session, tenant, o3, "Other", "stale", day(10, 8, 8))
+    add_event(session, tenant, o3, "DeliveredPurchase", "sent", day(10, 11, 6))
     session.add(Incident(tenant_id=tenant.id, kind="webhook_failed", severity="error",
-                         detected_at=now - timedelta(days=2), detail=f"secret {SECRET_IP}"))
+                         detected_at=day(10, 9), detail=f"secret {SECRET_IP}"))
     session.add(Incident(tenant_id=tenant.id, kind="old_resolved", severity="error",
-                         detected_at=now - timedelta(days=2), resolved_at=now - timedelta(days=1)))
+                         detected_at=day(10, 9), resolved_at=day(10, 10)))
     session.commit()
-    add_delivery(session, tenant, received_at=now - timedelta(days=2))
-    add_delivery(session, tenant, received_at=now - timedelta(hours=6))
-    add_delivery(session, tenant, processed_ok=False, error_type="RuntimeError", received_at=now - timedelta(days=1))
+    add_delivery(session, tenant, received_at=day(10, 9))
+    add_delivery(session, tenant, received_at=day(10, 11, 6))
+    add_delivery(session, tenant, processed_ok=False, error_type="RuntimeError", received_at=day(10, 10))
     add_delivery(session, tenant, signature_ok=False, processed_ok=False, error_type="invalid_signature")
     add_delivery(session, tenant, processed_ok=False, error_type="topic_not_handled")  # ignored topic: not a failure
     add_delivery(session, tenant, processed_ok=True, duplicate=True)
-    add_delivery(session, tenant, processed_ok=False, error_type="RuntimeError", received_at=now - timedelta(days=10))
+    add_delivery(session, tenant, processed_ok=False, error_type="RuntimeError", received_at=day(10, 1))  # 10d old
 
 
 def seed_b(session, tenant):
-    now = utcnow()
     for i in range(5):
-        o = add_order(session, tenant, now - timedelta(days=1, hours=i), cod=True, confirmed=True)
-        add_event(session, tenant, o, "ConfirmedOrder", "sent", now - timedelta(hours=i + 1))
-    session.add(Incident(tenant_id=tenant.id, kind="b_only_incident", severity="error", detected_at=now))
+        o = add_order(session, tenant, day(10, 10, 1 + i), cod=True, confirmed=True)
+        add_event(session, tenant, o, "ConfirmedOrder", "sent", day(10, 10, 2 + i))
+    session.add(Incident(tenant_id=tenant.id, kind="b_only_incident", severity="error", detected_at=day(10, 10)))
     session.commit()
     add_delivery(session, tenant, processed_ok=False, error_type="RuntimeError")
 
@@ -108,9 +127,11 @@ def seed_b(session, tenant):
 @pytest.fixture
 def tenants(db_session, fernet_key):
     a = create_tenant(db_session, name="A Shop", platform="shopify", shop_domain="a.myshopify.com",
-                      meta_dataset_id="111", mode="live")
+                      meta_dataset_id="11111", mode="live")
     b = create_tenant(db_session, name="B Shop", platform="salla", shop_domain="555")
     store_credential(db_session, a.id, "meta_capi_token", SECRET_TOKEN)
+    store_credential(db_session, a.id, "oto_webhook_secret", SECRET_COURIER)
+    create_tenant_key(db_session, a.id, "initial")
     seed_a(db_session, a)
     seed_b(db_session, b)
     return a, b
@@ -120,6 +141,7 @@ def tenants(db_session, fernet_key):
 def client(db_session, monkeypatch, tenants):
     monkeypatch.setenv("HERMES_TENANT_API_KEY", TENANT_KEY)
     monkeypatch.setenv("OPERATOR_API_KEY", OPERATOR_KEY)
+    monkeypatch.setattr(tenant_api, "_now", lambda: NOW)
     factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False)
     app = FastAPI()
     app.include_router(router)
@@ -199,26 +221,57 @@ def test_status_tenant_a(client):
     body = client.get("/v1/tenants/a.myshopify.com/status", headers=AUTH).json()
     assert set(body) == {
         "tenant_key", "platform", "mode", "active", "created_at", "has_meta_credentials", "last_webhook_at",
-        "webhook_failures_7d", "last_capi_event_at", "webhooks_verified", "onboarded"}
+        "webhook_failures_7d", "last_capi_event_at", "webhooks_verified", "checklist_ready", "onboarded",
+        "missing_required_steps", "test_event_code_set"}
     assert body["tenant_key"] == "a.myshopify.com"
     assert body["platform"] == "shopify"
     assert body["mode"] == "live"
     assert body["active"] is True
     assert body["has_meta_credentials"] is True
     assert body["webhooks_verified"] is True
-    assert body["onboarded"] is True
+    assert body["checklist_ready"] is True and body["onboarded"] is True
+    assert body["missing_required_steps"] == []
+    assert body["test_event_code_set"] is False
     # failures: RuntimeError (1d ago) + invalid_signature; excludes topic_not_handled, the duplicate, and the 10d-old row
     assert body["webhook_failures_7d"] == 2
-    assert body["last_webhook_at"] is not None and body["last_capi_event_at"] is not None
+    assert body["last_webhook_at"] == NOW.isoformat()  # latest signature_ok=True delivery
+    assert body["last_capi_event_at"] == day(10, 11, 6).isoformat()
 
 
 def test_status_tenant_b_is_independent(client):
     body = client.get("/v1/tenants/555/status", headers=AUTH).json()
     assert body["platform"] == "salla" and body["mode"] == "shadow"
     assert body["has_meta_credentials"] is False
-    assert body["onboarded"] is False  # no credentials and no dataset id
+    assert body["checklist_ready"] is False and body["onboarded"] is False
+    assert body["missing_required_steps"] == ["meta_dataset", "meta_capi_token", "courier_secret", "api_key"]
     assert body["webhooks_verified"] is True  # one signature_ok row (processing failed, but the signature verified)
     assert body["webhook_failures_7d"] == 1
+
+
+def test_status_checklist_matches_operator_checklist(db_session, client, tenants):
+    """The Tariq status and the operator checklist come from the same function and cannot disagree."""
+    for tenant in tenants:
+        shared = compute_checklist(db_session, tenant)
+        body = client.get(f"/v1/tenants/{tenant.shop_domain}/status", headers=AUTH).json()
+        assert body["checklist_ready"] is shared["ready_for_live"] is body["onboarded"]
+        assert body["missing_required_steps"] == [
+            s["key"] for s in shared["steps"] if s["required"] and s["status"] != "done"]
+
+
+def test_status_reflects_checklist_progress_and_test_event_code(db_session, client, tenants):
+    _, b = tenants
+    path = "/v1/tenants/555/status"
+    b.meta_dataset_id = "22222"
+    b.meta_test_event_code = SECRET_TEST_CODE
+    db_session.commit()
+    store_credential(db_session, b.id, "meta_capi_token", SECRET_TOKEN)
+    body = client.get(path, headers=AUTH).json()
+    assert body["missing_required_steps"] == ["courier_secret", "api_key"]
+    assert body["test_event_code_set"] is True and SECRET_TEST_CODE not in json.dumps(body)
+    store_credential(db_session, b.id, "oto_webhook_secret", SECRET_COURIER)
+    create_tenant_key(db_session, b.id, "initial")
+    body = client.get(path, headers=AUTH).json()
+    assert body["missing_required_steps"] == [] and body["checklist_ready"] is True and body["onboarded"] is True
 
 
 def test_webhooks_verified_requires_a_verified_signature(db_session, client):
@@ -235,38 +288,50 @@ def test_webhooks_verified_requires_a_verified_signature(db_session, client):
     assert body["last_capi_event_at"] is None
 
 
-def test_inactive_tenant_not_onboarded(db_session, client, fernet_key):
-    c = create_tenant(db_session, name="C", platform="shopify", shop_domain="c.myshopify.com", meta_dataset_id="9",
-                      active=False)
-    store_credential(db_session, c.id, "meta_capi_token", SECRET_TOKEN)
-    body = client.get("/v1/tenants/c.myshopify.com/status", headers=AUTH).json()
-    assert body["active"] is False and body["has_meta_credentials"] is True and body["onboarded"] is False
-
-
 # --- /signal-health --------------------------------------------------------------------------------------
 
 def test_signal_health_tenant_a(client):
     body = client.get("/v1/tenants/a.myshopify.com/signal-health", headers=AUTH).json()
-    assert set(body) == {"tenant_key", "window", "orders", "capi_events", "would_have_sent", "open_incidents"}
-    assert set(body["window"]) == {"start", "end", "days"} and body["window"]["days"] == 7
-    assert body["orders"] == {"placed": 4, "cod": 3, "confirmed": 2, "delivered": 1, "refused": 1}
-    assert body["capi_events"] == {"sent": 1, "shadow": 1, "failed": 1, "stale": 0, "late_delivery": 1}
+    assert set(body) == {"tenant_key", "window", "cohort_window", "orders", "cohort", "capi_events",
+                         "would_have_sent", "open_incidents"}
+    assert body["window"] == {"start": day(10, 4, 0).isoformat(), "end": day(10, 11, 0).isoformat(), "days": 7}
+    assert body["cohort_window"] == {"start": day(9, 27, 0).isoformat(), "end": day(10, 4, 0).isoformat()}
+    assert body["orders"] == {"placed": 3, "cod": 2, "confirmed": 2}
+    assert body["cohort"] == {"orders": 3, "delivered": 1, "refused": 1}
+    assert body["capi_events"] == {"sent": 1, "shadow": 1, "failed": 1, "stale": 1, "late_delivery": 1}
     assert body["would_have_sent"] == 1
     assert [i["type"] for i in body["open_incidents"]] == ["webhook_failed"]
     assert set(body["open_incidents"][0]) == {"type", "opened_at"}
 
 
+def test_signal_health_matches_stats_computation(db_session, client, tenants):
+    """Same numbers as the stats endpoints / Sunday digest for the same window (cohort shifted back 7 days)."""
+    a, _ = tenants
+    body = client.get("/v1/tenants/a.myshopify.com/signal-health", headers=AUTH).json()
+    window = (day(10, 4, 0), day(10, 11, 0))
+    week = compute_section(db_session, a.id, "week-orders", window)
+    cohort = compute_section(db_session, a.id, "cohort-delivery", window)["all"]
+    refused = compute_section(db_session, a.id, "refused-cod", window)
+    signal = compute_section(db_session, a.id, "signal-health", window)
+    assert body["orders"] == {"placed": week["placed"], "cod": week["cod"], "confirmed": week["confirmed"]}
+    assert body["cohort"] == {"orders": cohort["orders"], "delivered": cohort["delivered"], "refused": refused["count"]}
+    assert body["capi_events"]["sent"] == signal["confirmed_sent"] + signal["delivered_sent"]
+    assert body["capi_events"]["late_delivery"] == signal["late_delivery"]
+
+
 def test_signal_health_window_changes_counts(client):
-    body = client.get("/v1/tenants/a.myshopify.com/signal-health?window_days=28", headers=AUTH).json()
-    assert body["orders"]["placed"] == 5  # now includes the 20-day-old order
     body = client.get("/v1/tenants/a.myshopify.com/signal-health?window_days=1", headers=AUTH).json()
-    assert body["orders"]["placed"] == 0  # the newest order was placed exactly 1 day before seeding
+    assert body["window"]["start"] == day(10, 10, 0).isoformat()
+    assert body["orders"]["placed"] == 1  # only the Oct 10 order; today's order is after the window end
+    body = client.get("/v1/tenants/a.myshopify.com/signal-health?window_days=28", headers=AUTH).json()
+    assert body["orders"]["placed"] == 6  # now includes the 3 cohort-period orders; Sep 1 is still outside
 
 
 def test_signal_health_tenant_b_only_counts_its_own(client):
     body = client.get("/v1/tenants/555/signal-health", headers=AUTH).json()
     assert body["tenant_key"] == "555"
-    assert body["orders"] == {"placed": 5, "cod": 5, "confirmed": 5, "delivered": 0, "refused": 0}
+    assert body["orders"] == {"placed": 5, "cod": 5, "confirmed": 5}
+    assert body["cohort"] == {"orders": 0, "delivered": 0, "refused": 0}
     assert body["capi_events"] == {"sent": 5, "shadow": 0, "failed": 0, "stale": 0, "late_delivery": 0}
     assert [i["type"] for i in body["open_incidents"]] == ["b_only_incident"]
 
@@ -282,7 +347,7 @@ def test_no_pii_or_secrets_in_responses(client):
             blobs.append(json.dumps(resp.json()) + resp.text)
     blob = "\n".join(blobs)
     for secret in (SECRET_EMAIL_HASH, SECRET_PHONE_HASH, SECRET_ORDER_ID, SECRET_IP, SECRET_UA, SECRET_TOKEN,
-                   SECRET_PAYLOAD_HASH, encrypt_value(SECRET_IP)[:12], "ciphertext"):
+                   SECRET_COURIER, SECRET_TEST_CODE, SECRET_PAYLOAD_HASH, encrypt_value(SECRET_IP)[:12], "ciphertext"):
         assert secret not in blob
     assert "@" not in blob.replace("a.myshopify.com", "")  # no email-like strings
 
@@ -292,19 +357,19 @@ def test_no_pii_in_logs(client, caplog):
         client.get("/v1/tenants/a.myshopify.com/status", headers=AUTH)
         client.get("/v1/tenants/a.myshopify.com/signal-health", headers=AUTH)
     text = "\n".join(r.getMessage() for r in caplog.records)
-    for secret in (SECRET_EMAIL_HASH, SECRET_PHONE_HASH, SECRET_ORDER_ID, SECRET_IP, SECRET_UA, SECRET_TOKEN, TENANT_KEY):
+    for secret in (SECRET_EMAIL_HASH, SECRET_PHONE_HASH, SECRET_ORDER_ID, SECRET_IP, SECRET_UA, SECRET_TOKEN,
+                   SECRET_COURIER, TENANT_KEY):
         assert secret not in text
 
 
 def test_read_only_no_rows_written(db_session, client):
-    before = (db_session.query(Order).count(), db_session.query(CapiEvent).count(),
-              db_session.query(WebhookDelivery).count(), db_session.query(Incident).count())
+    def counts():
+        db_session.expire_all()
+        return tuple(db_session.query(m).count() for m in (Order, CapiEvent, WebhookDelivery, Incident))
+    before = counts()
     client.get("/v1/tenants/a.myshopify.com/status", headers=AUTH)
     client.get("/v1/tenants/a.myshopify.com/signal-health", headers=AUTH)
-    db_session.expire_all()
-    after = (db_session.query(Order).count(), db_session.query(CapiEvent).count(),
-             db_session.query(WebhookDelivery).count(), db_session.query(Incident).count())
-    assert before == after
+    assert before == counts()
 
 
 def test_service_app_includes_router():
