@@ -226,6 +226,7 @@ def _decide(session: Session, sender, tenant: Tenant, order: Order, now: datetim
         user_agent=ua,
         match_hashes={key: getattr(order, f"{key}_hash") for key in MATCH_KEYS},
         event_source_url=event_source_url_for(tenant),
+        test_event_code=getattr(tenant, "meta_test_event_code", None),
         event_time=event_time,
         placed_at=placed_cutoff,
         now=now.timestamp(),
@@ -489,7 +490,8 @@ async def _process_parsed(session, tenant, delivery, parsed, platform, topic, pa
         order.created_at_platform = order.created_at_platform or _platform_created_at(platform, payload)
         # Platforms can redact customer fields on later updates: never overwrite a hash with nothing.
         order.email_hash = hash_email(parsed["email"]) or order.email_hash
-        order.phone_hash = hash_phone(parsed["phone"], parsed["currency"], tenant.country) or order.phone_hash
+        order.phone_hash = hash_phone(parsed["phone"], parsed["currency"], tenant.country,
+                                      ship_country=(parsed.get("address") or {}).get("country")) or order.phone_hash
         for key, hashed in match_hashes_from_parsed(parsed).items():  # external_id + address keys, hashes only
             if hashed:
                 setattr(order, f"{key}_hash", hashed)

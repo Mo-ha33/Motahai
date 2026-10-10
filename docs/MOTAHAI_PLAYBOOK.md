@@ -78,7 +78,7 @@ The checkout IP and user agent are kept until the conversion is sent, so the CAP
 - Decrypted only when the CAPI payload is built.
 - Purged after a **successful live DeliveredPurchase**, or 14 days after capture, whichever comes first. A ConfirmedOrder does not purge.
 
-### D. Meta Graph API v20.0 CAPI Transmitter (`capi_service.py`)
+### D. Meta Graph API CAPI Transmitter (v25.0, `META_GRAPH_API_VERSION`) (`capi_service.py`)
 - **Advanced matching:**
   - Phone: normalized to digits in E.164 form (local Egyptian and Saudi numbers get their country code), then SHA-256 hashed.
   - Email, first name, last name, city, state, zip, country and external ID: trimmed, lower-cased and SHA-256 hashed.
