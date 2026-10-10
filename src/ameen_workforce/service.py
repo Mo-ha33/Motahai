@@ -32,6 +32,7 @@ from .operator_routes import router as operator_router
 from .tenant_key_routes import router as tenant_key_router
 from .onboarding_routes import router as onboarding_router
 from .stats_routes import router as stats_router
+from .audience_routes import router as audience_router
 from .tenant_me_routes import router as tenant_me_router
 from .auth import require_operator, require_hermes  # noqa: F401  (defined in auth.py; re-exported for routes + tests)
 
@@ -72,6 +73,7 @@ app.include_router(operator_router)
 app.include_router(tenant_key_router)
 app.include_router(onboarding_router)
 app.include_router(stats_router)
+app.include_router(audience_router)
 app.include_router(tenant_me_router)
 
 # CORS Policy

@@ -195,3 +195,29 @@ export interface ChecklistResponse {
   ready_for_live: boolean;
   note: string;
 }
+
+export const AUDIENCE_LIST_NAMES = ['exclude_refusers', 'seed_delivered_buyers'] as const;
+export type AudienceListName = (typeof AUDIENCE_LIST_NAMES)[number];
+
+/** Counts and timestamps only: the API never returns hashes or row contents in the status. */
+export interface AudienceListStatus {
+  name: AudienceListName;
+  rows: number | null;
+  updated_at: string | null;
+  size_bytes: number | null;
+}
+
+export interface AudienceSchedule {
+  job_name: string;
+  last_run_at: string | null;
+  last_run_ok: boolean | null;
+  last_error_type: string | null;
+  next_due_at: string | null;
+}
+
+export interface AudiencesStatus {
+  tenant_id: number;
+  min_list_rows: number;
+  lists: AudienceListStatus[];
+  schedule: AudienceSchedule;
+}

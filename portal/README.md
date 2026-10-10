@@ -117,3 +117,18 @@ Secrets handling:
 Switching a tenant to live is deliberately not offered; the checklist's `ready_for_live` is informational and the
 switch stays a separate operator action. Step fields are config-driven (`src/onboarding/fields.ts`); copy lives
 under `onboarding` in `src/i18n.ts` (ar + en).
+
+## Audiences page (M4-5, #52)
+
+Route `#/audiences`. Shows the two hashed Meta customer lists (`exclude_refusers`, `seed_delivered_buyers`) with row
+count, last-updated time and a warning when a list is under the API's `min_list_rows` (Meta may not use small
+audiences), plus the weekly export schedule (last run, ok/failed, next due). Backed by
+`/v1/tenants/{id}/audiences` (status), `/{name}.csv` (download) and `POST /export` (operator only).
+
+- The tenant comes from the session (tenant mode) or the tenant filter card (operator mode).
+- Downloads go through the authenticated client (`fetch` -> Blob -> temporary object URL, revoked right after the
+  click) because a plain link cannot carry the bearer token. Hashes are never rendered on the page.
+- A tenant key needs the `audiences:read` scope, which an operator must grant explicitly (new keys default to
+  `stats:read`). A 401 on this page in tenant mode shows an "ask your operator to grant audience access" message and
+  does NOT sign out, since the key is still valid for stats.
+- "Export now" is shown in operator mode only (a tenant key gets 403 from the API).

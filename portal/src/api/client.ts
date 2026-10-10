@@ -76,14 +76,20 @@ export interface Transport {
   baseUrl: string;
   /** `path` is appended to baseUrl. Errors are mapped to ApiError (status 0 = network failure). */
   request<T>(path: string, options?: RequestOptions): Promise<T>;
+  /** Same auth and error mapping as `request`, but resolves the response body as a Blob (file downloads). */
+  requestBlob(path: string, options?: Pick<RequestOptions, 'signal'>): Promise<Blob>;
 }
 
 /** The one place that builds headers, calls fetch and maps failures to ApiError. */
 export function createTransport({ baseUrl = '', auth = sameOriginAuth, fetchImpl }: TransportOptions = {}): Transport {
   const doFetch: typeof fetch = fetchImpl ?? ((...args) => fetch(...args));
 
-  async function request<T>(path: string, { method = 'GET', body, signal }: RequestOptions = {}): Promise<T> {
-    const headers: Record<string, string> = { Accept: 'application/json', ...(await auth.headers()) };
+  async function send(
+    path: string,
+    accept: string,
+    { method = 'GET', body, signal }: RequestOptions,
+  ): Promise<Response> {
+    const headers: Record<string, string> = { Accept: accept, ...(await auth.headers()) };
     const init: RequestInit = { headers, signal };
     if (method !== 'GET') {
       init.method = method;
@@ -100,20 +106,40 @@ export function createTransport({ baseUrl = '', auth = sameOriginAuth, fetchImpl
       if (signal?.aborted) throw err;
       throw new ApiError(0, err instanceof Error ? err.message : 'Network error');
     }
+    if (!response.ok) {
+      let parsed: unknown = null;
+      try {
+        parsed = await response.json();
+      } catch {
+        parsed = null;
+      }
+      throw new ApiError(response.status, detailFrom(parsed, response.statusText || 'Request failed'));
+    }
+    return response;
+  }
 
+  async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+    const response = await send(path, 'application/json', options);
     let parsed: unknown = null;
     try {
       parsed = await response.json();
     } catch {
       parsed = null;
     }
-    if (!response.ok) {
-      throw new ApiError(response.status, detailFrom(parsed, response.statusText || 'Request failed'));
-    }
     return parsed as T;
   }
 
-  return { baseUrl, request };
+  async function requestBlob(path: string, { signal }: Pick<RequestOptions, 'signal'> = {}): Promise<Blob> {
+    const response = await send(path, 'text/csv', { signal });
+    try {
+      return await response.blob();
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      throw new ApiError(0, err instanceof Error ? err.message : 'Network error');
+    }
+  }
+
+  return { baseUrl, request, requestBlob };
 }
 
 export function createStatsClient({
