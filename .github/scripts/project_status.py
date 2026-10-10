@@ -12,7 +12,10 @@ Environment:
   EVENT_ACTION  event action (closed / reopened) for issues events
   ISSUE_NUMBER  issue number for issues events
 
-Exit codes: 0 ok or skipped, 1 failure (bad input, no matching Status option, gh error).
+Exit codes: 0 ok or skipped, 1 failure (bad input, no matching Status option, gh error,
+or any per-item failure). Items are applied one by one; a failing item is reported and the
+rest still run. Every error is also printed as a GitHub annotation on stdout, because only
+annotations are visible without the Actions log.
 """
 
 import json
@@ -23,6 +26,8 @@ import sys
 OWNER = "Mo-ha33"
 PROJECT_NUMBER = 3
 STATUS_FIELD = "Status"
+ANNOTATION_TITLE = "project-status"
+GH_STDERR_LIMIT = 500
 
 # Status names that mean the same thing (lowercase, whitespace-normalised).
 STATUS_ALIASES = ({"review", "in review"},)
@@ -99,10 +104,27 @@ def match_option(wanted, options):
     return None
 
 
+def escape_annotation(message):
+    """Escape a message for a GitHub workflow command (Actions escaping rules)."""
+    return message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def report_error(message):
+    """Print a run-level error as an annotation (and to stderr for local runs)."""
+    print(f"::error title={ANNOTATION_TITLE}::{escape_annotation(message)}", flush=True)
+    print(f"error: {message}", file=sys.stderr)
+
+
+def report_item_error(number, message):
+    """Print a per-item error as an annotation (and to stderr for local runs)."""
+    print(f"::error::#{number}: {escape_annotation(message)}", flush=True)
+    print(f"error: #{number}: {message}", file=sys.stderr)
+
+
 def _gh_json(args):
     proc = subprocess.run(["gh", *args], capture_output=True, text=True)
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip()
+        detail = (proc.stderr.strip() or proc.stdout.strip() or "no output")[:GH_STDERR_LIMIT]
         raise StatusError(f"gh {' '.join(args[:2])} failed: {detail}")
     return json.loads(proc.stdout)
 
@@ -130,6 +152,22 @@ def load_status_field():
     return project["id"], field["id"], field["options"]
 
 
+def apply_status(repo, project_id, field_id, number, option):
+    """Add issue #number to the project (if needed) and set its Status to `option`."""
+    node_id = _gh_json(["api", f"repos/{repo}/issues/{number}"])["node_id"]
+    # addProjectV2ItemById returns the existing item when the issue is already on the board.
+    item_id = graphql(ADD_ITEM_MUTATION, project=project_id, content=node_id)[
+        "addProjectV2ItemById"
+    ]["item"]["id"]
+    graphql(
+        SET_STATUS_MUTATION,
+        project=project_id,
+        item=item_id,
+        field=field_id,
+        option=option["id"],
+    )
+
+
 def main(env=os.environ):
     if not env.get("GH_TOKEN"):
         print("::notice::ADD_TO_PROJECT_PAT secret not set; skipping project status update.")
@@ -155,25 +193,24 @@ def main(env=os.environ):
                 available = ", ".join(o["name"] for o in options)
                 raise StatusError(f'#{number}: no Status option matches "{wanted}". Available: {available}')
             plan.append((number, option))
-
-        for number, option in plan:
-            node_id = _gh_json(["api", f"repos/{repo}/issues/{number}"])["node_id"]
-            # addProjectV2ItemById returns the existing item when the issue is already on the board.
-            item_id = graphql(ADD_ITEM_MUTATION, project=project_id, content=node_id)[
-                "addProjectV2ItemById"
-            ]["item"]["id"]
-            graphql(
-                SET_STATUS_MUTATION,
-                project=project_id,
-                item=item_id,
-                field=field_id,
-                option=option["id"],
-            )
-            print(f"#{number} -> {option['name']}")
     except StatusError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        report_error(str(exc))
         return 1
-    return 0
+
+    # Per-item failures are recorded and the run continues with the remaining items.
+    failures = 0
+    for number, option in plan:
+        try:
+            apply_status(repo, project_id, field_id, number, option)
+        except StatusError as exc:
+            failures += 1
+            report_item_error(number, str(exc))
+        except (KeyError, TypeError, ValueError) as exc:
+            failures += 1
+            report_item_error(number, f"unexpected gh response: {exc!r}")
+        else:
+            print(f"::notice::#{number} -> {option['name']}", flush=True)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
