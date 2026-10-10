@@ -28,6 +28,7 @@ from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
 from .db import init_db
 from .webhook_routes import router as webhook_router
 from .capture_routes import router as capture_router
+from .operator_routes import router as operator_router
 from .tenant_key_routes import router as tenant_key_router
 from .stats_routes import router as stats_router
 from .tenant_me_routes import router as tenant_me_router
@@ -66,6 +67,7 @@ app = FastAPI(
 )
 app.include_router(webhook_router)
 app.include_router(capture_router)
+app.include_router(operator_router)
 app.include_router(tenant_key_router)
 app.include_router(stats_router)
 app.include_router(tenant_me_router)

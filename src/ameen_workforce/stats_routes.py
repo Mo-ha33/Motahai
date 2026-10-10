@@ -6,6 +6,7 @@ stats_routes.py — Tenant-scoped, read-only stats endpoints over the Sunday-dig
   GET /v1/tenants/{tenant_id}/stats/refused-cod       -> digest.q_refused_cod
   GET /v1/tenants/{tenant_id}/stats/signal-health     -> digest.q_signal_health
   GET /v1/tenants/{tenant_id}/stats/creatives         -> digest.q_creatives
+  GET /v1/tenants/{tenant_id}/stats/health-score      -> health_score.tenant_health_score
   GET /v1/tenants/{tenant_id}/stats/summary           -> all five in one response
 
 Every response is {"tenant_id", "currency", "window": {"start", "end"}, "data": ...} ("currency" = the tenant's ISO
@@ -33,6 +34,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .db import Tenant, get_session_factory
 from .tenant_auth import ensure_tenant_matches, require_operator_or_tenant_key
+from .health_score import tenant_health_score
 from .digest import q_cohort_delivery, q_creatives, q_refused_cod, q_signal_health, q_week_orders
 
 DEFAULT_WINDOW_DAYS = 7
@@ -123,6 +125,21 @@ def _add_route(name: str) -> None:
 
 for _name in SECTIONS:
     _add_route(_name)
+
+
+@router.get("/health-score")
+def stats_health_score(tenant_id: int, caller: Optional[Tenant] = Depends(require_stats_auth),  # auth first: before 422s
+                       window: Window = Depends(get_window),
+                       factory: sessionmaker = Depends(get_stats_session_factory)) -> Dict[str, Any]:
+    if caller is not None:
+        ensure_tenant_matches(caller, tenant_id)
+    with factory() as session:
+        tenant = session.get(Tenant, tenant_id)
+        if tenant is None:
+            raise HTTPException(status_code=404, detail="Unknown tenant")
+        data = tenant_health_score(session, tenant_id, window)
+        currency = tenant.currency
+    return {"tenant_id": tenant_id, "currency": currency, "window": _iso(window), "data": data}
 
 
 @router.get("/summary")

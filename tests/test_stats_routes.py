@@ -248,6 +248,29 @@ def test_operator_key_still_works_alongside_tenant_keys(client, tenants):
     assert client.get(url(b.id, "summary"), headers=AUTH).status_code == 200
 
 
+def test_health_score_requires_credentials(client, tenants):
+    a, _ = tenants
+    assert client.get(url(a.id, "health-score")).status_code == 401
+    assert client.get(url(a.id, "health-score", "start=nope")).status_code == 401  # auth before 422
+    assert client.get(url(a.id, "health-score"), headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_health_score_tenant_key_own_tenant_ok(client, db_session, tenants):
+    a, _ = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    resp = client.get(url(a.id, "health-score"), headers=bearer(key))
+    assert resp.status_code == 200
+    assert resp.json()["tenant_id"] == a.id and resp.json()["currency"] == "EGP"
+
+
+def test_health_score_tenant_key_for_another_tenant_is_404(client, db_session, tenants):
+    a, b = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    other = client.get(url(b.id, "health-score"), headers=bearer(key))
+    unknown = client.get(url(99999, "health-score"), headers=bearer(key))
+    assert other.status_code == 404 and other.json() == unknown.json()
+
+
 def test_tenant_me_happy_path(client, db_session, tenants):
     a, _ = tenants
     _, key = create_tenant_key(db_session, a.id)
