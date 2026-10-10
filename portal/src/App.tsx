@@ -6,10 +6,21 @@ import {
   storeLang,
   type Lang,
 } from './i18n';
+import { defaultDashboard, type DashboardConfig } from './config/dashboard';
+import { DashboardPage } from './dashboard/DashboardPage';
+import { FiltersProvider } from './filters/FiltersContext';
+import {
+  applyThemeMode,
+  nextThemeMode,
+  readStoredThemeMode,
+  storeThemeMode,
+  type ThemeMode,
+} from './theme';
 import { hrefFor, ROUTES, useHashRoute, type Route } from './router';
 
-export default function App() {
+export default function App({ config = defaultDashboard }: { config?: DashboardConfig }) {
   const [lang, setLang] = useState<Lang>(() => readStoredLang());
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredThemeMode());
   const route = useHashRoute('signal');
   const t = dictionaries[lang];
 
@@ -18,14 +29,30 @@ export default function App() {
     storeLang(lang);
   }, [lang]);
 
+  useEffect(() => {
+    applyThemeMode(themeMode);
+    storeThemeMode(themeMode);
+  }, [themeMode]);
+
   const toggleLang = () => setLang((current) => (current === 'ar' ? 'en' : 'ar'));
 
+  const page = route ? config.pages[route] : undefined;
   const pageTitle = route ? t.pages[route].title : t.productName;
 
   return (
+    <FiltersProvider>
     <div className="app">
       <header className="app-header">
         <span className="brand">{t.productName}</span>
+        <div className="header-actions">
+        <button
+          type="button"
+          className="lang-toggle"
+          onClick={() => setThemeMode(nextThemeMode)}
+          aria-label={`${t.theme.label}: ${t.theme[themeMode]}`}
+        >
+          {t.theme.label}: {t.theme[themeMode]}
+        </button>
         <button
           type="button"
           className="lang-toggle"
@@ -34,6 +61,7 @@ export default function App() {
         >
           {t.language}
         </button>
+        </div>
       </header>
 
       <div className="app-body">
@@ -55,10 +83,15 @@ export default function App() {
 
         <main className="content">
           <h1 className="page-title">{pageTitle}</h1>
-          <EmptyState lang={lang} route={route} />
+          {page ? (
+            <DashboardPage key={route} config={page} lang={lang} />
+          ) : (
+            <EmptyState lang={lang} route={route} />
+          )}
         </main>
       </div>
     </div>
+    </FiltersProvider>
   );
 }
 

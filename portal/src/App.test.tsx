@@ -8,6 +8,7 @@ describe('App shell', () => {
     window.location.hash = '';
     document.documentElement.lang = '';
     document.documentElement.dir = '';
+    document.documentElement.removeAttribute('data-theme');
   });
 
   afterEach(() => {
@@ -32,7 +33,23 @@ describe('App shell', () => {
     expect(document.documentElement.lang).toBe('en');
     expect(screen.getByRole('button', { name: 'العربية' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Delivered ROAS' })).toBeTruthy();
-    expect(screen.getByText('No data yet')).toBeTruthy();
+    expect(screen.getByText('Choose a tenant')).toBeTruthy();
+  });
+
+  it('cycles the theme mode and sets data-theme', () => {
+    render(<App />);
+
+    fireEvent.click(screen.getByRole('button', { name: /المظهر: تلقائي/ }));
+    expect(document.documentElement.getAttribute('data-theme')).toBe('light');
+    fireEvent.click(screen.getByRole('button', { name: /المظهر: فاتح/ }));
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
+    expect(window.localStorage.getItem('motahai.theme')).toBe('dark');
+  });
+
+  it('prompts for a tenant on dashboard pages instead of calling the API', () => {
+    window.location.hash = '#/roas';
+    render(<App />);
+    expect(screen.getByText('اختر متجرًا')).toBeTruthy();
   });
 
   it('shows the empty state for a known route and not-found for an unknown one', () => {
