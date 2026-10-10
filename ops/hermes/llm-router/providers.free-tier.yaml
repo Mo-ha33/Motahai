@@ -39,7 +39,9 @@ providers:
   - name: nvidia
     base_url: https://integrate.api.nvidia.com/v1
     key_env: NVIDIA_API_KEY
-    model: meta/llama-3.3-70b-instruct      # tool-calling capable on NIM; NOT deepseek-r1 (no tools, <think> noise)
+    # 2026-10-11: llama-3.3-70b returned 410 Gone (EOL 2026-08-26). tool_conformance.py --runs 3:
+    # nemotron-3-super 100 % / 0 malformed / p50 850 ms; glm-5.3 4 errors, p50 31 s; kimi-k2.6 all errors.
+    model: nvidia/nemotron-3-super-120b-a12b
     context_window: 131072
     max_output_tokens: 2048
     rpm: 30                                  # ~40 RPM free limit; 25% headroom, spill early
@@ -79,7 +81,7 @@ providers:
   - name: openrouter-free
     base_url: https://openrouter.ai/api/v1
     key_env: OPENROUTER_API_KEY
-    model: meta-llama/llama-3.3-70b-instruct:free
+    model: nvidia/nemotron-3-super-120b-a12b:free   # 2026-10-11 conformance --runs 2: 100 %, 0 malformed
     context_window: 131072
     max_output_tokens: 2048
     rpm: 15
@@ -88,12 +90,11 @@ providers:
     max_concurrency: 2
     timeout_s: 60
     extra_body:
-      # OpenRouter tries these in order inside ONE request (its own fallback). [VERIFY]
-      # current :free slugs with GET https://openrouter.ai/api/v1/models before the demo.
+      # OpenRouter tries these in order inside ONE request (its own fallback). Only list slugs that
+      # passed tool_conformance.py (all three previous :free slugs were delisted by 2026-10-11;
+      # google/gemma-4-31b-it:free errored on every tool call). Re-check GET /api/v1/models monthly.
       models:
-        - meta-llama/llama-3.3-70b-instruct:free
-        - deepseek/deepseek-chat-v3-0324:free
-        - qwen/qwen-2.5-72b-instruct:free
+        - nvidia/nemotron-3-super-120b-a12b:free
       provider:
         require_parameters: true
     extra_headers:
