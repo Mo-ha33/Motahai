@@ -36,8 +36,8 @@ logger = logging.getLogger("ameen_workforce.capi")
 # Meta expires each Graph API version about two years after release; a call to an expired version is silently served by
 # the oldest live version instead of failing. v20.0 expired 2026-09-24. Expiration dates are from Meta's version table:
 # https://developers.facebook.com/docs/graph-api/changelog/versions (tests fail 90 days before the pinned one expires).
-META_GRAPH_API_VERSION = "v22.0"
-META_GRAPH_API_VERSION_EXPIRES = date(2027, 5, 20)
+META_GRAPH_API_VERSION = "v25.0"
+META_GRAPH_API_VERSION_EXPIRES = date(2028, 7, 29)
 # Operator override (e.g. to move to a newer version before a release); must look like "v23.0". Read per send.
 META_GRAPH_API_VERSION_ENV = "MOTAHAI_META_GRAPH_API_VERSION"
 _GRAPH_VERSION = re.compile(r"^v[0-9]{2,3}\.0$")
