@@ -5,4 +5,5 @@ export const statsClient = createStatsClient();
 
 export * from './auth';
 export * from './client';
+export * from './onboarding';
 export * from './types';

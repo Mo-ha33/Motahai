@@ -482,3 +482,323 @@ body {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* Health score */
+.health-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4) var(--space-8);
+}
+
+.health-gauge-wrap {
+  position: relative;
+  inline-size: min(240px, 100%);
+}
+
+.health-gauge {
+  display: block;
+  inline-size: 100%;
+  block-size: auto;
+}
+
+.health-gauge-track,
+.health-gauge-fill {
+  fill: none;
+  stroke-width: 14;
+  stroke-linecap: round;
+}
+
+.health-gauge-track {
+  stroke: var(--color-surface-muted);
+}
+
+.health-gauge-fill {
+  stroke: var(--color-text-muted);
+}
+
+.health-gauge[data-tone="positive"] .health-gauge-fill { stroke: var(--color-positive); }
+.health-gauge[data-tone="warning"] .health-gauge-fill { stroke: var(--color-warning); }
+.health-gauge[data-tone="negative"] .health-gauge-fill { stroke: var(--color-negative); }
+
+.health-score-text {
+  position: absolute;
+  inset-inline: 0;
+  inset-block-end: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.1;
+}
+
+.health-score-value {
+  font-size: calc(var(--font-size-kpi) * 1.6);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.health-score-max {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.health-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  flex: 1 1 200px;
+  min-inline-size: 0;
+}
+
+.health-chip {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  padding-block: var(--space-1);
+  padding-inline: var(--space-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-text-muted);
+  color: var(--color-text-muted);
+}
+
+.health-chip[data-tone="positive"] { border-color: var(--color-positive); color: var(--color-positive); }
+.health-chip[data-tone="warning"] { border-color: var(--color-warning); color: var(--color-warning); }
+.health-chip[data-tone="negative"] { border-color: var(--color-negative); color: var(--color-negative); }
+
+.health-insufficient {
+  margin: 0;
+}
+
+.health-penalties {
+  margin-block-start: var(--space-4);
+}
+
+.health-penalties-title {
+  font-size: 0.875rem;
+  margin: 0 0 var(--space-2);
+}
+
+.health-penalty-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.health-penalty {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding-block: var(--space-2);
+  border-block-start: 1px solid var(--color-border);
+}
+
+.health-penalty-main {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+.health-penalty-evidence {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+.health-penalty-points {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-negative);
+  white-space: nowrap;
+}
+
+.widget-source-error {
+  border-color: var(--color-negative);
+}
+
+/* Onboarding wizard */
+.onboarding {
+  display: grid;
+  gap: var(--space-4);
+  max-inline-size: 640px;
+}
+
+.stepper {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.stepper-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font: inherit;
+  font-size: 0.8125rem;
+  color: var(--color-text);
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding-block: var(--space-1);
+  padding-inline: var(--space-3);
+  cursor: pointer;
+}
+
+.stepper-item[aria-current="step"] {
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  border-color: var(--color-accent);
+}
+
+.stepper-item:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.stepper-n {
+  font-weight: 700;
+}
+
+.step-card {
+  max-inline-size: none;
+  display: grid;
+  gap: var(--space-3);
+}
+
+.step-card h2,
+.step-card p {
+  margin: 0;
+}
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.onboarding .filter-input {
+  inline-size: 100%;
+  box-sizing: border-box;
+  min-block-size: 36px;
+}
+
+.onboarding-error {
+  border: 1px solid var(--color-negative);
+  border-radius: var(--radius-sm);
+  color: var(--color-negative);
+  padding: var(--space-3);
+  display: grid;
+  gap: var(--space-1);
+  font-size: 0.875rem;
+}
+
+.onboarding-error-detail {
+  overflow-wrap: anywhere;
+}
+
+.once-warning {
+  border: 1px solid var(--color-warning);
+  border-radius: var(--radius-sm);
+  color: var(--color-warning) !important;
+  padding: var(--space-3);
+  font-size: 0.875rem;
+}
+
+.once-panel {
+  display: grid;
+  gap: var(--space-3);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  margin: 0;
+  min-inline-size: 0;
+}
+
+.copy-field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.copy-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+
+.copy-input {
+  flex: 1;
+  min-inline-size: 0;
+}
+
+.copy-button {
+  margin-block-start: 0;
+}
+
+.check-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.checklist-item {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  border-block-end: 1px solid var(--color-border);
+  padding-block-end: var(--space-2);
+}
+
+.checklist-status {
+  flex: none;
+  min-inline-size: 56px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-align: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1);
+}
+
+.checklist-item[data-status="done"] .checklist-status {
+  color: var(--color-positive);
+  border-color: var(--color-positive);
+}
+
+.checklist-item[data-status="missing"] .checklist-status {
+  color: var(--color-negative);
+  border-color: var(--color-negative);
+}
+
+.checklist-item[data-status="manual"] .checklist-status {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.checklist-main {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+.checklist-ready {
+  font-weight: 700;
+}
+
+.checklist-ready[data-ready="true"] {
+  color: var(--color-positive) !important;
+}

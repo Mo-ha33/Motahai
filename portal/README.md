@@ -25,7 +25,7 @@ src/config/dashboard.ts   pages: filters + ordered widget instances (type, title
 src/config/metrics.ts     metric registry: id, label/hint i18n keys, format, select(summary)
 src/widgets/              widget components, registered by type in widgets/index.ts
 src/filters/              filter cards (tenant, date-range), registered in filters/registry.ts
-src/dashboard/            StatsProvider (one summary fetch per tenant + window), DashboardPage
+src/dashboard/            StatsProvider (parallel fetch of the page's sources per tenant + window), DashboardPage
 src/api/                  typed Stats API client, pluggable auth, one shared client instance
 src/i18n.ts               typed ar (primary) / en dictionaries; a missing key fails tsc
 src/theme.ts, tokens.css  theme mode and design tokens
@@ -35,6 +35,19 @@ Data flow: `FiltersProvider` (tenant + range, persisted in localStorage) -> `Sta
 `GET /v1/tenants/{id}/stats/summary?start&end` -> `DashboardPage` renders the page's widgets in a
 12-column grid (`span` 3/4/6/8/12; full width under 720px). No mock data ships in `src/`; fixtures
 live in `src/test/fixtures` and `*.test.*` only.
+
+### Data sources
+A page declares `sources` (default `['summary']`) and each widget instance a `source` (default
+`'summary'`). `StatsProvider` fetches the page's sources in parallel per tenant + window under one abort
+controller and keeps a state per source, so a failing source shows an error card only in the widgets it
+feeds (a page whose sources all fail shows the single page-level error card). A widget receives
+`data`/`envelope` of its own source (`WidgetProps<Options, DataShape>`). Current sources: `summary`
+(`/stats/summary`) and `health-score` (`/stats/health-score`, used by the `health-score` widget on the
+Signal page).
+
+To add a source: add its id to `StatsSourceId` and its data type to `SourceDataMap` in `src/api/types.ts`,
+a method on `StatsClient` in `src/api/client.ts`, one entry in `FETCHERS` in
+`src/dashboard/StatsProvider.tsx`, then list it in the page's `sources` and set `source` on its widgets.
 
 ### Add a metric
 1. Add its id to `METRIC_IDS` and a `MetricDef` in `src/config/metrics.ts` (`select` returns
@@ -83,3 +96,24 @@ The portal opens on a sign-in screen with two modes (`src/auth/`):
 
 `ApiProvider` (`src/dashboard/ApiContext.tsx`) builds the app-wide client from the session; tests can
 inject `fetchImpl` via `<App fetchImpl={...} />`.
+
+## Onboarding wizard (operator only)
+
+The `#/onboarding` route is a five-step wizard over `/v1/operator/onboarding/*` (`src/api/onboarding.ts`,
+`src/onboarding/`): create tenant (or continue one by id), Meta dataset + CAPI token, Bosta/OTO webhook secrets,
+first API key, checklist. Tenant-mode sessions see an "operator only" card and make no calls; the client always uses
+same-origin auth (the dev proxy adds the operator key).
+
+Secrets handling:
+
+- The CAPI token is a `type=password`, `autocomplete=off` input, cleared from component state as soon as the request
+  is issued; it is never echoed back, shown or stored.
+- Courier secrets/URLs and the first API key come back from the server exactly once. They are shown in a "copy now"
+  panel (clipboard API, with select-text fallback) and live only in component state; leaving the step or the page
+  drops them. They are never written to any storage and never logged.
+- The only thing persisted is the numeric tenant id in `sessionStorage` (`motahai.onboarding.tenant`), so a reload
+  resumes at the checklist.
+
+Switching a tenant to live is deliberately not offered; the checklist's `ready_for_live` is informational and the
+switch stays a separate operator action. Step fields are config-driven (`src/onboarding/fields.ts`); copy lives
+under `onboarding` in `src/i18n.ts` (ar + en).
