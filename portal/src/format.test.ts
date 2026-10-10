@@ -14,6 +14,15 @@ describe('formatMetric', () => {
     expect(formatMetric(1.42, 'ratio', 'ar')).toMatch(/^×/);
   });
 
+  it('formats money with the envelope currency and falls back to a plain number', () => {
+    expect(formatMetric(450.5, 'money', 'en', 'EGP')).toMatch(/EGP/);
+    expect(formatMetric(450.5, 'money', 'en', 'USD')).toBe('$450.50');
+    expect(formatMetric(450.5, 'money', 'ar', 'EGP')).toMatch(/[٠-٩]/);
+    expect(formatMetric(450.5, 'money', 'en', undefined)).toBe('450.50');
+    expect(formatMetric(450.5, 'money', 'en', 'not-a-code')).toBe('450.50');
+    expect(formatMetric(1234, 'count', 'en', 'EGP')).toBe('1,234');
+  });
+
   it('renders null as an em dash', () => {
     expect(formatMetric(null, 'percent', 'en')).toBe('—');
   });

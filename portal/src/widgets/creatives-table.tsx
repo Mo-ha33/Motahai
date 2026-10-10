@@ -18,7 +18,7 @@ const COLUMN_FORMAT: Record<Exclude<CreativeColumn, 'ad_id'>, MetricFormat> = {
   delivered_value: 'money',
 };
 
-export function CreativesTableWidget({ data, instance, lang }: WidgetProps<CreativesTableOptions>) {
+export function CreativesTableWidget({ data, envelope, instance, lang }: WidgetProps<CreativesTableOptions>) {
   const t = dictionaries[lang];
   const { columns, limit } = instance.options;
   const rows = limit === undefined ? data.creatives : data.creatives.slice(0, limit);
@@ -48,7 +48,7 @@ export function CreativesTableWidget({ data, instance, lang }: WidgetProps<Creat
                       </th>
                     ) : (
                       <td key={column} data-numeric="">
-                        {formatMetric(row[column], COLUMN_FORMAT[column], lang)}
+                        {formatMetric(row[column], COLUMN_FORMAT[column], lang, envelope.currency)}
                       </td>
                     ),
                   )}

@@ -17,6 +17,20 @@ describe('stats client', () => {
     expect(f.mock.calls[0][0]).toBe('/v1/tenants/7/stats/summary?start=2026-10-03&end=2026-10-10');
   });
 
+  it('me() calls /v1/tenant/me with auth and maps errors like stats calls', async () => {
+    const profile = { tenant_id: 7, name: 'A', currency: 'EGP', country: 'EG', mode: 'live', platform: 'salla' };
+    const f = fakeFetch((_url, init) =>
+      (init?.headers as Record<string, string>).Authorization === 'Bearer tk'
+        ? jsonResponse(profile)
+        : jsonResponse({ detail: 'Invalid or missing API key' }, 401),
+    );
+    const ok = createStatsClient({ auth: bearerAuth(() => 'tk'), fetchImpl: f });
+    expect(await ok.me()).toEqual(profile);
+    expect(f.mock.calls[0][0]).toBe('/v1/tenant/me');
+    const bad = createStatsClient({ fetchImpl: f });
+    await expect(bad.me()).rejects.toMatchObject({ status: 401 });
+  });
+
   it('prefixes baseUrl, encodes the tenant id and targets a section', async () => {
     const f = fakeFetch(() => jsonResponse({}));
     const client = createStatsClient({ baseUrl: 'http://api.test', fetchImpl: f });

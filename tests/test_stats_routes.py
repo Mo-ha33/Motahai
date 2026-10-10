@@ -16,6 +16,9 @@ from sqlalchemy.orm import sessionmaker
 from src.ameen_workforce import digest
 from src.ameen_workforce.db import CapiEvent, Order, OrderStatusEvent, create_tenant
 from src.ameen_workforce.stats_routes import get_stats_session_factory, router
+from src.ameen_workforce.tenant_auth import create_tenant_key, revoke_tenant_key
+from src.ameen_workforce.tenant_me_routes import router as me_router
+from src.ameen_workforce.webhook_routes import get_session_factory_dep
 
 OPERATOR_KEY = "op-key-for-stats-tests"
 AUTH = {"Authorization": f"Bearer {OPERATOR_KEY}"}
@@ -81,7 +84,9 @@ def client(db_session, fernet_key, monkeypatch, tenants):
     factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False)
     app = FastAPI()
     app.include_router(router)
+    app.include_router(me_router)
     app.dependency_overrides[get_stats_session_factory] = lambda: factory
+    app.dependency_overrides[get_session_factory_dep] = lambda: factory
     return TestClient(app)
 
 
@@ -188,3 +193,96 @@ def test_tenant_isolation(client, db_session, tenants):
     # the tenant can only come from the path: a spoofed query param or header changes nothing
     spoof = client.get(url(a.id, "summary", QS + f"&tenant_id={b.id}"), headers={**AUTH, "X-Tenant-Id": str(b.id)})
     assert spoof.json()["data"] == want_a
+
+
+# --- tenant API key access (M4-2 #49) ---------------------------------------------------------------------------
+
+def bearer(key):
+    return {"Authorization": f"Bearer {key}"}
+
+
+def test_responses_carry_tenant_currency(client, tenants):
+    a, _ = tenants
+    for name in ("week-orders", "summary"):
+        assert client.get(url(a.id, name), headers=AUTH).json()["currency"] == a.currency == "EGP"
+
+
+def test_tenant_key_reads_own_stats(client, db_session, tenants):
+    a, _ = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    resp = client.get(url(a.id, "summary"), headers=bearer(key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["currency"] == "EGP" and body["tenant_id"] == a.id
+    assert body["data"] == expected(db_session, a.id)
+
+
+def test_tenant_key_for_another_tenant_is_404(client, db_session, tenants):
+    a, b = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    other = client.get(url(b.id, "summary"), headers=bearer(key))
+    unknown = client.get(url(99999, "summary"), headers=bearer(key))
+    assert other.status_code == 404 and unknown.status_code == 404
+    assert other.json() == unknown.json()
+
+
+def test_bad_tenant_credentials_are_uniform_401(client, db_session, tenants):
+    a, _ = tenants
+    row, revoked = create_tenant_key(db_session, a.id)
+    revoke_tenant_key(db_session, row.id)
+    _, wrong_scope = create_tenant_key(db_session, a.id, scopes="other:read")
+    bodies = set()
+    for header in (bearer(revoked), bearer(wrong_scope), bearer("mtk_deadbeef_garbage"), bearer("mtk_"), {}):
+        resp = client.get(url(a.id, "summary"), headers=header)
+        assert resp.status_code == 401
+        bodies.add(resp.text if header else None)
+    bodies.discard(None)
+    assert len(bodies) == 1  # revoked / wrong scope / garbage are indistinguishable
+    # a bad bad-window request without credentials is still 401, not 422
+    assert client.get(url(a.id, "summary", "start=nope")).status_code == 401
+
+
+def test_operator_key_still_works_alongside_tenant_keys(client, tenants):
+    a, b = tenants
+    assert client.get(url(a.id, "summary"), headers=AUTH).status_code == 200
+    assert client.get(url(b.id, "summary"), headers=AUTH).status_code == 200
+
+
+def test_health_score_requires_credentials(client, tenants):
+    a, _ = tenants
+    assert client.get(url(a.id, "health-score")).status_code == 401
+    assert client.get(url(a.id, "health-score", "start=nope")).status_code == 401  # auth before 422
+    assert client.get(url(a.id, "health-score"), headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_health_score_tenant_key_own_tenant_ok(client, db_session, tenants):
+    a, _ = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    resp = client.get(url(a.id, "health-score"), headers=bearer(key))
+    assert resp.status_code == 200
+    assert resp.json()["tenant_id"] == a.id and resp.json()["currency"] == "EGP"
+
+
+def test_health_score_tenant_key_for_another_tenant_is_404(client, db_session, tenants):
+    a, b = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    other = client.get(url(b.id, "health-score"), headers=bearer(key))
+    unknown = client.get(url(99999, "health-score"), headers=bearer(key))
+    assert other.status_code == 404 and other.json() == unknown.json()
+
+
+def test_tenant_me_happy_path(client, db_session, tenants):
+    a, _ = tenants
+    _, key = create_tenant_key(db_session, a.id)
+    resp = client.get("/v1/tenant/me", headers=bearer(key))
+    assert resp.status_code == 200
+    assert resp.json() == {"tenant_id": a.id, "name": "A Shop", "currency": "EGP", "country": "EG",
+                           "mode": "shadow", "platform": "shopify"}
+
+
+def test_tenant_me_rejects_operator_and_missing_keys(client, db_session, tenants):
+    a, _ = tenants
+    row, revoked = create_tenant_key(db_session, a.id)
+    revoke_tenant_key(db_session, row.id)
+    for header in (AUTH, {}, bearer(revoked), bearer("mtk_deadbeef_garbage")):
+        assert client.get("/v1/tenant/me", headers=header).status_code == 401

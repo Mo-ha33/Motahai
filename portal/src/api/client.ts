@@ -5,6 +5,7 @@ import type {
   StatsSection,
   StatsSummaryData,
   StatsWindow,
+  TenantProfile,
 } from './types';
 
 export class ApiError extends Error {
@@ -28,6 +29,8 @@ export interface StatsClientOptions {
 export type TenantRef = number | string;
 
 export interface StatsClient {
+  /** The signed-in tenant's profile (tenant key required; the operator key is a 401). */
+  me(signal?: AbortSignal): Promise<TenantProfile>;
   summary(
     tenantId: TenantRef,
     window: StatsWindow,
@@ -57,14 +60,7 @@ export function createStatsClient({
 }: StatsClientOptions = {}): StatsClient {
   const doFetch: typeof fetch = fetchImpl ?? ((...args) => fetch(...args));
 
-  async function get<T>(
-    name: string,
-    tenantId: TenantRef,
-    window: StatsWindow,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    const query = new URLSearchParams({ start: window.start, end: window.end });
-    const url = `${baseUrl}/v1/tenants/${encodeURIComponent(String(tenantId))}/stats/${name}?${query}`;
+  async function request<T>(url: string, signal?: AbortSignal): Promise<T> {
     const headers = { Accept: 'application/json', ...(await auth.headers()) };
 
     let response: Response;
@@ -87,7 +83,16 @@ export function createStatsClient({
     return body as T;
   }
 
+  function get<T>(name: string, tenantId: TenantRef, window: StatsWindow, signal?: AbortSignal): Promise<T> {
+    const query = new URLSearchParams({ start: window.start, end: window.end });
+    return request<T>(
+      `${baseUrl}/v1/tenants/${encodeURIComponent(String(tenantId))}/stats/${name}?${query}`,
+      signal,
+    );
+  }
+
   return {
+    me: (signal) => request<TenantProfile>(`${baseUrl}/v1/tenant/me`, signal),
     summary: (tenantId, window, signal) => get('summary', tenantId, window, signal),
     section: (name, tenantId, window, signal) => get(name, tenantId, window, signal),
   };

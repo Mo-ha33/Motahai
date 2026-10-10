@@ -7,8 +7,8 @@ export interface CompareBarsOptions {
 }
 
 /** Horizontal bars on one shared scale (the largest value fills the track). */
-export function CompareBarsWidget({ data, instance, lang }: WidgetProps<CompareBarsOptions>) {
-  const items = instance.options.metrics.map((id) => ({ id, metric: resolveMetric(id, data, lang) }));
+export function CompareBarsWidget({ data, envelope, instance, lang }: WidgetProps<CompareBarsOptions>) {
+  const items = instance.options.metrics.map((id) => ({ id, metric: resolveMetric(id, data, lang, envelope.currency) }));
   const max = Math.max(0, ...items.map((i) => i.metric.value ?? 0));
   return (
     <WidgetFrame instance={instance} lang={lang}>

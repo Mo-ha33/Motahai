@@ -15,6 +15,18 @@ function renderWidget(instance: WidgetInstance, lang: 'ar' | 'en' = 'en') {
 }
 
 describe('widgets', () => {
+  it('money widgets use the envelope currency, plain number when absent', () => {
+    const instance: WidgetInstance = { id: 'k', type: 'kpi', options: { metric: 'refused_value' } };
+    const Widget = getWidget('kpi')!;
+    const { unmount } = render(
+      <Widget data={summaryEnvelope.data} envelope={{ ...summaryEnvelope, currency: 'EGP' }} instance={instance} lang="en" />,
+    );
+    expect(screen.getByText(/EGP/).textContent).toMatch(/450\.50/);
+    unmount();
+    renderWidget(instance);
+    expect(screen.getByText('450.50')).toBeTruthy();
+  });
+
   it('kpi shows label, value and hint', () => {
     renderWidget({ id: 'k', type: 'kpi', options: { metric: 'delivery_rate' } });
     expect(screen.getByText('Delivery rate')).toBeTruthy();
