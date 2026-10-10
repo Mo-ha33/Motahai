@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .capi_service import capi_sender
 from .checkout_context import purge_expired_checkout_context
+from .digest import send_weekly_digests, sender_from_env
 from .db import JobRun, get_session_factory, init_db, session_scope, utcnow
 from .order_pipeline import retry_failed_events, send_due_events
 
@@ -46,6 +47,7 @@ DEFAULT_DUE_EVENTS_LIMIT = 500
 HEARTBEAT_MAX_AGE = timedelta(minutes=45)  # three missed 15-minute cycles
 SEND_JOB_NAME = "send_due_events"
 MERGE_JOB_NAME = "merge_pending_captures"
+DIGEST_JOB_NAME = "send_weekly_digests"
 HEARTBEAT_JOB_NAME = "scheduler_heartbeat"
 
 
@@ -119,6 +121,7 @@ async def run_scheduler_tick(
     now: Optional[datetime] = None,
     sender=capi_sender,
     due_limit: int = DEFAULT_DUE_EVENTS_LIMIT,
+    digest_sender=None,
 ) -> Dict[str, Any]:
     """
     Executes one full iteration of the background jobs:
@@ -126,7 +129,9 @@ async def run_scheduler_tick(
       2. retry_failed_events (retries failed CAPI requests)
       3. purge_expired_checkout_context (purges encrypted IP/UA older than 14 days)
       4. merge_pending_captures (skipped, and recorded as such, when the capture module is unavailable)
-      5. scheduler_heartbeat (system health check)
+      5. send_weekly_digests (Sunday Signal Hygiene email; a cheap no-op except on Sunday >= 10:00 tenant-local;
+         `digest_sender` defaults to SMTP from the environment, and the job is recorded as skipped when SMTP is unset)
+      6. scheduler_heartbeat (system health check)
 
     Each job records its start/finish times, success status, and details in `job_runs`.
     If an individual job raises an exception, it is caught, recorded as ok=False in `job_runs`,
@@ -171,6 +176,12 @@ async def run_scheduler_tick(
             now,
         )
 
+    summary["jobs"][DIGEST_JOB_NAME] = await _run_job(
+        factory, DIGEST_JOB_NAME,
+        lambda s, t: _digest_counts(s, t, digest_sender),
+        now,
+    )
+
     # Heartbeat / health check (records the cycle even when a job above failed; all_jobs_succeeded says which)
     heartbeat_start = now or utcnow()
     try:
@@ -193,6 +204,13 @@ async def run_scheduler_tick(
 
 def _purge_counts(session: Session, now: datetime) -> Dict[str, int]:
     return {"purged_count": purge_expired_checkout_context(session, now=now)}
+
+
+def _digest_counts(session: Session, now: datetime, digest_sender) -> Dict[str, Any]:
+    sender = digest_sender or sender_from_env()
+    if sender is None:
+        return {"skipped": "digest_sender_not_configured"}
+    return send_weekly_digests(session, now, sender)
 
 
 def check_scheduler_health(

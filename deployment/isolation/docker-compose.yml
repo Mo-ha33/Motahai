@@ -1,0 +1,118 @@
+# Trust-boundary split: Core (money path, secrets, HITL private key) vs Hermes (LLM agent, shell tools).
+# See README.md in this folder. No secret appears in this file: everything comes from env_file / secret files.
+#
+#   cp core.env.example   core.env     && edit   (Core secrets; never copy to the Hermes side)
+#   cp postgres.env.example postgres.env && edit (database bootstrap only)
+#   cp hermes.env.example hermes.env   && edit   (Hermes secrets; contains the PUBLIC key only)
+#   cp compose.env.example compose.env && edit   (file paths / image names)
+#   docker compose -f deployment/isolation/docker-compose.yml --env-file deployment/isolation/compose.env up -d --build
+#
+# Networks
+#   core_net      Core internals (core-api, core-scheduler, postgres). Outbound allowed (Meta CAPI). Nothing from
+#                 the agent side is attached to it.
+#   core_internal internal:true (no route to the internet or the host). Shared by core-api and hermes ONLY: this is
+#                 the single path from the agent side to Core.
+#   agent_net     Hermes runtime. Outbound allowed (LLM provider APIs). core-api is NOT on it.
+
+name: motahai-isolation
+
+services:
+  core-api:
+    build:
+      context: ../..
+      dockerfile: deployment/isolation/Dockerfile.core
+    image: motahai-core:local
+    command: ["python", "-m", "uvicorn", "src.ameen_workforce.service:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - core.env
+    # HITL private key (Ed25519, PEM) is mounted read-only from a host file owned by uid 10001, mode 0600.
+    # core.env points HITL_SIGNING_PRIVATE_KEY_PATH at /run/secrets/hitl_private.pem.
+    volumes:
+      - ${CORE_HITL_PRIVATE_KEY_FILE:?set CORE_HITL_PRIVATE_KEY_FILE in compose.env}:/run/secrets/hitl_private.pem:ro
+    # No `ports:` — not published to the host. Operators reach it through a reverse proxy you add on core_net.
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - core_net
+      - core_internal
+    restart: unless-stopped
+    # Deliberately absent: docker.sock, privileged, host networking, any Hermes mount.
+
+  core-scheduler:
+    image: motahai-core:local
+    command: ["python", "-m", "ameen_workforce.scheduler"]
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - core.env
+    stop_grace_period: 120s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - core_net
+    restart: always
+    # Exactly one replica: a second scheduler would race the first on the same due events.
+    deploy:
+      replicas: 1
+
+  postgres:
+    image: postgres:16-alpine
+    # Own env file so the Fernet key / HITL key / operator key are never in the database container's environment.
+    env_file:
+      - postgres.env
+    # No `ports:` — never published to the host.
+    volumes:
+      - core_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - core_net
+    restart: unless-stopped
+
+  hermes:
+    # Image comes from your Hermes build; it must not contain the Core env file, DB credentials or the HITL private key.
+    image: ${HERMES_IMAGE:?set HERMES_IMAGE in compose.env}
+    env_file:
+      - hermes.env
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Only agent-side state. No Core volumes, no docker.sock.
+    volumes:
+      - hermes_state:/home/hermes/.hermes
+    networks:
+      - agent_net
+      - core_internal
+    restart: unless-stopped
+
+networks:
+  core_net:
+    driver: bridge
+  core_internal:
+    driver: bridge
+    internal: true
+  agent_net:
+    driver: bridge
+
+volumes:
+  core_pgdata:
+  hermes_state:

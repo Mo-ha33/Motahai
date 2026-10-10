@@ -96,9 +96,11 @@ tools:
   hermes_browser_evaluate: {rate: 20, concurrency: 1, global_concurrency: 2, timeout_s: 30, max_script_chars: 4000}
   hermes_terminal_exec:    {rate: 10, concurrency: 1, global_concurrency: 1, timeout_s: 120}
   # Rule D-003 — production GTM publishing. approval_required: the tool itself refuses unless the call
-  # carries `hitl_approval_token`, an HMAC-signed, single-use, 30-minute token bound to this exact
+  # carries `hitl_approval_token`, an Ed25519-signed, single-use, 30-minute token bound to this exact
   # container + workspace that a HUMAN operator mints via POST /approvals/gtm-publish (OPERATOR_API_KEY).
-  # Agents cannot mint it (HITL_SIGNING_KEY is never in an agent's environment). Intentionally NOT listed in
+  # Agents cannot mint it: the MCP server holds ONLY the Ed25519 PUBLIC key (HITL_VERIFY_PUBLIC_KEY /
+  # HITL_VERIFY_PUBLIC_KEY_PATH); the private key (HITL_SIGNING_PRIVATE_KEY_PATH) lives only with the Core
+  # service under a separate Linux user — see deployment/isolation/. Intentionally NOT listed in
   # any role above: grant a tool to a role only after the human-approval flow is wired for that role.
   hermes_gtm_cloud_publish: {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 120,
                              approval_required: {gate: D-003, mechanism: signed_single_use_token,

@@ -34,13 +34,13 @@
 | TASK-021 | Implement Rule D-005 (COD OrderPlaced vs Purchase) | Sonnet 5.5 | P0 | DONE | cod, capi, rules | Fixed by S1-0 (Coexist: DeliveredPurchase, delivered_<order_id>). (updated 2026-10-09 21:16) |
 | TASK-022 | Zero-Effort Shopify/Salla Delivery Webhook Listener | Sonnet 5.5 | P0 | IN_PROGRESS | cod, webhook | Parser class landed in d51dcf0; no HTTP route, no HMAC verification, no idempotency yet (review B3/B4) — see S1-1, S1-2. |
 | TASK-030 | 24/7 Automated Drift Sentinel & Container Monitor | Haiku 5.5 | P1 | BACKLOG | monitoring, cron | Periodic container fingerprinting & beacon check; systemd timers + job_runs heartbeat; S1-5 |
-| TASK-031 | Weekly Signal Hygiene Digest (Sunday WhatsApp) | Sonnet 5.5 | P1 | BACKLOG | retention, reporting | 'Saved ad spend' claim dropped as unmeasurable. Sections: undelivered COD orders (count/value), delivery-rate trend on matured cohorts, real incident log, creative scorecard. Every number from DB queries. |
+| TASK-031 | Weekly Signal Hygiene Digest (Sunday WhatsApp) | Sonnet 5.5 | P1 | DONE | retention, reporting | Implemented by S1-4. (updated 2026-10-10 00:24) |
 | TASK-040 | Cash-Delivered Creative Scorecard | Sonnet 5.5 | P2 | BACKLOG | ugc, creatives | Narrowed scope: ad-level URL macro template (utm_content={{ad.id}}) + order→ad_id join; no creative dashboards, no creator marketplace; Ziad video paused. |
 | S1-0 | Fix D-003 gate (signed approvals) + D-005 delivered detection & Coexist event | Sonnet 5.5 | P0 | DONE | hitl, cod, capi, security | Signed single-use D-003 tokens, D-005 Coexist DeliveredPurchase, COD delivered detection fixes, access_token auth, stale guard. 155 tests pass. (updated 2026-10-09 21:16) |
 | S1-1 | Persistence + idempotency (tenants, orders, capi_events UNIQUE, webhook_deliveries, incidents, digests, job_runs) | Sonnet 5.5 | P0 | DONE | db, idempotency | Committed a7c4a75. 184 tests. (updated 2026-10-09 21:33) |
 | S1-2 | Webhook HTTP routes + Shopify HMAC / Salla signature verification | Sonnet 5.5 | P0 | DONE | webhook, security | Committed with S1-3. Follow-ups: rate-limit/prune bad-signature rows; verify Salla signature + merchant field on a real delivery. (updated 2026-10-09 21:59) |
 | S1-3 | Checkout capture: UTMs, ad_id, fbp/fbc/ttclid/ScCid + client_details into CAPI payload | Sonnet 5.5 | P0 | DONE | capi, attribution | Committed with S1-2. Verify _mt_ attrs reach note_attributes on a dev store; Salla attribution gap. (updated 2026-10-09 21:59) |
-| S1-4 | Sunday digest generator (reports/weekly_digest.py) | Sonnet 5.5 | P1 | BACKLOG | reporting | Sprint S1 step 4. Implements TASK-031. |
+| S1-4 | Sunday digest generator (reports/weekly_digest.py) | Sonnet 5.5 | P1 | DONE | reporting | digest.py: SQL-only metrics, ar/en email, Sunday 10:00 tenant-local, idempotent per week. (updated 2026-10-10 00:24) |
 | S1-5 | Scheduler + churn early-warning checks (unread digests, token expiry/Meta 190, webhook failures, 48h silence) | Haiku 5.5 | P1 | IN_PROGRESS | monitoring, cron | S2 wave 2 dispatched 2026-10-10. (updated 2026-10-09 22:21) |
 | S1-6 | Platform API lookups (TikTok/Snap macros, Meta partner sharing, Shopify/Salla webhooks, WhatsApp templates) | Haiku 5.5 | P1 | DONE | research, integrations | docs/research/S1-6_platform_lookups.md; open: custom-event optimization unconfirmed, Salla signature/COD enum inferred. (updated 2026-10-09 21:06) |
 | S1-7 | Board hygiene | Haiku 5.5 | P2 | DONE | board, hygiene | Review 2026-10-09 board update. |
@@ -52,7 +52,7 @@
 | S2-6 | Refuser exclusion + delivered-buyer seed audience CSV exports | Haiku 5.5 | P1 | DONE | audiences, retention | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
 | S2-7 | Pilot validation plan: required CAPI fields, custom-conversion optimization, ROAS bidding, A/B test | Haiku 5.5 | P1 | DONE | research, pilot | Committed in S2 wave 1. (updated 2026-10-09 22:21) |
 | S2-8 | Thank-you page capture (Salla App Snippet + Shopify checkout_completed): order_id + UA + IP + fbp/fbc → Core | Sonnet 5.5 | P1 | IN_PROGRESS | capture, salla, emq | Salla webhooks carry no UA/IP; Meta requires client_user_agent for website events. Wave 2. Also: handle_order_update made decision-only. |
-| S1-8 | Ed25519 asymmetric HITL signing + user separation | Sonnet 5.5 | P1 | BACKLOG | hitl, security | MCP server holds only the public key; issuing service runs as a separate Linux user, so an agent with shell on the VPS (hermes_run_task) cannot mint D-003 tokens. |
+| S1-8 | Ed25519 asymmetric HITL signing + user separation | Sonnet 5.5 | P1 | DONE | hitl, security | Ed25519 D-003 tokens (no HMAC), deployment/isolation manifests. (updated 2026-10-10 00:24) |
 
 ---
 

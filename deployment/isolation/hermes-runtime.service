@@ -1,0 +1,39 @@
+[Unit]
+Description=Hermes runtime (LLM agent, MCP server, skills) - holds the HITL PUBLIC key only
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A different Linux user from Core. It must not be able to read /etc/motahai or /var/lib/motahai.
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes
+# /etc/hermes/hermes.env (0600 hermes:hermes): CORE_API_BASE_URL, CORE_SERVICE_TOKEN, HITL_VERIFY_PUBLIC_KEY (or
+# HITL_VERIFY_PUBLIC_KEY_PATH=/etc/hermes/hitl_public.pem), HITL_USED_NONCES_PATH, tenant MCP tokens, LLM key.
+EnvironmentFile=/etc/hermes/hermes.env
+# Replace with the real Hermes entry point. The `cryptography` package must be installed in this venv: the inline
+# verifier in consultation.py imports it, and every GTM publish fails closed without it.
+ExecStart=/opt/hermes/venv/bin/python -m REPLACE_WITH_HERMES_ENTRYPOINT
+Restart=always
+RestartSec=5s
+
+# Hardening: the agent has shell tools, so assume it can run arbitrary commands as this user.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# Core's files and secrets are invisible to this unit (defence in depth on top of file modes).
+InaccessiblePaths=/etc/motahai /var/lib/motahai /opt/ameen-workforce
+ReadWritePaths=/home/hermes/.hermes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-runtime
+
+[Install]
+WantedBy=multi-user.target

@@ -9,17 +9,41 @@ Allows an operator to quickly onboard and configure e-commerce stores:
 3. Configures Meta Dataset ID & CAPI Access Token (Fernet-encrypted at rest).
 4. Executes an automated test ping / CAPI event verification.
 
-Usage:
+Usage (recommended: keep secrets out of shell history and process listings):
+    # 1. Put the secrets in a file only you can read (chmod 600), one KEY=VALUE per line:
+    #      META_CAPI_TOKEN=EAAB...
+    #      WEBHOOK_SECRET=shpss_...           (optional, platform webhook secret)
+    #      BOSTA_WEBHOOK_SECRET=...           (optional)
+    #      OTO_WEBHOOK_SECRET=...             (optional)
     python scripts/onboard_store.py \
         --name "Pilot Store 1" \
         --platform shopify \
         --shop-domain "pilot1.myshopify.com" \
         --meta-dataset-id "123456789012345" \
-        --meta-capi-token "EAAB..." \
-        --webhook-secret "shpss_..." \
+        --secrets-file ~/motahai/pilot1.env \
         --mode shadow
 
+    # 2. Or pipe them from a secret manager (--secrets-stdin reads the same KEY=VALUE format):
+    #      some-secret-manager get pilot1 | python scripts/onboard_store.py ... --secrets-stdin
+
+    # 3. Or read ONE secret from a hidden prompt (or from stdin) with '-':
+    #      python scripts/onboard_store.py ... --meta-capi-token -
+
+Secret sources (a secret may come from any of them):
+    --secrets-file PATH       dotenv-style file. Refused (exit 2) on POSIX if group/world-readable. Lines starting
+                              with # and blank lines are ignored; surrounding quotes are stripped.
+    --secrets-stdin           the same KEY=VALUE format read from stdin. Cannot be combined with a '-' value.
+    <secret flag> -           read that one secret from stdin (hidden prompt when stdin is a TTY). At most one '-'.
+    <secret flag> VALUE       works, but prints a warning: the value is visible in shell history and process
+                              listings. Prefer --secrets-file or --secrets-stdin.
+
+    Keys: META_CAPI_TOKEN, WEBHOOK_SECRET, BOSTA_WEBHOOK_SECRET, OTO_WEBHOOK_SECRET.
+    Precedence when the same secret is given by several sources: command-line value > stdin > file (a warning names
+    the sources, never the values). The same key defined twice in ONE file or stdin with different values is a
+    conflict: exit 2, nothing is written.
+
 Options:
+    --meta-capi-token         Meta CAPI access token (required, from the flag or a secret source above)
     --verify-capi-ping        Send a MotahaiConnectionTest event to Meta to verify dataset + token (opt-in).
                               REQUIRES --test-event-code: without it the CLI exits non-zero and sends nothing.
     --test-event-code         Meta test event code (e.g. TEST12345) from Events Manager; keeps the ping out of live data
@@ -36,13 +60,15 @@ credentials unreadable by the services, so none is generated for real runs.
 
 import argparse
 import asyncio
+import getpass
 import json
 import logging
 import os
 import secrets
+import stat
 import sys
 import time
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -303,6 +329,133 @@ async def verify_capi_ping(
         }
 
 
+# Secret flags -> argparse dest. Every one of them can also come from --secrets-file / --secrets-stdin.
+SECRET_FLAG_FOR_DEST = {
+    "meta_capi_token": "--meta-capi-token",
+    "webhook_secret": "--webhook-secret",
+    "bosta_webhook_secret": "--bosta-webhook-secret",
+    "oto_webhook_secret": "--oto-webhook-secret",
+}
+# KEY in a secrets file / stdin block -> argparse dest.
+SECRET_KEY_FOR_DEST = {
+    "meta_capi_token": "META_CAPI_TOKEN",
+    "webhook_secret": "WEBHOOK_SECRET",
+    "bosta_webhook_secret": "BOSTA_WEBHOOK_SECRET",
+    "oto_webhook_secret": "OTO_WEBHOOK_SECRET",
+}
+SECRET_DEST_FOR_KEY = {key: dest for dest, key in SECRET_KEY_FOR_DEST.items()}
+SECRET_HISTORY_WARNING = ("{flag} was given on the command line: the value is visible in shell history and process "
+                          "listings. Prefer --secrets-file or --secrets-stdin (or '{flag} -' for a hidden prompt).")
+
+
+class SecretsInputError(ValueError):
+    """A secrets file, stdin block or '-' value is unusable. Messages name keys and line numbers, never values."""
+
+
+def parse_secrets_text(text: str, source: str) -> Dict[str, str]:
+    """
+    Parses a dotenv-style KEY=VALUE block (secrets file or stdin). Blank lines and lines starting with '#' are ignored,
+    an optional leading 'export ' is accepted, one pair of matching surrounding quotes is removed. Returns {dest: value}.
+    Unknown keys, malformed lines, empty values and the same key with different values all raise SecretsInputError.
+    """
+    values: Dict[str, str] = {}
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise SecretsInputError(f"{source}: line {lineno} is not KEY=VALUE")
+        if key not in SECRET_DEST_FOR_KEY:
+            raise SecretsInputError(f"{source}: line {lineno} has unknown key {key!r} "
+                                    f"(expected one of {', '.join(SECRET_DEST_FOR_KEY)})")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1].strip()
+        if not value:
+            raise SecretsInputError(f"{source}: {key} has an empty value (line {lineno})")
+        dest = SECRET_DEST_FOR_KEY[key]
+        if dest in values and values[dest] != value:
+            raise SecretsInputError(f"{source}: {key} is defined twice with different values (line {lineno}). "
+                                    "Keep one definition per secret.")
+        values[dest] = value
+    return values
+
+
+def read_secrets_file(path: str) -> str:
+    """
+    Reads a secrets file. On POSIX the permission check runs on the OPEN file descriptor (no stat/open race) and refuses
+    any group or other access bit. The check is skipped on Windows, where POSIX modes do not apply.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            if os.name == "posix":
+                mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+                if mode & 0o077:
+                    raise SecretsInputError(f"secrets file {path} is readable by group or others (mode {mode:o}). "
+                                            f"Run: chmod 600 {path}")
+            return handle.read()
+    except SecretsInputError:
+        raise
+    except OSError as exc:
+        raise SecretsInputError(f"cannot read secrets file {path}: {exc.strerror or type(exc).__name__}") from None
+
+
+def read_secret_from_stdin(flag: str, stream: Any) -> str:
+    """One secret for '<flag> -': a hidden prompt when stdin is a terminal (no echo), otherwise the first stdin line."""
+    if stream.isatty():
+        value = getpass.getpass(f"{flag} (input hidden): ", stream=sys.stderr)
+    else:
+        value = stream.readline().rstrip("\r\n")
+    value = value.strip()
+    if not value:
+        raise SecretsInputError(f"no value received on stdin for {flag}")
+    return value
+
+
+def resolve_secrets(args: argparse.Namespace, stdin: Any) -> List[str]:
+    """
+    Fills the secret attributes of args from the four sources. Precedence per secret: command-line value > '-' (stdin)
+    > --secrets-stdin > --secrets-file. Returns human-readable warnings (they name keys and sources, never values).
+    Raises SecretsInputError on an unusable source; nothing is stored in that case.
+    """
+    dash_dests = [dest for dest in SECRET_FLAG_FOR_DEST if getattr(args, dest) == "-"]
+    if len(dash_dests) > 1:
+        raise SecretsInputError("only one secret flag may read stdin with '-'; use --secrets-stdin for several secrets")
+    if dash_dests and args.secrets_stdin:
+        raise SecretsInputError("'-' and --secrets-stdin both read stdin; use one of them")
+
+    layers: List[Tuple[str, Dict[str, str]]] = []  # highest precedence first
+    flag_values = {dest: getattr(args, dest) for dest in SECRET_FLAG_FOR_DEST
+                   if getattr(args, dest) not in (None, "-")}
+    if flag_values:
+        layers.append(("command line", flag_values))
+    if dash_dests:
+        dest = dash_dests[0]
+        layers.append((f"stdin ({SECRET_FLAG_FOR_DEST[dest]} -)", {dest: read_secret_from_stdin(SECRET_FLAG_FOR_DEST[dest], stdin)}))
+    if args.secrets_stdin:
+        layers.append(("--secrets-stdin", parse_secrets_text(stdin.read(), "--secrets-stdin")))
+    if args.secrets_file:
+        layers.append(("--secrets-file", parse_secrets_text(read_secrets_file(args.secrets_file), "--secrets-file")))
+
+    resolved: Dict[str, str] = {}
+    origin: Dict[str, str] = {}
+    warnings: List[str] = []
+    for label, values in layers:
+        for dest, value in values.items():
+            if dest not in resolved:
+                resolved[dest], origin[dest] = value, label
+            elif resolved[dest] != value:
+                warnings.append(f"{SECRET_KEY_FOR_DEST[dest]} differs between {origin[dest]} and {label}; "
+                                f"using the {origin[dest]} value (values not shown)")
+    for dest in SECRET_FLAG_FOR_DEST:
+        setattr(args, dest, resolved.get(dest))
+    return warnings
+
+
 def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Onboard pilot stores to Ameen / Motahai Conversion Engine.",
@@ -312,8 +465,16 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--platform", required=True, choices=["shopify", "salla", "zid"], help="E-commerce platform")
     parser.add_argument("--shop-domain", required=True, help="Shopify *.myshopify.com or Salla merchant ID")
     parser.add_argument("--meta-dataset-id", required=True, help="Meta Pixel / Dataset ID")
-    parser.add_argument("--meta-capi-token", required=True, help="Meta Conversions API access token")
-    parser.add_argument("--webhook-secret", default=None, help="Platform webhook secret (optional)")
+    parser.add_argument("--meta-capi-token", default=None,
+                        help="Meta Conversions API access token (required unless META_CAPI_TOKEN comes from "
+                             "--secrets-file/--secrets-stdin; use '-' for a hidden prompt)")
+    parser.add_argument("--secrets-file", default=None, metavar="PATH",
+                        help="dotenv-style KEY=VALUE file with META_CAPI_TOKEN, WEBHOOK_SECRET, BOSTA_WEBHOOK_SECRET, "
+                             "OTO_WEBHOOK_SECRET. Must not be group/world-readable (POSIX).")
+    parser.add_argument("--secrets-stdin", action="store_true",
+                        help="Read the same KEY=VALUE format from stdin (e.g. piped from a secret manager).")
+    parser.add_argument("--webhook-secret", default=None,
+                        help="Platform webhook secret (optional; use '-' for a hidden prompt)")
     parser.add_argument("--country", default=None, help="Two-letter country code (default: EG for shopify, SA for salla)")
     parser.add_argument("--currency", default=None, help="Three-letter currency code (default: EGP for shopify, SAR for salla)")
     parser.add_argument("--timezone", default=None, help="Timezone string (e.g. 'Africa/Cairo', 'Asia/Riyadh')")
@@ -325,8 +486,10 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-ping", action="store_true", help="Skip the Meta connection ping even if --verify-capi-ping is set")
     parser.add_argument("--test-event-code", default=None,
                         help="Meta test event code (e.g. TEST12345). Required by --verify-capi-ping; keeps the ping out of live data.")
-    parser.add_argument("--bosta-webhook-secret", default=None, help="Bosta webhook secret (stored encrypted)")
-    parser.add_argument("--oto-webhook-secret", default=None, help="OTO webhook secret (stored encrypted)")
+    parser.add_argument("--bosta-webhook-secret", default=None,
+                        help="Bosta webhook secret (stored encrypted; use '-' for a hidden prompt)")
+    parser.add_argument("--oto-webhook-secret", default=None,
+                        help="OTO webhook secret (stored encrypted; use '-' for a hidden prompt)")
     parser.add_argument("--generate-courier-secrets", action="store_true",
                         help="Generate strong Bosta + OTO webhook secrets, store them, and print them ONCE with the webhook URLs. "
                              "Replaces any existing courier secrets.")
@@ -337,6 +500,9 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def validate_cli_args(args: argparse.Namespace) -> Optional[str]:
     """Returns a human-readable problem with the combination of flags, or None. Runs before anything is written or sent."""
+    if not (args.meta_capi_token and args.meta_capi_token.strip()):
+        return ("a Meta CAPI token is required: pass --meta-capi-token, or META_CAPI_TOKEN in --secrets-file / "
+                "--secrets-stdin. Nothing was stored.")
     if args.verify_capi_ping and not (args.test_event_code and args.test_event_code.strip()):
         return ("--verify-capi-ping requires --test-event-code (the Meta test event code from Events Manager). "
                 "Nothing was sent and nothing was stored.")
@@ -356,11 +522,22 @@ def _fail(args: argparse.Namespace, message: str) -> int:
     return 2
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
     try:
         args = parse_cli_args(argv)
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 1
+
+    for dest, flag in SECRET_FLAG_FOR_DEST.items():
+        value = getattr(args, dest)
+        if value is not None and value != "-":
+            print(f"warning: {SECRET_HISTORY_WARNING.format(flag=flag)}", file=sys.stderr)
+
+    try:
+        for warning in resolve_secrets(args, sys.stdin if stdin is None else stdin):
+            print(f"warning: {warning}", file=sys.stderr)
+    except SecretsInputError as exc:
+        return _fail(args, str(exc))
 
     problem = validate_cli_args(args)
     if problem:

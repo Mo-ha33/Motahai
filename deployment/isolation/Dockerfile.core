@@ -1,0 +1,23 @@
+# Core image (API + scheduler). Contains NO Hermes code, NO LLM client and NO agent shell tools.
+# Build from the repository root:  docker build -f deployment/isolation/Dockerfile.core -t motahai-core:local .
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+# psycopg is needed for the Postgres DATABASE_URL (postgresql+psycopg://...). pytest is not needed at runtime.
+RUN pip install --no-cache-dir -r /app/requirements.txt "psycopg[binary]>=3.1,<4"
+
+COPY src /app/src
+
+# Non-root. UID/GID 10001 is the same identity the compose file runs as (user: "10001:10001").
+RUN groupadd --system --gid 10001 motahai \
+ && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin motahai
+USER 10001:10001
+
+EXPOSE 8000
+CMD ["python", "-m", "uvicorn", "src.ameen_workforce.service:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

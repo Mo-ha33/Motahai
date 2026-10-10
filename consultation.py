@@ -5,8 +5,6 @@ strategic opinions/fatawa, dispatch tasks, and audit code.
 """
 
 import base64
-import hashlib
-import hmac
 import json
 import os
 import threading
@@ -19,23 +17,38 @@ DEFAULT_USED_NONCES_PATH = "/home/deploy/.hermes/hitl_used_nonces.json"
 
 # ---------------------------------------------------------------------------
 # Rule D-003 approval-token verifier.
-# Inlined (stdlib only) because this file is deployed alone into the VPS package and cannot
+# Inlined (stdlib + `cryptography`, imported lazily) because this file is deployed alone into the VPS package and cannot
 # import ameen_workforce. Byte-for-byte identical to src/ameen_workforce/hitl_tokens.py, which
 # also issues the tokens (POST /approvals/gtm-publish). tests/test_hitl_tokens.py enforces parity.
+# Ed25519: this side holds ONLY the public key (HITL_VERIFY_PUBLIC_KEY / HITL_VERIFY_PUBLIC_KEY_PATH); the
+# private key lives with the Core service under a separate user, so an agent on this host cannot mint approvals.
+# The Hermes host needs `pip install cryptography`; without it every publish fails closed.
 # ---------------------------------------------------------------------------
 # --- BEGIN VERIFIER (must stay identical to the copy inlined in consultation.py) ---
 _NONCE_LOCK = threading.Lock()
 
 
-def _signing_key() -> Optional[bytes]:
-    key = os.environ.get("HITL_SIGNING_KEY", "")
-    if len(key) < 32:
-        return None
-    return key.encode("utf-8")
-
-
 def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _verify_key():
+    """Ed25519 PUBLIC key from env HITL_VERIFY_PUBLIC_KEY (base64url raw 32 bytes) or
+    HITL_VERIFY_PUBLIC_KEY_PATH (PEM). None if missing/invalid (fail closed). No private key is ever read here."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        raw = os.environ.get("HITL_VERIFY_PUBLIC_KEY", "").strip()
+        if raw:
+            return Ed25519PublicKey.from_public_bytes(_b64url_decode(raw))
+        path = os.environ.get("HITL_VERIFY_PUBLIC_KEY_PATH", "").strip()
+        if path:
+            with open(path, "rb") as fh:
+                key = load_pem_public_key(fh.read())
+            return key if isinstance(key, Ed25519PublicKey) else None
+    except Exception:
+        return None
+    return None
 
 
 def _consume_nonce(used_nonce_store, nonce: str, exp: int, now: float, record: bool = True) -> bool:
@@ -70,16 +83,18 @@ def _consume_nonce(used_nonce_store, nonce: str, exp: int, now: float, record: b
 def verify_publish_token(token, container_id, workspace_id, used_nonce_store, now=None, consume=True):
     """Returns (ok, reason). With consume=True (default) an ok token's nonce is spent (single use);
     consume=False validates everything without spending it (dry check before a later consume)."""
-    key = _signing_key()
-    if key is None:
-        return False, "signing_key_not_configured"
+    public_key = _verify_key()
+    if public_key is None:
+        return False, "verify_key_not_configured"
     if not isinstance(token, str) or not token.strip():
         return False, "token_missing"
     now = time.time() if now is None else now
     try:
+        from cryptography.exceptions import InvalidSignature
         payload_b64, sig_b64 = token.strip().split(".")
-        expected = hmac.new(key, payload_b64.encode("ascii"), hashlib.sha256).digest()
-        if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
+        try:
+            public_key.verify(_b64url_decode(sig_b64), payload_b64.encode("ascii"))
+        except InvalidSignature:
             return False, "bad_signature"
         claims = json.loads(_b64url_decode(payload_b64))
         cid, wid, exp, nonce = claims["cid"], claims["wid"], claims["exp"], claims["nonce"]

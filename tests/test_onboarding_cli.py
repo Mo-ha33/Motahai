@@ -3,8 +3,10 @@ tests/test_onboarding_cli.py — Unit and integration tests for Operator Onboard
 ====================================================================================================
 """
 
+import io
 import json
 import logging
+import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -484,3 +486,230 @@ def test_cli_refuses_real_run_without_fernet_key(monkeypatch, capsys):
 
     assert main(BASE_CLI_ARGS + ["--json"]) != 0
     assert FERNET_KEY_ENV in json.loads(capsys.readouterr().out)["message"]
+
+
+# =============================================================================
+# 6. Secret sources: --secrets-file, --secrets-stdin, '-' (hidden prompt / stdin), argv warning, precedence
+# =============================================================================
+
+BASE_NO_TOKEN_ARGS = [
+    "--name", "CLI Store",
+    "--platform", "shopify",
+    "--shop-domain", "cli-store.myshopify.com",
+    "--meta-dataset-id", "999888777",
+]
+FILE_TOKEN = "FILE_META_TOKEN_0001"
+FILE_BOSTA = "FILE_BOSTA_SECRET_0001"
+FILE_OTO = "FILE_OTO_SECRET_0001"
+FILE_WEBHOOK = "FILE_PLATFORM_WEBHOOK_0001"
+ALL_SECRET_VALUES = (FILE_TOKEN, FILE_BOSTA, FILE_OTO, FILE_WEBHOOK)
+
+FULL_FILE = (
+    "# pilot store 1 secrets\n"
+    "\n"
+    f"META_CAPI_TOKEN={FILE_TOKEN}\n"
+    f"WEBHOOK_SECRET={FILE_WEBHOOK}\n"
+    f"BOSTA_WEBHOOK_SECRET={FILE_BOSTA}\n"
+    f"OTO_WEBHOOK_SECRET='{FILE_OTO}'\n"
+)
+
+
+def write_secrets_file(tmp_path, text, mode=0o600):
+    path = tmp_path / "pilot.env"
+    path.write_text(text, encoding="utf-8")
+    if os.name == "posix":
+        os.chmod(path, mode)
+    return str(path)
+
+
+def stored(db, kind):
+    tenant = get_tenant_by_shop_domain(db, "cli-store.myshopify.com")
+    return get_credential(db, tenant.id, kind)
+
+
+def test_secrets_file_supplies_every_secret(cli_db, tmp_path):
+    path = write_secrets_file(tmp_path, FULL_FILE)
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--json"]) == 0
+
+    assert stored(cli_db, "meta_capi_token") == FILE_TOKEN
+    assert stored(cli_db, "webhook_secret") == FILE_WEBHOOK
+    assert stored(cli_db, "bosta_webhook_secret") == FILE_BOSTA
+    assert stored(cli_db, "oto_webhook_secret") == FILE_OTO
+
+
+def test_secrets_stdin_supplies_secrets(cli_db):
+    block = f"export META_CAPI_TOKEN={FILE_TOKEN}\nBOSTA_WEBHOOK_SECRET={FILE_BOSTA}\n"
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-stdin", "--json"], stdin=io.StringIO(block)) == 0
+
+    assert stored(cli_db, "meta_capi_token") == FILE_TOKEN
+    assert stored(cli_db, "bosta_webhook_secret") == FILE_BOSTA
+
+
+def test_dash_reads_single_secret_from_stdin_without_warning(cli_db, capsys):
+    stdin = io.StringIO("STDIN_META_TOKEN_0002\nignored second line\n")
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", "-", "--json"], stdin=stdin) == 0
+
+    assert stored(cli_db, "meta_capi_token") == "STDIN_META_TOKEN_0002"
+    assert "shell history" not in capsys.readouterr().err  # '-' is not an argv secret
+
+
+def test_dash_uses_hidden_prompt_when_stdin_is_a_tty(cli_db, monkeypatch, capsys):
+    prompts = []
+
+    class FakeTTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    def fake_getpass(prompt="", stream=None):
+        prompts.append(prompt)
+        return "TTY_META_TOKEN_0003"
+
+    monkeypatch.setattr("getpass.getpass", fake_getpass)
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", "-", "--json"], stdin=FakeTTY()) == 0
+
+    assert len(prompts) == 1 and "--meta-capi-token" in prompts[0]
+    assert stored(cli_db, "meta_capi_token") == "TTY_META_TOKEN_0003"
+    assert "TTY_META_TOKEN_0003" not in capsys.readouterr().out
+
+
+def test_dash_with_empty_stdin_exits_2(cli_db):
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", "-", "--json"], stdin=io.StringIO("")) == 2
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+def test_dash_and_secrets_stdin_both_reading_stdin_exits_2(cli_db):
+    stdin = io.StringIO(f"META_CAPI_TOKEN={FILE_TOKEN}\n")
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", "-", "--secrets-stdin", "--json"], stdin=stdin) == 2
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+def test_two_dash_values_exit_2(cli_db):
+    stdin = io.StringIO("ONLY_ONE_LINE\n")
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", "-", "--bosta-webhook-secret", "-", "--json"],
+                stdin=stdin) == 2
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file permission bits are a POSIX concept")
+def test_secrets_file_readable_by_others_is_refused(cli_db, tmp_path, capsys):
+    path = write_secrets_file(tmp_path, FULL_FILE, mode=0o644)
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--json"]) == 2
+
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+    captured = capsys.readouterr()
+    assert "chmod 600" in captured.err + captured.out
+    assert FILE_TOKEN not in captured.err + captured.out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="file permission bits are a POSIX concept")
+def test_secrets_file_owner_only_is_accepted_on_posix(cli_db, tmp_path):
+    path = write_secrets_file(tmp_path, FULL_FILE, mode=0o600)
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--json"]) == 0
+
+
+def test_missing_secrets_file_exits_2(cli_db, tmp_path):
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", str(tmp_path / "nope.env"), "--json"]) == 2
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+@pytest.mark.parametrize("text, fragment", [
+    ("FOO=bar\n", "unknown key 'FOO'"),
+    ("META_CAPI_TOKEN\n", "not KEY=VALUE"),
+    ("=value\n", "not KEY=VALUE"),
+    ("META_CAPI_TOKEN=\n", "empty value"),
+    (f"META_CAPI_TOKEN={FILE_TOKEN}\nMETA_CAPI_TOKEN=OTHER_VALUE_0009\n", "defined twice with different values"),
+])
+def test_malformed_secrets_block_exits_2_without_echoing_values(cli_db, tmp_path, capsys, text, fragment):
+    path = write_secrets_file(tmp_path, text)
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert fragment in captured.err + captured.out
+    for value in (FILE_TOKEN, "OTHER_VALUE_0009"):
+        assert value not in captured.err + captured.out
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+def test_repeated_identical_definition_is_not_a_conflict(cli_db, tmp_path):
+    path = write_secrets_file(tmp_path, f"META_CAPI_TOKEN={FILE_TOKEN}\nMETA_CAPI_TOKEN={FILE_TOKEN}\n")
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--json"]) == 0
+    assert stored(cli_db, "meta_capi_token") == FILE_TOKEN
+
+
+def test_missing_meta_token_everywhere_exits_2(cli_db, capsys):
+    assert main(BASE_NO_TOKEN_ARGS + ["--json"], stdin=io.StringIO("")) == 2
+    assert "--meta-capi-token" in json.loads(capsys.readouterr().out)["message"]
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+def test_argv_secret_emits_shell_history_warning_for_each_flag(cli_db, capsys):
+    args = BASE_CLI_ARGS + ["--webhook-secret", "ARGV_WEBHOOK_0001", "--json"]
+    assert main(args) == 0
+
+    err = capsys.readouterr().err
+    assert err.count("visible in shell history") == 2
+    assert "--meta-capi-token was given on the command line" in err
+    assert "--webhook-secret was given on the command line" in err
+    assert "Prefer --secrets-file or --secrets-stdin" in err
+    assert "CLI_SECRET_TOKEN" not in err and "ARGV_WEBHOOK_0001" not in err
+
+
+def test_secrets_file_run_emits_no_history_warning(cli_db, tmp_path, capsys):
+    path = write_secrets_file(tmp_path, FULL_FILE)
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--json"]) == 0
+    assert "shell history" not in capsys.readouterr().err
+
+
+def test_command_line_value_beats_file_with_a_warning(cli_db, tmp_path, capsys):
+    path = write_secrets_file(tmp_path, FULL_FILE)
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", "ARGV_OVERRIDE_0004", "--secrets-file", path, "--json"]) == 0
+
+    assert stored(cli_db, "meta_capi_token") == "ARGV_OVERRIDE_0004"
+    err = capsys.readouterr().err
+    assert "META_CAPI_TOKEN differs between command line and --secrets-file" in err
+    assert "ARGV_OVERRIDE_0004" not in err and FILE_TOKEN not in err
+
+
+def test_stdin_beats_file(cli_db, tmp_path, capsys):
+    path = write_secrets_file(tmp_path, FULL_FILE)
+    stdin = io.StringIO("META_CAPI_TOKEN=STDIN_WINS_0005\n")
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--secrets-stdin", "--json"], stdin=stdin) == 0
+
+    assert stored(cli_db, "meta_capi_token") == "STDIN_WINS_0005"
+    assert stored(cli_db, "bosta_webhook_secret") == FILE_BOSTA  # the file still supplies keys stdin omits
+    err = capsys.readouterr().err
+    assert "differs between --secrets-stdin and --secrets-file" in err
+    assert "STDIN_WINS_0005" not in err and FILE_TOKEN not in err
+
+
+def test_same_value_from_flag_and_file_is_not_reported_as_a_difference(cli_db, tmp_path, capsys):
+    path = write_secrets_file(tmp_path, FULL_FILE)
+    assert main(BASE_NO_TOKEN_ARGS + ["--meta-capi-token", FILE_TOKEN, "--secrets-file", path, "--json"]) == 0
+    assert "differs" not in capsys.readouterr().err
+
+
+def test_generate_courier_secrets_conflicts_with_file_courier_secret(cli_db, tmp_path):
+    path = write_secrets_file(tmp_path, FULL_FILE)
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path, "--generate-courier-secrets", "--json"]) == 2
+    assert get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com") is None
+
+
+def test_secret_values_never_reach_stdout_stderr_or_logs(cli_db, tmp_path, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    path = write_secrets_file(tmp_path, FULL_FILE)
+
+    assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path]) == 0  # human-readable summary, not --json
+    assert main(BASE_CLI_ARGS + ["--bosta-webhook-secret", "ARGV_BOSTA_0006", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    everything = captured.out + captured.err + caplog.text
+    for value in ALL_SECRET_VALUES + ("CLI_SECRET_TOKEN", "ARGV_BOSTA_0006"):
+        assert value not in everything

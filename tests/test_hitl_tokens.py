@@ -1,5 +1,5 @@
 """
-test_hitl_tokens.py — Rule D-003 signed, bound, short-lived, single-use approval tokens.
+test_hitl_tokens.py — Rule D-003 Ed25519-signed, bound, short-lived, single-use approval tokens.
 
 Covers: the issuer/verifier (src/ameen_workforce/hitl_tokens.py), the gate inside the deployed
 consultation.py (loaded from the real file under a stub package), parity of the two verifier copies,
@@ -12,6 +12,8 @@ import hmac
 import importlib.util
 import inspect
 import json
+import os
+import subprocess
 import sys
 import time
 import types
@@ -19,13 +21,14 @@ from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from src.ameen_workforce import hitl_tokens
 from src.ameen_workforce.config import settings
 from src.ameen_workforce.service import app
 
 ROOT = Path(__file__).resolve().parents[1]
-SIGNING_KEY = "unit-test-signing-key-0123456789abcdef"
 OPERATOR_KEY = "unit-test-operator-key"
 CONTAINER = "GTM-5C5N552P"
 WORKSPACE = "2"
@@ -35,18 +38,43 @@ def b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def forge(cid=CONTAINER, wid=WORKSPACE, exp=None, nonce="n-forged-1", key=SIGNING_KEY) -> str:
-    """Builds a token the same way the issuer does, with arbitrary claims/key (for negative tests)."""
+def pem_private(key: Ed25519PrivateKey) -> bytes:
+    return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption())
+
+
+def public_b64(key: Ed25519PrivateKey) -> str:
+    return b64(key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+
+
+ISSUER_KEY = {}
+
+
+def forge(cid=CONTAINER, wid=WORKSPACE, exp=None, nonce="n-forged-1", key=None) -> str:
+    """Builds a token the same way the issuer does, with arbitrary claims/signing key (for negative tests).
+    Default key is the test issuer key (the one whose public half the verifier trusts)."""
+    key = key or ISSUER_KEY["key"]
     claims = {"cid": cid, "wid": wid, "exp": int(time.time()) + 600 if exp is None else exp, "nonce": nonce}
     payload = b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
-    sig = hmac.new(key.encode(), payload.encode("ascii"), hashlib.sha256).digest()
-    return f"{payload}.{b64(sig)}"
+    return f"{payload}.{b64(key.sign(payload.encode('ascii')))}"
 
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
+    """Issuer side: private key PEM (0600) via HITL_SIGNING_PRIVATE_KEY_PATH. Verifier side: public key only
+    via HITL_VERIFY_PUBLIC_KEY. (One process plays both roles in tests; real hosts hold one half each.)"""
+    key = Ed25519PrivateKey.generate()
+    ISSUER_KEY["key"] = key
+    key_file = tmp_path / "keys" / "hitl_private.pem"
+    key_file.parent.mkdir()
+    key_file.write_bytes(pem_private(key))
+    if os.name == "posix":
+        key_file.chmod(0o600)
     nonces = tmp_path / "state" / "hitl_used_nonces.json"
-    monkeypatch.setenv("HITL_SIGNING_KEY", SIGNING_KEY)
+    monkeypatch.delenv("HITL_SIGNING_KEY", raising=False)
+    monkeypatch.delenv("HITL_VERIFY_PUBLIC_KEY_PATH", raising=False)
+    monkeypatch.setenv("HITL_SIGNING_PRIVATE_KEY_PATH", str(key_file))
+    monkeypatch.setenv("HITL_VERIFY_PUBLIC_KEY", public_b64(key))
     monkeypatch.setenv("HITL_USED_NONCES_PATH", str(nonces))
     return nonces
 
@@ -193,13 +221,44 @@ def test_issue_and_verify_roundtrip_is_single_use(env):
     assert len(stored) == 1
 
 
-def test_issue_fails_closed_without_or_with_weak_key(monkeypatch):
-    monkeypatch.delenv("HITL_SIGNING_KEY", raising=False)
+def test_issue_fails_closed_without_private_key(env, monkeypatch, tmp_path):
+    monkeypatch.delenv("HITL_SIGNING_PRIVATE_KEY_PATH")
     with pytest.raises(RuntimeError):
         hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
-    monkeypatch.setenv("HITL_SIGNING_KEY", "short")
+    monkeypatch.setenv("HITL_SIGNING_PRIVATE_KEY_PATH", str(tmp_path / "nope.pem"))
     with pytest.raises(RuntimeError):
         hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    garbage = tmp_path / "garbage.pem"
+    garbage.write_text("not a pem", encoding="utf-8")
+    if os.name == "posix":
+        garbage.chmod(0o600)
+    monkeypatch.setenv("HITL_SIGNING_PRIVATE_KEY_PATH", str(garbage))
+    with pytest.raises(RuntimeError):
+        hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+
+
+def test_issue_refuses_non_ed25519_private_key(env, monkeypatch, tmp_path):
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    rsa_pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    path = tmp_path / "rsa.pem"
+    path.write_bytes(rsa_pem)
+    if os.name == "posix":
+        path.chmod(0o600)
+    monkeypatch.setenv("HITL_SIGNING_PRIVATE_KEY_PATH", str(path))
+    with pytest.raises(RuntimeError):
+        hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes only")
+def test_issue_refuses_group_or_world_readable_private_key(env):
+    path = Path(os.environ["HITL_SIGNING_PRIVATE_KEY_PATH"])
+    for mode in (0o640, 0o604, 0o644):
+        path.chmod(mode)
+        with pytest.raises(RuntimeError):
+            hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    path.chmod(0o600)
+    assert hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
 
 
 @pytest.mark.parametrize("cid,wid,ttl", [("", "2", 60), ("GTM 1", "2", 60), (CONTAINER, "", 60),
@@ -232,7 +291,7 @@ def test_expired_nonces_are_pruned(env):
 
 
 def test_consultation_verifier_is_byte_for_byte_identical_to_hitl_tokens(consultation):
-    for name in ("_signing_key", "_b64url_decode", "_consume_nonce", "verify_publish_token"):
+    for name in ("_verify_key", "_b64url_decode", "_consume_nonce", "verify_publish_token"):
         assert inspect.getsource(getattr(consultation, name)) == inspect.getsource(getattr(hitl_tokens, name)), name
 
 
@@ -282,8 +341,8 @@ def test_old_magic_string_and_arbitrary_strings_are_refused(env, tools, fake_goo
 
 @pytest.mark.parametrize("tool", BOTH)
 def test_forged_signature_is_refused(env, tools, fake_google, fake_bridge, tool):
-    wrong_key = forge(wid=workspace_for(tool), key="a-different-signing-key-0123456789abcdef")
-    assert assert_refused(call(tools, tool, token=wrong_key))["approval_check"] == "bad_signature"
+    other_issuer = forge(wid=workspace_for(tool), key=Ed25519PrivateKey.generate(), nonce="n-other-key")
+    assert assert_refused(call(tools, tool, token=other_issuer))["approval_check"] == "bad_signature"
 
     good = forge(wid=workspace_for(tool), nonce="n-tamper")
     payload, sig = good.split(".")
@@ -317,11 +376,92 @@ def test_cloud_token_cannot_be_replayed_on_the_bridge_tool(env, tools, fake_goog
 
 
 @pytest.mark.parametrize("tool", BOTH)
-def test_missing_signing_key_refuses_even_a_well_formed_token(env, monkeypatch, tools, fake_google, fake_bridge, tool):
+def test_missing_public_key_refuses_even_a_well_formed_token(env, monkeypatch, tools, fake_google, fake_bridge, tool):
     token = hitl_tokens.issue_publish_token(CONTAINER, workspace_for(tool))
-    monkeypatch.delenv("HITL_SIGNING_KEY")
-    assert assert_refused(call(tools, tool, token=token))["approval_check"] == "signing_key_not_configured"
+    monkeypatch.delenv("HITL_VERIFY_PUBLIC_KEY")
+    assert assert_refused(call(tools, tool, token=token))["approval_check"] == "verify_key_not_configured"
+    monkeypatch.setenv("HITL_VERIFY_PUBLIC_KEY", "not-a-key")
+    assert assert_refused(call(tools, tool, token=token))["approval_check"] == "verify_key_not_configured"
     assert fake_google.calls == [] and fake_bridge == []
+
+
+@pytest.mark.parametrize("tool", BOTH)
+def test_old_hmac_format_token_is_refused(env, tools, fake_google, fake_bridge, monkeypatch, tool):
+    """HMAC support is gone: even a correctly HMAC-signed token (and a set HITL_SIGNING_KEY) is refused."""
+    secret = "legacy-hmac-signing-key-0123456789abcdef"
+    monkeypatch.setenv("HITL_SIGNING_KEY", secret)
+    claims = {"cid": CONTAINER, "wid": workspace_for(tool), "exp": int(time.time()) + 600, "nonce": "n-hmac"}
+    payload = b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    legacy = f"{payload}.{b64(hmac.new(secret.encode(), payload.encode('ascii'), hashlib.sha256).digest())}"
+    assert assert_refused(call(tools, tool, token=legacy))["approval_check"] == "bad_signature"
+    assert hitl_tokens.verify_publish_token(legacy, CONTAINER, workspace_for(tool), os.environ["HITL_USED_NONCES_PATH"])[0] is False
+    assert fake_google.calls == [] and fake_bridge == []
+
+
+def test_verifier_works_with_only_the_public_key_in_the_environment(env, monkeypatch, consultation):
+    token = hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    for name in list(os.environ):
+        if "PRIVATE" in name or name == "HITL_SIGNING_KEY":
+            monkeypatch.delenv(name)
+    assert not any("PRIVATE" in name for name in os.environ)
+    assert consultation.verify_publish_token(token, CONTAINER, WORKSPACE, env) == (True, "ok")
+
+
+def test_verifier_accepts_public_key_from_pem_path(env, monkeypatch, tmp_path):
+    token = hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    pub_pem = ISSUER_KEY["key"].public_key().public_bytes(serialization.Encoding.PEM,
+                                                           serialization.PublicFormat.SubjectPublicKeyInfo)
+    pub_file = tmp_path / "hitl_public.pem"
+    pub_file.write_bytes(pub_pem)
+    monkeypatch.delenv("HITL_VERIFY_PUBLIC_KEY")
+    monkeypatch.setenv("HITL_VERIFY_PUBLIC_KEY_PATH", str(pub_file))
+    assert hitl_tokens.verify_publish_token(token, CONTAINER, WORKSPACE, env) == (True, "ok")
+
+
+def test_verifier_never_reads_the_private_key_file(env, monkeypatch):
+    token = hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    private_path = os.environ["HITL_SIGNING_PRIVATE_KEY_PATH"]
+    real_open = open
+
+    def guarded_open(file, *args, **kwargs):
+        assert str(file) != private_path, "verifier touched the private key"
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", guarded_open)
+    assert hitl_tokens.verify_publish_token(token, CONTAINER, WORKSPACE, env) == (True, "ok")
+
+
+def test_generate_keypair_cli_writes_0600_private_key_and_prints_only_public(env, monkeypatch, tmp_path):
+    out = tmp_path / "cli_keys"
+    root = Path(__file__).resolve().parents[1]
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith("HITL_")}
+    run_env["PYTHONPATH"] = str(root / "src")
+    cmd = [sys.executable, "-m", "ameen_workforce.hitl_tokens", "generate-keypair", "--out", str(out)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=run_env, cwd=str(root))
+    assert proc.returncode == 0, proc.stderr
+    private_file = out / "hitl_private.pem"
+    assert private_file.exists() and (out / "hitl_public.pem").exists()
+    if os.name == "posix":
+        assert (private_file.stat().st_mode & 0o777) == 0o600
+    private_key = serialization.load_pem_private_key(private_file.read_bytes(), password=None)
+    printed = proc.stdout.strip()
+    assert printed == public_b64(private_key)
+    assert len(base64.urlsafe_b64decode(printed + "=" * (-len(printed) % 4))) == 32
+    # Nothing that looks like private material reaches stdout or stderr
+    pem_body = "".join(private_file.read_text(encoding="ascii").splitlines()[1:-1])
+    raw_private = b64(private_key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                                serialization.NoEncryption()))
+    for stream in (proc.stdout, proc.stderr):
+        assert "PRIVATE KEY" not in stream and pem_body not in stream and raw_private not in stream
+    # A token issued with the generated key verifies with ONLY the printed public key
+    monkeypatch.setenv("HITL_SIGNING_PRIVATE_KEY_PATH", str(private_file))
+    token = hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    monkeypatch.delenv("HITL_SIGNING_PRIVATE_KEY_PATH")
+    monkeypatch.setenv("HITL_VERIFY_PUBLIC_KEY", printed)
+    assert hitl_tokens.verify_publish_token(token, CONTAINER, WORKSPACE, tmp_path / "n.json") == (True, "ok")
+    # Refuses to overwrite an existing key
+    again = subprocess.run(cmd, capture_output=True, text=True, env=run_env, cwd=str(root))
+    assert again.returncode != 0 and "PRIVATE KEY" not in again.stdout
 
 
 def test_valid_token_proceeds_and_cannot_be_reused_cloud(env, tools, fake_google):
@@ -420,11 +560,11 @@ async def test_approvals_fail_closed_when_operator_key_unset_or_shared(operator_
 
 
 @pytest.mark.asyncio
-async def test_approvals_validation_and_missing_signing_key(operator_env, monkeypatch):
+async def test_approvals_validation_and_missing_private_key(operator_env, monkeypatch):
     headers = {"Authorization": f"Bearer {OPERATOR_KEY}"}
     assert (await post_approval(body={"container_id": "bad id", "workspace_id": "2"}, headers=headers)).status_code == 422
     assert (await post_approval(body={"container_id": CONTAINER}, headers=headers)).status_code == 422
-    monkeypatch.delenv("HITL_SIGNING_KEY")
+    monkeypatch.delenv("HITL_SIGNING_PRIVATE_KEY_PATH")
     res = await post_approval(headers=headers)
     assert res.status_code == 503
     assert "approval_token" not in res.text

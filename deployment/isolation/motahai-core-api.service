@@ -1,0 +1,39 @@
+[Unit]
+Description=Motahai Core API (money path, HITL approval issuer) - NO LLM agent runs under this user
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Never root, and never the same user as the Hermes runtime. This user owns the HITL PRIVATE key.
+User=motahai
+Group=motahai
+WorkingDirectory=/opt/ameen-workforce
+# /etc/motahai/core.env (0600 motahai:motahai) defines DATABASE_URL, MOTAHAI_FERNET_KEY, OPERATOR_API_KEY,
+# CORE_SERVICE_TOKEN and HITL_SIGNING_PRIVATE_KEY_PATH=/etc/motahai/hitl/hitl_private.pem
+EnvironmentFile=/etc/motahai/core.env
+# Loopback only: put a TLS reverse proxy in front for the Hermes host / operators (see README.md).
+ExecStart=/opt/ameen-workforce/venv/bin/python -m uvicorn src.ameen_workforce.service:app --host 127.0.0.1 --port 58770 --workers 2
+Restart=always
+RestartSec=5s
+LimitNOFILE=65535
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+StateDirectory=motahai
+ReadWritePaths=/var/lib/motahai
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=motahai-core-api
+
+[Install]
+WantedBy=multi-user.target

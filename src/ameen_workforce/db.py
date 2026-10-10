@@ -11,7 +11,8 @@ All timestamps are timezone-aware UTC. SQLite drops tzinfo on read, so UTCDateTi
 
 Schema is created with create_all() for now. NOTE: create_all() never ALTERs an existing table, so the S2 columns
 (orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
-storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source) and the new checkout_context table need an Alembic migration before any non-empty database is upgraded.
+storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source, S1-4 tenants.digest_email +
+tenants.language) and the new checkout_context table need an Alembic migration before any non-empty database is upgraded.
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
@@ -91,6 +92,9 @@ class Tenant(Base):
     # FX-3: per-tenant ConfirmedOrder rules {"tags": [...], "statuses": [...], "implicit_on_ship": bool}; NULL = defaults.
     # Read via confirmation.effective_confirmation_rules, write via confirmation.set_confirmation_rules (validated).
     confirmation_rules: Mapped[Optional[dict]] = mapped_column(JSON(none_as_null=True), nullable=True)
+    # S1-4: weekly Signal Hygiene digest recipient (NULL = no digest) and its language ('ar' default, or 'en').
+    digest_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    language: Mapped[str] = mapped_column(String(8), default="ar")
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:
@@ -409,7 +413,9 @@ def create_tenant(
     mode: str = "shadow",
     active: bool = True,
     settlement_hours: Optional[float] = None,
-    storefront_url: Optional[str] = None
+    storefront_url: Optional[str] = None,
+    digest_email: Optional[str] = None,
+    language: str = "ar"
 ) -> Tenant:
     """Creates and commits a tenant. New tenants default to shadow mode (no Meta calls) until flipped to live."""
     if platform not in PLATFORMS:
@@ -420,10 +426,13 @@ def create_tenant(
         raise ValueError("settlement_hours must be >= 0")
     if storefront_url is not None and not storefront_url.strip().lower().startswith(("http://", "https://")):
         raise ValueError("storefront_url must start with http:// or https://")
+    if language not in ("ar", "en"):
+        raise ValueError("language must be 'ar' or 'en'")
     tenant = Tenant(
         name=name, platform=platform, shop_domain=_norm_domain(shop_domain), meta_dataset_id=meta_dataset_id,
         country=country.upper(), currency=currency.upper(), timezone=timezone, mode=mode, active=active,
-        settlement_hours=settlement_hours, storefront_url=storefront_url.strip() if storefront_url else None
+        settlement_hours=settlement_hours, storefront_url=storefront_url.strip() if storefront_url else None,
+        digest_email=digest_email.strip() if digest_email and digest_email.strip() else None, language=language
     )
     session.add(tenant)
     session.commit()
