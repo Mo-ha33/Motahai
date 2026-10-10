@@ -14,8 +14,14 @@ jobs:
   add-to-project:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'issues' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      HAS_PAT: ${{ secrets.ADD_TO_PROJECT_PAT != '' }}
     steps:
-      - uses: actions/add-to-project@v1.0.2
+      - name: Skip when ADD_TO_PROJECT_PAT is not configured
+        if: env.HAS_PAT != 'true'
+        run: echo "::notice::ADD_TO_PROJECT_PAT secret not set; skipping project board sync."
+      - if: env.HAS_PAT == 'true'
+        uses: actions/add-to-project@v1.0.2
         with:
           project-url: https://github.com/users/Mo-ha33/projects/3
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
