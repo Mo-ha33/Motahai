@@ -34,6 +34,7 @@ from .onboarding_routes import router as onboarding_router
 from .stats_routes import router as stats_router
 from .audience_routes import router as audience_router
 from .tenant_me_routes import router as tenant_me_router
+from .tenant_api import router as tenant_api_router
 from .auth import require_operator, require_hermes  # noqa: F401  (defined in auth.py; re-exported for routes + tests)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [AmeenWorkforce] %(message)s")
@@ -75,6 +76,7 @@ app.include_router(onboarding_router)
 app.include_router(stats_router)
 app.include_router(audience_router)
 app.include_router(tenant_me_router)
+app.include_router(tenant_api_router)
 
 # CORS Policy
 ALLOWED_ORIGINS = [
