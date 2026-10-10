@@ -94,7 +94,7 @@
 | M6-6 | Billing and subscriptions — [#63](https://github.com/Mo-ha33/Motahai/issues/63) | Sonnet 5.5 | P3 | BACKLOG | phase-6, backend, feature | Depends on: M3-3. (updated 2026-10-10) |
 | B-1 | Board automation: set Project #3 status from Actions — [#64](https://github.com/Mo-ha33/Motahai/issues/64) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | In PR #27 (6fb20c6); 18 unit tests, full suite 662 passed. Live run needs #27 on main. (updated 2026-10-10) |
 | B-2 | CI: run pytest and the portal build on every PR — [#71](https://github.com/Mo-ha33/Motahai/issues/71) | Haiku 5.5 | P1 | REVIEW | phase-1, infra, board | Draft PR #72; Python 3.12 + portal job; Opus reviewed. (updated 2026-10-10) |
-| S-1 | Require authentication on /tasks and /escalations routes — [#74](https://github.com/Mo-ha33/Motahai/issues/74) | Sonnet 5.5 | P0 | IN_PROGRESS | phase-1, security, backend, bug | Found by the VPS deploy-plan thread; nginx IP allowlist is the interim guard. Dispatched 2026-10-10. (updated 2026-10-10) |
+| S-1 | Require authentication on /tasks, /escalations and /webhook/hermes — [#74](https://github.com/Mo-ha33/Motahai/issues/74) | Sonnet 5.5 | P0 | REVIEW | phase-1, security, backend, bug | Draft PR #75; also closes unauthenticated /webhook/hermes (found in review). Confirm the Hermes caller sends the Bearer key before deploy. 664 passed. (updated 2026-10-10) |
 
 ---
 
