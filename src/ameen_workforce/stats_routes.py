@@ -6,13 +6,7 @@ stats_routes.py — Tenant-scoped, read-only stats endpoints over the Sunday-dig
   GET /v1/tenants/{tenant_id}/stats/refused-cod       -> digest.q_refused_cod
   GET /v1/tenants/{tenant_id}/stats/signal-health     -> digest.q_signal_health
   GET /v1/tenants/{tenant_id}/stats/creatives         -> digest.q_creatives
-  GET /v1/tenants/{tenant_id}/stats/health-score      -> health_score.tenant_health_score (tracking health 0-100)
-  GET /v1/tenants/{tenant_id}/stats/summary           -> the five digest sections in one response (not health-score)
-
-health-score: data = {"score": int 0-100 | null, "status": healthy|degraded|critical|insufficient_data, "penalties":
-[{"name", "points", "evidence"}]}. score = 100 - sum(penalty points), clamped; a tenant with no signal events, incidents
-or staged webhooks is "insufficient_data" with a null score (never 100). as_of = window end. The full formula and
-constants are documented in health_score.py.
+  GET /v1/tenants/{tenant_id}/stats/summary           -> all five in one response
 
 Every response is {"tenant_id", "window": {"start", "end"}, "data": ...}; every number comes straight from the existing
 q_* functions (nothing is computed or defaulted here). Cohort-based endpoints (cohort-delivery, refused-cod, creatives,
