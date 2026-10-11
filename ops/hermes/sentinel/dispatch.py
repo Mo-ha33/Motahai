@@ -352,6 +352,26 @@ def _process(notification: dict, contacts, deps: _Deps, results: list) -> None:
     _send_admin(key, incident, recovered, crit, deps, results)
 
 
+def send_admin_telegram(
+    text: str,
+    key: str = "telemetry",
+    *,
+    sleep: Callable[[float], None] = _time_module.sleep,
+    http_transport: Optional[httpx.BaseTransport] = None,
+) -> str:
+    """Send one plain-text message to the admin Telegram chat (activity telemetry, T6). Same transport as the
+    alerts: 10 s timeout, one retry after 5 s, bot token never logged. Returns sent | failed | skipped:not_configured.
+    Never raises. ``key`` is only a log label."""
+    deps = _Deps(sleep=sleep, http_transport=http_transport, smtp_factory=smtplib.SMTP, now=datetime.now(timezone.utc))
+    try:
+        status = _send_telegram(key, text, deps)
+    except Exception as exc:
+        logger.error("incident=%s channel=%s outcome=send_error error=%s", key, CH_TELEGRAM, type(exc).__name__)
+        status = FAILED
+    logger.info("incident=%s channel=%s outcome=%s", key, CH_TELEGRAM, status)
+    return status
+
+
 def _as_aware(now) -> datetime:
     if isinstance(now, datetime):
         return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)

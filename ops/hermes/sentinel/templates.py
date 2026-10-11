@@ -339,3 +339,53 @@ def client_followup_email(lang: str = "ar", store_name: str | None = None) -> tu
         subject = "تحديث: استئناف فحص التتبع لمتجركم"
         body = f"{_greeting(False, store)}\n\n{_AR_FOLLOWUP}\n\n{_AR_SIGNOFF}"
     return subject, body
+
+
+# ---------------------------------------------------------------------------
+# activity telemetry (T6): one plain-text Telegram summary per sentinel pass
+# ---------------------------------------------------------------------------
+
+TELEMETRY_MAX_LINES = 25
+
+
+def _latency_text(latency_ms) -> str:
+    try:
+        ms = max(0, int(latency_ms))
+    except (TypeError, ValueError):
+        return ""
+    return f"{ms} ms" if ms < 1000 else f"{ms / 1000:.1f} s"
+
+
+def _window_text(window_s) -> str:
+    if not isinstance(window_s, (int, float)) or isinstance(window_s, bool) or window_s <= 0:
+        return ""
+    seconds = int(window_s)
+    if seconds < 120:
+        return f" (last {max(10, round(seconds / 10) * 10)} s)"
+    return f" (last {seconds // 60} min)"
+
+
+def telemetry_summary(events, total=None, window_s=None) -> str:
+    """Plain-text summary of Hermes tool calls, always <= 3500 characters.
+
+    `events` are validated telemetry events ({"tool", "outcome", "latency_ms", "subject"}), oldest first. `total` is the
+    number of calls the message stands for (>= len(events) when older events were dropped by the backlog cap). At most
+    TELEMETRY_MAX_LINES lines are listed, then "...and N more". Only the four fields above are ever rendered."""
+    try:
+        events = [e for e in (events or []) if isinstance(e, dict)]
+        count = total if isinstance(total, int) and not isinstance(total, bool) and total >= len(events) else len(events)
+        lines = [f"Hermes activity{_window_text(window_s)}: {count} call{'s' if count != 1 else ''}",
+                 f"نشاط هيرمس: {count} استدعاء", ""]
+        for event in events[:TELEMETRY_MAX_LINES]:
+            parts = [_clean(event.get("tool"), 64) or "unknown", _clean(event.get("subject"), 80),
+                     _clean(event.get("outcome"), 60), _latency_text(event.get("latency_ms"))]
+            lines.append("• " + "  ".join(part for part in parts if part))
+        extra = count - min(len(events), TELEMETRY_MAX_LINES)
+        if extra > 0:
+            lines.append(f"…and {extra} more")
+        body = "\n".join(lines)
+        if len(body) > TELEGRAM_LIMIT:
+            body = body[: TELEGRAM_LIMIT - len(_TRUNC_SUFFIX)].rstrip() + _TRUNC_SUFFIX
+        return body
+    except Exception:
+        return "Hermes activity: summary could not be rendered."

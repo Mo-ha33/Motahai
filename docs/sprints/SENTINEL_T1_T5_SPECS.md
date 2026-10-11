@@ -170,3 +170,49 @@ Telegram failure; client email once per incident; token never in captured logs; 
 
 `ops/hermes/sentinel/deploy/hermes-sentinel.service` (oneshot) + `hermes-sentinel.timer` (60 s) +
 `docs/runbooks/HERMES_SENTINEL_RUNBOOK.md`.
+
+## T6 — Hermes activity telemetry to Telegram (owner request, 2026-10-11)
+
+Goal: near-real-time, PII-free execution summaries of Hermes tool calls (Tariq's storefront probe, GTM verify/apply/
+publish, motahai tools, run_task, consult, audit_code) in the owner's Telegram chat, next to the unchanged CRIT/WARN
+alerts. Same hard rules as section 0 (no LLM, stdlib + httpx, public repo, no PII).
+
+**Files:** `ops/hermes/sentinel/telemetry.py` (new; producer + consumer helpers), `consultation.py` (one wrapper for all
+tools), `detect.py` (consumer stage), `templates.py` (`telemetry_summary`), `dispatch.py` (`send_admin_telegram`), tests
+`sentinel/tests/test_telemetry.py`.
+
+**C5 — telemetry event** (`$HERMES_SENTINEL_DIR/telemetry/events.jsonl`, dir 0700, file 0600, one JSON object per line,
+appended with a single `os.write` on an `O_APPEND` descriptor, lines < 4 KB):
+```json
+{"ts": "2026-10-11T12:00:00Z", "tool": "hermes_storefront_probe", "outcome": "OK", "latency_ms": 14312,
+ "subject": "epxsmk-y0.myshopify.com"}
+```
+- `outcome` is derived from the JSON the tool returned: `reason_code` if present, `UNKNOWN:<reason>` for a probe that
+  could not load, else `status` (`CONNECTED`, `applied`, `AWAITING_HITL_APPROVAL`, `OK`, ...; `success` → `published`);
+  plain-text results (consult, run_task, audit_code) are `OK`; an exception records its type name and is re-raised.
+  Every outcome/tool/subject must match a strict token pattern, otherwise it is replaced (`UNKNOWN`, `unknown`, null).
+- `subject`: public GTM-ID (`public_container_id`, or `container_id` as a GTM-ID or a numeric id this process saw in
+  verify/apply), else the bare hostname of `store_url` / `tenant_key` (a numeric merchant id is dropped), else
+  `gtm_public_id`, else null. Never emails, tokens, paths, queries or free text.
+- Size cap 5 MB (events dropped and counted in memory, logged once); the sentinel renames a fully consumed file > 1 MB to
+  `events.jsonl.1`.
+
+**Hook:** `register_consultation_tools` rebinds `server` to `_TelemetryServer`, so every `@server.tool(...)` below it
+registers `telemetry.instrument(name, fn)`: time the call, `emit` after it returns or raises, return value and exception
+untouched, any telemetry error swallowed. `SENTINEL_TELEMETRY_EXCLUDE` (comma list, `*` = all) skips tools; if
+`telemetry.py` cannot be loaded the tool is registered unwrapped. The verifier block is not touched.
+
+**Consumer** (each sentinel pass, after the alert dispatch): read events after `state.json` `telemetry_offset` (reset to 0
+if the file is smaller than the offset or its inode changed; an unterminated last line waits for the next pass); render
+ONE message with `templates.telemetry_summary` (header with count, Arabic count line, ≤ 25 `• tool  subject  outcome  time`
+lines, `…and N more`, ≤ 3500 chars, plain text); send it with `dispatch.send_admin_telegram` (same 10 s timeout, one retry,
+token redaction). Telegram only, at most one message per pass, none for zero events. Skipped (offset advances, nothing
+sent) when `SENTINEL_TELEMETRY_TELEGRAM=0`, `silence.json` has an unexpired `"telemetry"` key, or Telegram is not
+configured. A failed send keeps the offset (retry next pass; at most the last 200 events are rendered, older ones are
+counted); it is also deferred when an alert's Telegram send failed in the same pass. `--dry-run` prints the message and
+persists nothing.
+
+**Acceptance:** producer line format / permissions / no-PII / size cap / never raises; hook leaves every tool's return value
+and exceptions unchanged, records latency, honours the exclude list, parity test still green; consumer offset, truncation,
+inode change, rotation, one message per pass, 25-line cap, zero events, disabled flag, silence, failed send, backlog cap,
+dry-run. Rollout: copy `ops/hermes/sentinel/` + `consultation.py`, restart `hermes-mcp` once.

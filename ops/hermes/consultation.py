@@ -245,6 +245,49 @@ def _flow_record(step: str, public_id: Any, out: str) -> str:
     return out
 
 
+def _telemetry():
+    """Loads the sibling sentinel/telemetry module (package import, file-path fallback like _flow_record)."""
+    try:
+        from .sentinel import telemetry
+        return telemetry
+    except ImportError:
+        import importlib.util
+        import sys
+        cached = sys.modules.get("hermes_sentinel_telemetry")
+        if cached is not None:
+            return cached
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel", "telemetry.py")
+        spec = importlib.util.spec_from_file_location("hermes_sentinel_telemetry", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_sentinel_telemetry"] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+class _TelemetryServer:
+    """Sentinel T6: stands in for `server` while the tools register. Each tool is registered wrapped by
+    telemetry.instrument (times the call, appends one PII-free event line after it returns or raises, changes neither
+    the return value nor the exception). The local name keeps the RAW function, so hermes_audit_code calling
+    hermes_consult is one event, not two. If telemetry cannot be loaded the tool is registered unwrapped."""
+
+    def __init__(self, server):
+        self._server = server
+        self.executor = server.executor
+
+    def tool(self, *args, **kwargs):
+        register = self._server.tool(*args, **kwargs)
+        name = kwargs.get("name") or (args[0] if args else "")
+
+        def decorator(fn):
+            try:
+                wrapped = _telemetry().instrument(name, fn, lookup=_public_id_for)
+            except Exception:  # noqa: BLE001 - telemetry must never stop a tool from registering
+                wrapped = fn
+            register(wrapped)
+            return fn
+        return decorator
+
+
 def _gtm_service(scopes: List[str]):
     """Returns (service, None), or (None, JSON error string) if the key file is missing / unusable."""
     if not os.path.exists(GTM_SERVICE_ACCOUNT_PATH):
@@ -298,6 +341,7 @@ def _hitl_gate(tool: str, container_id: str, workspace_id: str, version_name: st
 
 def register_consultation_tools(server):
     executor = server.executor
+    server = _TelemetryServer(server)  # sentinel T6: every @server.tool below is registered with an activity-telemetry wrapper
 
     @server.tool(
         name="hermes_consult",

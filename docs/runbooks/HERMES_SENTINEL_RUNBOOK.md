@@ -54,6 +54,8 @@ Put these lines in `/home/deploy/.hermes/.env`. Do not add quotes unless a value
 | `HERMES_SENTINEL_DIR` | no | Defaults to `/home/deploy/.hermes/sentinel`. If you change it, change the `ReadWritePaths=` line in the service file too. |
 | `SENTINEL_FLOW_DEADLINE_S` | no | Seconds an agent may owe a step before `flow_stalled`. Default `300`. |
 | `SENTINEL_HEARTBEAT_URL` | no | Ping URL of a free healthchecks.io check, `<HEARTBEAT_URL>`. Treat it as a secret. See 2.6. |
+| `SENTINEL_TELEMETRY_TELEGRAM` | no | Set to `0` to stop the Telegram activity summaries (section 9). Default: on. |
+| `SENTINEL_TELEMETRY_EXCLUDE` | no | Comma list of tool names that `hermes-mcp` must not record (section 9). Read by `hermes-mcp`, not by the sentinel. |
 
 If SMTP is not configured, email is skipped and the journal says so. Telegram still works.
 
@@ -610,3 +612,56 @@ without first checking it for tokens, passwords, chat ids and addresses.
 Ask the developer for the new package. Copy it over `SENTINEL_HOME/sentinel/`, then run
 `sudo systemctl daemon-reload` if a unit file changed. The timer picks up the new code on its next pass.
 Never edit code on the server.
+
+---
+
+## 9. Activity telemetry (what Hermes just did)
+
+Besides alerts, the sentinel sends the admin chat a short summary of the Hermes tool calls that happened since its
+previous run, so you can follow a live session from your phone. It is **Telegram only** (never email, never clients),
+**at most one message per run** (about one a minute), and **nothing is sent when nothing happened**.
+
+Example:
+
+```text
+Hermes activity (last 60 s): 4 calls
+نشاط هيرمس: 4 استدعاء
+
+• hermes_storefront_probe  epxsmk-y0.myshopify.com  OK  14.3 s
+• hermes_gtm_verify_access  GTM-ABC1234  CONNECTED  850 ms
+• hermes_consult  OK  2.1 s
+• hermes_storefront_probe  x.example.com  UNKNOWN:BLOCKED_HOST  40 ms
+```
+
+Each line is: tool name, subject, outcome, duration. More than 25 calls in one run show 25 lines and `…and N more`.
+
+**How it works.** `hermes-mcp` appends one line per tool call to `/home/deploy/.hermes/sentinel/telemetry/events.jsonl`
+(directory `0700`, file `0600`). The sentinel reads the new lines on its next run (it remembers a byte offset in
+`state.json`), sends one message, and only then moves the offset. If Telegram is down the offset stays, so the next run
+retries (it summarises at most the last 200 events and counts the older ones). A fully read file larger than 1 MB is
+renamed to `events.jsonl.1`. If nobody reads the file it stops growing at 5 MB (new events are dropped, one line in the
+`hermes-mcp` log).
+
+**Privacy.** A line holds only: time, tool name, an outcome code (for example `CONNECTED`, `applied`, `published`,
+`OK`, `UNKNOWN:BLOCKED_HOST`, `CORE_NOT_CONFIGURED`, or the error type name if the tool crashed), the duration, and a
+subject that is a public GTM container ID or a bare store hostname. It never holds prompts, replies, tool arguments or
+results, approval tokens, email addresses, URL paths or query strings, or numeric merchant IDs. Anything that does not
+match those strict patterns is dropped before it is written and again before it is sent.
+
+**Turn it off, silence it, exclude tools.**
+
+| What | How |
+|---|---|
+| Stop the Telegram summaries (alerts are not affected) | `SENTINEL_TELEMETRY_TELEGRAM=0` in `/home/deploy/.hermes/.env`; takes effect on the next sentinel run |
+| Pause for a while | add `"telemetry": "<UTC end time>"` to `silence.json` (section 4). Events from that period are discarded, not replayed |
+| Do not record some tools at all | `SENTINEL_TELEMETRY_EXCLUDE=hermes_consult,hermes_run_task` in the **hermes-mcp** environment, then restart `hermes-mcp`. `*` records nothing |
+
+While telemetry is off or silenced, the sentinel still reads and discards the new lines, so switching it back on does
+not replay old activity. Telegram must be configured (section 2.1) or the summaries are skipped.
+
+**Deploying it.** Copy the updated `ops/hermes/sentinel/` folder to **both** places (it holds `telemetry.py`, new in
+this version): `SENTINEL_HOME/sentinel/` (section 2.5) and the `sentinel/` folder next to `consultation.py` in the
+`hermes-mcp` package, together with the updated `consultation.py`. Restart `hermes-mcp` once (`consultation.py` is
+loaded at start-up; this is the only restart needed). The sentinel picks up its new code on its next timer run. If
+`telemetry.py` is missing from the `hermes-mcp` side, the tools still work and simply record nothing. No new unit file,
+packages or permissions are needed (`telemetry/` lives inside the existing `ReadWritePaths=` directory).
