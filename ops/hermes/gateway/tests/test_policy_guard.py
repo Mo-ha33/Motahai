@@ -108,3 +108,31 @@ def test_rate_limit_timeout_budget_and_audit(guard):
     deny(lambda: guard.authorize(aud, "hermes_consult", {"prompt": "q"}), 429)
     last = json.loads((guard.tmp / "audit.jsonl").read_text().splitlines()[-1])
     assert last["status"] == "denied:budget" and "prompt" not in json.dumps(last)
+
+
+def test_gtm_provisioning_tools_are_scoped(guard, monkeypatch):
+    arch = guard.authenticate("Bearer arch-token", True, 10)
+    aud = guard.authenticate("Bearer aud-token", True, 10)
+    # read-only verify_access: operator agents yes, advisors no
+    guard.authorize(aud, "hermes_gtm_verify_access", {"public_container_id": "GTM-ABC1234"})
+    deny(lambda: guard.authorize(arch, "hermes_gtm_verify_access", {}), 403)
+    # workspace_apply (draft writes) is NOT granted to general operator agents or advisors
+    deny(lambda: guard.authorize(aud, "hermes_gtm_workspace_apply", {}), 403)
+    deny(lambda: guard.authorize(arch, "hermes_gtm_workspace_apply", {}), 403)
+    # production publish/deploy remain in no role at all
+    for tool in ("hermes_gtm_cloud_publish", "hermes_gtm_deploy"):
+        deny(lambda t=tool: guard.authorize(aud, t, {}), 403)
+    # only the dedicated provisioner principal gets workspace_apply (principal is disabled until its hash is set)
+    monkeypatch.setenv("MCP_TOK_TARIQ", hashlib.sha256(b"tariq-token").hexdigest())
+    pol = yaml.safe_load((HERE.parent / "tool-policy.yaml").read_text(encoding="utf-8"))
+    tariq = PolicyGuard(pol).authenticate("Bearer tariq-token", True, 10)
+    g2 = PolicyGuard(pol)
+    g2.authorize(tariq, "hermes_gtm_workspace_apply", {"public_container_id": "GTM-ABC1234", "container_spec": "{}"})
+    g2.authorize(tariq, "hermes_gtm_verify_access", {})
+    for tool in ("hermes_gtm_cloud_publish", "hermes_gtm_deploy", "hermes_terminal_exec"):
+        deny(lambda t=tool: g2.authorize(tariq, t, {}), 403)
+    # both new tools have explicit limits and no approval gate (publish keeps its D-003 gate)
+    lim = pol["tools"]
+    assert "hermes_gtm_verify_access" in lim and "hermes_gtm_workspace_apply" in lim
+    assert "approval_required" not in lim["hermes_gtm_verify_access"] and "approval_required" not in lim["hermes_gtm_workspace_apply"]
+    assert "approval_required" in lim["hermes_gtm_cloud_publish"]

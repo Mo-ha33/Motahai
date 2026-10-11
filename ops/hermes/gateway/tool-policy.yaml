@@ -44,6 +44,16 @@ roles:
       - hermes_browser_type
       - hermes_browser_evaluate
       - hermes_browser_close
+      - hermes_gtm_verify_access        # read-only: resolves GTM-XXXXXXX -> numeric ids, checks the invite
+    daily_token_budget: 1500000
+
+  # Headless GTM provisioning (Tariq). hermes_gtm_workspace_apply writes to a DRAFT workspace only and is
+  # linter-gated server-side; production release still needs the D-003 token via hermes_gtm_cloud_publish,
+  # which is intentionally in no role. Keep this role off the general-purpose agents.
+  gtm_provisioner:
+    inherits: operator_agent
+    tools:
+      - hermes_gtm_workspace_apply
     daily_token_budget: 1500000
 
   # Humans only (via SSH tunnel to loopback, never through the public endpoint).
@@ -66,6 +76,7 @@ principals:
   - {name: qa-consent-inspector,  role: operator_agent, token_sha256_env: MCP_TOK_QA}
   - {name: autofix-engineer,      role: advisor,        token_sha256_env: MCP_TOK_AUTOFIX}
   - {name: drift-sentinel,        role: operator_agent, token_sha256_env: MCP_TOK_SENTINEL}
+  - {name: tariq-provisioner,     role: gtm_provisioner, token_sha256_env: MCP_TOK_TARIQ}   # disabled until the hash is set
   - {name: operator-human,        role: human_operator, token_sha256_env: MCP_TOK_HUMAN}
 
 # ── Per-tool limits ──────────────────────────────────────────────────────────
@@ -105,6 +116,10 @@ tools:
   hermes_gtm_cloud_publish: {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 120,
                              approval_required: {gate: D-003, mechanism: signed_single_use_token,
                                                  arg: hitl_approval_token, issuer: "POST /approvals/gtm-publish"}}
+  # Non-production GTM tools (no approval token): verify_access is read-only; workspace_apply only writes a
+  # draft workspace (never publishes) and refuses unless gtm-container-linter passes.
+  hermes_gtm_verify_access:   {rate: 20, concurrency: 2, global_concurrency: 4, timeout_s: 60}
+  hermes_gtm_workspace_apply: {rate: 6, concurrency: 1, global_concurrency: 2, timeout_s: 120}
   hermes_gtm_deploy:       {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 60,
                             approval_required: {gate: D-003, mechanism: signed_single_use_token,
                                                 arg: hitl_approval_token, issuer: "POST /approvals/gtm-publish"}}

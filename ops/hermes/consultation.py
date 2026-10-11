@@ -123,9 +123,47 @@ def _used_nonces_path() -> str:
 
 _PENDING_CREDENTIALS = json.dumps({
     "status": "pending_credentials",
+    "reason_code": "CREDENTIALS_PENDING",
+    "audience": "operator",
+    "retryable": False,
     "service_account_email": "tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com",
     "message": "Service Account key not found at /home/deploy/secrets/gtm-service-account.json. Client should invite tariq-gtm-agent@agentic-ai-494313.iam.gserviceaccount.com with Publish permission in GTM Admin > User Management."
 })
+
+
+def _gtm_api():
+    """Loads the sibling gtm_api module (package import on the VPS, file-path fallback when this file is
+    loaded standalone, e.g. under the test stub package)."""
+    try:
+        from . import gtm_api
+        return gtm_api
+    except ImportError:
+        import importlib.util
+        import sys
+        cached = sys.modules.get("hermes_gtm_api")
+        if cached is not None:
+            return cached
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gtm_api.py")
+        spec = importlib.util.spec_from_file_location("hermes_gtm_api", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_gtm_api"] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+def _gtm_json(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _gtm_service(scopes: List[str]):
+    """Returns (service, None), or (None, JSON error string) if the key file is missing / unusable."""
+    if not os.path.exists(GTM_SERVICE_ACCOUNT_PATH):
+        return None, _PENDING_CREDENTIALS
+    api = _gtm_api()
+    try:
+        return api.build_service(GTM_SERVICE_ACCOUNT_PATH, scopes), None
+    except Exception as exc:  # noqa: BLE001 - classified, never raw
+        return None, _gtm_json(api.classify_gtm_error(exc))
 
 
 def build_version_note(approved_by_token: bool = True) -> str:
@@ -292,6 +330,7 @@ def register_consultation_tools(server):
     @server.tool(
         name="hermes_gtm_deploy",
         description=(
+            "LEGACY / OPERATOR-DESKTOP ONLY — headless agents must use hermes_gtm_cloud_publish. "
             "Deploy and publish the configured tracking container (tags, triggers, variables) to Google Tag Manager "
             "through the operator's local browser bridge. Requires a human-issued approval token (Rule D-003)."
         ),
@@ -332,10 +371,84 @@ def register_consultation_tools(server):
 
 
     @server.tool(
+        name="hermes_gtm_verify_access",
+        description=(
+            "READ-ONLY. Resolves a public GTM container ID (GTM-XXXXXXX) to its numeric account / container / default "
+            "workspace IDs and confirms the Tariq service account has been invited to it. Call this first for every "
+            "merchant. On failure returns reason_code + audience; audience=client errors include client_action_ar / "
+            "client_action_en text that can be relayed to the merchant. Also returns tariq_workspace_id if the dedicated "
+            "workspace already exists (else null). No approval token needed; changes nothing."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "public_container_id": {
+                    "type": "string",
+                    "description": "Public GTM container ID, e.g. GTM-5C5N552P (uppercase)"
+                }
+            },
+            "required": ["public_container_id"]
+        }
+    )
+    def hermes_gtm_verify_access(public_container_id: str) -> str:
+        api = _gtm_api()
+        bad = api.validate_public_id(public_container_id)
+        if bad:
+            return _gtm_json(bad)
+        service, failure = _gtm_service([api.SCOPE_READONLY])
+        if failure:
+            return failure
+        return _gtm_json(api.verify_access(service, public_container_id))
+
+    @server.tool(
+        name="hermes_gtm_workspace_apply",
+        description=(
+            "Writes tags, triggers and variables into a dedicated draft workspace named 'Tariq - GTM-XXXX' (created or reused; "
+            "falls back to the default workspace only if the container is at its workspace limit and the default has no "
+            "unpublished changes, else WORKSPACE_LIMIT). Idempotent upsert by name; order variables -> triggers -> tags. "
+            "The result's workspace_id is the one to bind the D-003 token to. Nothing goes live: publishing is a separate human-approved "
+            "step (hermes_gtm_cloud_publish). The spec is linted with gtm-container-linter first; blocking findings "
+            "(critical/high) refuse the whole call and write nothing. No approval token needed."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "public_container_id": {
+                    "type": "string",
+                    "description": "Public GTM container ID, e.g. GTM-5C5N552P"
+                },
+                "container_spec": {
+                    "type": "string",
+                    "description": (
+                        "JSON string: {\"variables\":[...],\"triggers\":[...],\"tags\":[...]} using GTM API v2 resource shapes. "
+                        "Tags reference triggers by NAME via firingTriggerName / blockingTriggerName (arrays); the built-in "
+                        "triggers can be named 'All Pages', 'Initialization - All Pages' or 'Consent Initialization - All Pages' "
+                        "(or given by id in firingTriggerId: 2147479553 / 2147479573 / 2147479572). "
+                        "Every entity needs a unique name and a type."
+                    )
+                }
+            },
+            "required": ["public_container_id", "container_spec"]
+        }
+    )
+    def hermes_gtm_workspace_apply(public_container_id: str, container_spec: str) -> str:
+        api = _gtm_api()
+        bad = api.validate_public_id(public_container_id)
+        if bad:
+            return _gtm_json(bad)
+        service, failure = _gtm_service([api.SCOPE_EDIT_CONTAINERS, api.SCOPE_READONLY])
+        if failure:
+            return failure
+        return _gtm_json(api.apply_container_spec(service, public_container_id, container_spec))
+
+    @server.tool(
         name="hermes_gtm_cloud_publish",
         description=(
-            "Direct 24/7 Cloud API deployment to Google Tag Manager via official GTM API v2 (Service Account / OAuth). "
-            "Creates, tags, and publishes container versions directly to Google Cloud without requiring a local browser session."
+            "Direct 24/7 Cloud API deployment to Google Tag Manager via official GTM API v2 (Service Account). "
+            "Creates a container version from the workspace and publishes it live, without a local browser session. "
+            "Refuses to publish if GTM reports a compiler error or merge conflict. Production release: requires a "
+            "human-issued D-003 approval token bound to this container_id and workspace_id. "
+            "Use the numeric IDs returned by hermes_gtm_verify_access / hermes_gtm_workspace_apply."
         ),
         input_schema={
             "type": "object",
@@ -346,7 +459,7 @@ def register_consultation_tools(server):
                 },
                 "container_id": {
                     "type": "string",
-                    "description": "GTM Container numerical ID (e.g. 265962858) or public container string (GTM-XXXXXXX)"
+                    "description": "GTM Container numerical ID (e.g. 265962858), as returned by hermes_gtm_verify_access"
                 },
                 "workspace_id": {
                     "type": "string",
@@ -375,46 +488,8 @@ def register_consultation_tools(server):
         if refusal:
             return refusal
 
-        try:
-            from google.oauth2 import service_account
-            from googleapiclient.discovery import build
-            
-            SCOPES = ['https://www.googleapis.com/auth/tagmanager.publish']
-            creds = service_account.Credentials.from_service_account_file(secrets_path, scopes=SCOPES)
-            service = build('tagmanager', 'v2', credentials=creds)
-            
-            parent_ws = f"accounts/{account_id}/containers/{container_id}/workspaces/{workspace_id}"
-            
-            version_body = {
-                "name": version_name,
-                "notes": build_version_note(approved_by_token=True)
-            }
-            
-            version_res = service.accounts().containers().workspaces().create_version(
-                path=parent_ws,
-                body=version_body
-            ).execute()
-            
-            v_path = version_res['containerVersion']['path']
-            
-            live_pub = service.accounts().containers().versions().publish(
-                path=v_path
-            ).execute()
-            
-            return json.dumps({
-                "status": "success",
-                "mode": "cloud_api_v2",
-                "account_id": account_id,
-                "container_id": container_id,
-                "live_version_id": live_pub['containerVersion']['containerVersionId'],
-                "version_name": live_pub['containerVersion']['name'],
-                "url": f"https://tagmanager.google.com/#/versions/{v_path}",
-                "zero_pii": "enforced",
-                "consent_mode_v2": "enforced"
-            })
-        except Exception as e:
-            return json.dumps({
-                "status": "error",
-                "mode": "cloud_api_v2",
-                "error": str(e)
-            })
+        api = _gtm_api()
+        service, failure = _gtm_service([api.SCOPE_EDIT_VERSIONS, api.SCOPE_PUBLISH])
+        if failure:
+            return failure
+        return _gtm_json(api.create_and_publish_version(service, account_id, container_id, workspace_id, version_name))
