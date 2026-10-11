@@ -117,9 +117,19 @@ def _duration(opened_at, timestamp) -> str | None:
     return f"{days}d {hours}h" if hours else f"{days}d"
 
 
+_DEFAULT_SEVERITY = {
+    "router_exhausted": "CRIT",
+    "router_unreachable": "CRIT",
+    "provider_degraded": "CRIT",
+    "flow_stalled": "CRIT",
+    "budget_80": "WARN",
+    "sentinel_error": "WARN",
+}
+
+
 def _severity(inc: dict) -> str:
     kind = _known(inc.get("kind"), _KINDS)
-    fallback = "CRIT" if kind in ("router_exhausted", "router_unreachable", "sentinel_error") else "WARN"
+    fallback = _DEFAULT_SEVERITY.get(kind, "WARN")
     return _clean(inc.get("severity"), 12).upper() or fallback
 
 
@@ -280,7 +290,7 @@ def _store(store_name) -> str:
 
 
 _AR_SIGNOFF = "مع التحية،\nفريق مُتاح AI"
-_EN_SIGNOFF = "Best regards,\nمُتاح AI team"
+_EN_SIGNOFF = "Best regards,\nThe Motahai AI team"
 
 _EN_HOLDING = (
     "We have received your request and are now working on completing the check of your "

@@ -161,9 +161,34 @@ def test_unknown_exhaustion_kind_is_not_echoed_as_action():
     assert "check the router journal" in text
 
 
-def test_missing_severity_defaults_by_kind():
-    assert T.admin_telegram({"kind": "budget_80"}).startswith("[WARN] Hermes:")
-    assert T.admin_telegram({"kind": "router_exhausted"}).startswith("[CRIT] Hermes:")
+@pytest.mark.parametrize("kind, expected", [
+    ("router_exhausted", "CRIT"),
+    ("router_unreachable", "CRIT"),
+    ("provider_degraded", "CRIT"),
+    ("flow_stalled", "CRIT"),
+    ("budget_80", "WARN"),
+    ("sentinel_error", "WARN"),
+    ("mystery_kind", "WARN"),
+])
+def test_missing_severity_defaults_per_kind(kind, expected):
+    text = T.admin_telegram({"kind": kind})
+    assert text.startswith(f"[{expected}] Hermes:")
+    subject, _ = T.admin_email({"kind": kind})
+    assert subject.startswith(f"[{expected}] Hermes sentinel:")
+
+
+def test_explicit_severity_overrides_default():
+    assert T.admin_telegram({"kind": "budget_80", "severity": "CRIT"}).startswith("[CRIT] Hermes:")
+    assert T.admin_telegram({"kind": "router_exhausted", "severity": "WARN"}).startswith("[WARN] Hermes:")
+
+
+def test_english_signoff_is_motahai():
+    _, body = T.client_holding_email("en")
+    assert "The Motahai AI team" in body
+    _, body = T.client_followup_email("en", "Demo Store")
+    assert "The Motahai AI team" in body
+    _, body = T.client_holding_email("ar")
+    assert "فريق مُتاح AI" in body
 
 
 def test_telegram_stays_within_limit_for_oversized_inputs():
