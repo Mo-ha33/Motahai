@@ -1,0 +1,2 @@
+# Sentinel venv (VPS: SENTINEL_HOME/.venv). stdlib + httpx only; keep in step with the root requirements.txt pin.
+httpx>=0.27.0,<0.28.0
