@@ -15,6 +15,7 @@ Files under ``$HERMES_SENTINEL_DIR``:
   flow/*.json     C1 flow-state records, written by flow_state.py                            (read)
   contacts.json   C4 client contacts, maintained by the operator                             (read)
   silence.json    {"<incident key | key prefix | kind>": "<until ISO UTC>"}                  (read)
+  telemetry/events.jsonl  Hermes tool-call activity lines (T6), appended by hermes-mcp           (read, rotated)
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from . import telemetry as telemetry_mod
+from . import templates as templates_mod
 
 logger = logging.getLogger("hermes.sentinel")
 
@@ -116,6 +120,7 @@ class Config:
     router_url: str
     router_key: str
     heartbeat_url: str
+    telemetry_enabled: bool = True  # SENTINEL_TELEMETRY_TELEGRAM=0 turns the activity summary off (alerts are unaffected)
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Config":
@@ -131,6 +136,7 @@ class Config:
             # ROUTER_URL is deliberately NOT derived from HERMES_ROUTER_URL (that one is the client-side setting).
             router_key=get("ROUTER_API_KEY") or get("HERMES_ROUTER_KEY"),
             heartbeat_url=get("SENTINEL_HEARTBEAT_URL"),
+            telemetry_enabled=get("SENTINEL_TELEMETRY_TELEGRAM") != "0",
         )
 
 
@@ -212,6 +218,13 @@ def default_dispatch(notifications: List[dict], contacts: dict, now: datetime) -
     return dispatch_mod.dispatch(notifications, contacts, **kwargs)
 
 
+def default_send_telemetry(text: str) -> str:
+    """Sends the activity summary through the alert Telegram transport (dispatch.send_admin_telegram)."""
+    from . import dispatch as dispatch_mod
+
+    return dispatch_mod.send_admin_telegram(text)
+
+
 @dataclass
 class Deps:
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
@@ -219,6 +232,7 @@ class Deps:
     fetch_healthz: Optional[Callable[[], Tuple[Optional[int], Any]]] = None  # None -> built from Config
     dispatch: Callable[[List[dict], dict, datetime], List[dict]] = default_dispatch
     heartbeat: Callable[[str], None] = default_heartbeat
+    send_telemetry: Callable[[str], str] = default_send_telemetry
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +670,66 @@ def _detect_errors(p: _Pass) -> None:
 
 
 # ---------------------------------------------------------------------------
+# activity telemetry (T6): new tool-call events -> ONE Telegram message per pass
+# ---------------------------------------------------------------------------
+
+TELEMETRY_SILENCE_KEY = "telemetry"
+
+
+def _telemetry_silenced(silences: dict, now: datetime) -> bool:
+    end = _parse_ts(silences.get(TELEMETRY_SILENCE_KEY))
+    return end is not None and end > now
+
+
+def _telemetry_window(p: "_Pass") -> Optional[float]:
+    previous = _parse_ts(p.state.get("tick"))
+    if previous is None:
+        return None
+    seconds = (p.now - previous).total_seconds()
+    return seconds if 0 < seconds <= 3600 else None
+
+
+def _telemetry_stage(p: "_Pass", cfg: Config, deps: Deps, silences: dict, rows: Any, dry_run: bool) -> Optional[str]:
+    """Reads the events appended since the saved offset and sends one summary. Returns the text that was sent (or, in a
+    dry run, would be sent), else None. The offset (state.json: telemetry_offset / telemetry_ino) advances only once the
+    send returned: sent, or permanently skipped (disabled, silenced, Telegram not configured). A failed send keeps it, so
+    the next pass retries (read_new then summarises at most the last 200 events and counts the rest). Never raises."""
+    try:
+        path = telemetry_mod.events_path(cfg.sentinel_dir)
+        read = telemetry_mod.read_new(path, p.state.get("telemetry_offset"), p.state.get("telemetry_ino"))
+        if not read.exists:
+            return None
+        enabled = cfg.telemetry_enabled and not _telemetry_silenced(silences, p.now)
+        text: Optional[str] = None
+        if read.total > 0 and enabled:
+            text = templates_mod.telemetry_summary(read.events, read.total, _telemetry_window(p))
+        if dry_run:
+            return text
+        status = STATUS_SENT
+        if text is not None:
+            if any(isinstance(r, dict) and r.get("channel") == "telegram" and r.get("status") == STATUS_FAILED
+                   for r in (rows if isinstance(rows, list) else [])):
+                logger.info("telemetry deferred: Telegram failed for an alert this pass")
+                return None
+            try:
+                status = deps.send_telemetry(text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("telemetry send failed (%s)", type(exc).__name__)
+                status = STATUS_FAILED
+            if status == STATUS_FAILED:
+                return None  # offset kept: retried next pass
+        offset = read.offset
+        p.state["telemetry_ino"] = read.ino
+        if telemetry_mod.rotate_if_consumed(path, offset):
+            offset, p.state["telemetry_ino"] = 0, None
+        p.state["telemetry_offset"] = offset
+        return text if status == STATUS_SENT else None
+    except Exception as exc:  # noqa: BLE001 - telemetry never breaks a pass
+        logger.warning("telemetry stage failed (%s)", type(exc).__name__)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # silences, notifications, dispatch results
 # ---------------------------------------------------------------------------
 
@@ -786,6 +860,7 @@ class PassResult:
     notifications: List[dict] = field(default_factory=list)
     persisted: bool = False
     summary: str = ""
+    telemetry: Optional[str] = None  # the activity message sent (dry run: that would be sent) in this pass
 
 
 def run_pass(cfg: Config, deps: Optional[Deps] = None, *, dry_run: bool = False) -> PassResult:
@@ -820,6 +895,7 @@ def run_pass(cfg: Config, deps: Optional[Deps] = None, *, dry_run: bool = False)
         len(p.opened), len(p.resolved), open_count, len(notifications), len(p.errors))
 
     if dry_run:
+        result.telemetry = _telemetry_stage(p, cfg, deps, silences, [], True)
         result.summary = f"dry-run {counts}"
         logger.info("sentinel pass (%s)", result.summary)
         return result
@@ -832,6 +908,7 @@ def run_pass(cfg: Config, deps: Optional[Deps] = None, *, dry_run: bool = False)
             logger.error("dispatch failed (%s); state not advanced", type(exc).__name__)
             result.summary = f"dispatch failed {counts}"
             return result
+    result.telemetry = _telemetry_stage(p, cfg, deps, silences, rows, False)
     if notifications and not any(
         isinstance(r, dict) and r.get("channel") in ("telegram", "admin_email") and r.get("status") != "skipped:not_configured"
         for r in (rows if isinstance(rows, list) else [])
@@ -879,5 +956,8 @@ def main(argv: Optional[List[str]] = None, deps: Optional[Deps] = None, env: Opt
         for note in result.notifications:
             inc = note["incident"]
             print(f"{inc['incident_key']} {inc['severity']} {note['event']}")
+        if result.telemetry:
+            print("telemetry message that would be sent:")
+            print(result.telemetry)
         print(result.summary)
     return result.exit_code

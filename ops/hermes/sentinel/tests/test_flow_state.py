@@ -446,7 +446,8 @@ def test_container_map_is_bounded_and_not_persisted(tmp_path, monkeypatch, consu
     tools["hermes_gtm_verify_access"](public_container_id=GTM)
     assert consultation._public_id_for("555") == GTM
     root = tmp_path / "sentinel"
-    written = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    written = sorted(p.relative_to(root).as_posix() for p in root.rglob("*")
+                     if p.is_file() and not p.relative_to(root).as_posix().startswith("telemetry/"))  # T6 activity log
     assert written == [f"flow/{GTM}.json"]                         # only the flow record, no mapping file
 
 
