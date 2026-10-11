@@ -4,6 +4,16 @@ motahai_api.py - Hermes MCP client for the Motahai Core tenant & COD signal API.
 Pure functions with an injectable HTTP requester so unit tests never touch the network.
 Deployed alongside consultation.py on the VPS.
 
+Configuration (both required; read from the Hermes environment):
+  * MOTAHAI_CORE_URL       - base URL of Motahai Core (http or https, with a host).
+  * MOTAHAI_TENANT_API_KEY - Core bearer key.
+
+MOTAHAI_CORE_URL has deliberately NO default. The VPS is shared: port 8000 on
+127.0.0.1 belongs to another product (SmartCafe), so a silent fallback there would
+send Motahai traffic to the wrong backend. A missing or blank URL or key returns
+CORE_NOT_CONFIGURED without making any call. A loopback URL on port 8000 is refused
+for the same reason.
+
 Tools backed by this module:
   * hermes_motahai_tenant_status(tenant_key)
       -> GET  {MOTAHAI_CORE_URL}/v1/tenants/{tenant_key}/status
@@ -20,6 +30,7 @@ arbitrary self-serve stores, bind tenant_key to the Wesam conversation server-si
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -31,8 +42,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger("hermes.motahai_api")
 
-DEFAULT_CORE_URL = "http://127.0.0.1:8000"
 TIMEOUT_S = 15.0
+# Port 8000 on a loopback host is the SmartCafe backend on the shared VPS; never call it.
+_RESERVED_LOOPBACK_PORT = 8000
 
 # Lowercase domain (3..255 chars of a-z, 0-9, '.', '-') or numeric Salla merchant ID (1..20 digits).
 _DOMAIN_RE = re.compile(r"^[a-z0-9.-]{3,255}$")
@@ -128,16 +140,64 @@ def _default_http_call(
 HttpCaller = Callable[[str, str, Dict[str, str], Optional[bytes], float], Tuple[int, str]]
 
 
-def _core_config() -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
-    """Reads MOTAHAI_CORE_URL and MOTAHAI_TENANT_API_KEY from env."""
-    api_key = os.environ.get("MOTAHAI_TENANT_API_KEY", "").strip()
-    if not api_key:
-        return None, None, error_response(
-            "CORE_AUTH_FAILED",
-            "operator",
-            "MOTAHAI_TENANT_API_KEY is not configured in the Hermes environment.",
+def _is_loopback_host(host: str) -> bool:
+    """True for localhost, *.localhost, any 127.0.0.0/8 address, and ::1 (brackets already stripped)."""
+    name = host.rstrip(".").lower()
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def _validate_core_url(raw: str) -> Optional[str]:
+    """Returns a safe detail message if raw is not an acceptable Core URL, else None.
+
+    Never echoes the URL itself, so the detail is safe to return to callers.
+    """
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        host = parts.hostname
+        port = parts.port  # raises ValueError on a non-numeric or out-of-range port
+    except ValueError:
+        return "MOTAHAI_CORE_URL is not a valid URL."
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        return "MOTAHAI_CORE_URL must be an absolute http or https URL with a host."
+    if port == _RESERVED_LOOPBACK_PORT and _is_loopback_host(host):
+        return (
+            "MOTAHAI_CORE_URL points at a loopback address on port 8000, which is reserved "
+            "for another product on this host (SmartCafe). Set it to the Motahai Core address."
         )
-    base_url = os.environ.get("MOTAHAI_CORE_URL", "").strip() or DEFAULT_CORE_URL
+    return None
+
+
+def _core_config() -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    """Reads MOTAHAI_CORE_URL and MOTAHAI_TENANT_API_KEY from env.
+
+    Makes no network call. Returns CORE_NOT_CONFIGURED when either is missing or
+    blank, or when the URL is malformed or targets the reserved port. The detail
+    names variables only, never their values.
+    """
+    base_url = os.environ.get("MOTAHAI_CORE_URL", "").strip()
+    api_key = os.environ.get("MOTAHAI_TENANT_API_KEY", "").strip()
+    missing = [
+        name
+        for name, value in (("MOTAHAI_CORE_URL", base_url), ("MOTAHAI_TENANT_API_KEY", api_key))
+        if not value
+    ]
+    if missing:
+        return None, None, error_response(
+            "CORE_NOT_CONFIGURED",
+            "operator",
+            f"{' and '.join(missing)} not configured in the Hermes environment.",
+        )
+    url_problem = _validate_core_url(base_url)
+    if url_problem:
+        return None, None, error_response("CORE_NOT_CONFIGURED", "operator", url_problem)
     return base_url.rstrip("/"), api_key, None
 
 

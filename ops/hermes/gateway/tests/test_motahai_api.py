@@ -68,7 +68,7 @@ class FakeHttp:
 @pytest.fixture
 def core_env(monkeypatch):
     monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
-    monkeypatch.setenv("MOTAHAI_CORE_URL", "http://127.0.0.1:8000/")
+    monkeypatch.setenv("MOTAHAI_CORE_URL", "http://core.test:8080/")
 
 
 def test_module_docstring_records_known_pilot_risk():
@@ -129,19 +129,129 @@ def test_validate_window_days_rejects_out_of_range_without_http_call(core_env, b
     assert http.calls == []
 
 
-def test_missing_env_key_makes_no_http_call(monkeypatch):
-    monkeypatch.delenv("MOTAHAI_TENANT_API_KEY", raising=False)
-    http = FakeHttp()
-    for fn in (
+def _all_three(http):
+    return (
         lambda: motahai.tenant_status("shop.myshopify.com", http_call=http),
         lambda: motahai.signal_health("shop.myshopify.com", 7, http_call=http),
         lambda: motahai.promote_live("shop.myshopify.com", APPROVAL_TOKEN, http_call=http),
-    ):
+    )
+
+
+def test_missing_env_key_makes_no_http_call(monkeypatch):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", "http://core.test:8080/")
+    monkeypatch.delenv("MOTAHAI_TENANT_API_KEY", raising=False)
+    http = FakeHttp()
+    for fn in _all_three(http):
         out = fn()
         assert out["ok"] is False
-        assert out["reason_code"] == "CORE_AUTH_FAILED"
+        assert out["reason_code"] == "CORE_NOT_CONFIGURED"
         assert out["audience"] == "operator"
     assert http.calls == []
+
+
+def test_missing_url_makes_no_http_call(monkeypatch):
+    monkeypatch.delenv("MOTAHAI_CORE_URL", raising=False)
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
+    http = FakeHttp()
+    for fn in _all_three(http):
+        out = fn()
+        assert out["ok"] is False and out["reason_code"] == "CORE_NOT_CONFIGURED"
+        assert "MOTAHAI_CORE_URL" in out["detail"]
+    assert http.calls == []
+
+
+def test_both_unset_makes_no_http_call(monkeypatch):
+    monkeypatch.delenv("MOTAHAI_CORE_URL", raising=False)
+    monkeypatch.delenv("MOTAHAI_TENANT_API_KEY", raising=False)
+    http = FakeHttp()
+    for fn in _all_three(http):
+        out = fn()
+        assert out["ok"] is False and out["reason_code"] == "CORE_NOT_CONFIGURED"
+        assert "MOTAHAI_CORE_URL" in out["detail"] and "MOTAHAI_TENANT_API_KEY" in out["detail"]
+    assert http.calls == []
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+def test_blank_values_are_not_configured_and_make_no_call(monkeypatch, blank):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", blank)
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", blank)
+    http = FakeHttp()
+    for fn in _all_three(http):
+        out = fn()
+        assert out["ok"] is False and out["reason_code"] == "CORE_NOT_CONFIGURED"
+    assert http.calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://127.0.0.1:8000",
+        "http://127.0.0.2:8000/",
+        "http://localhost:8000/",
+        "http://LOCALHOST:8000",
+        "http://[::1]:8000",
+        "ftp://core.test",
+        "not a url",
+        "http://core.test:notaport",
+        "http://[::1",
+        "http://:8080",
+    ],
+)
+def test_unsafe_or_malformed_core_url_is_refused_without_call(monkeypatch, bad_url):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", bad_url)
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
+    http = FakeHttp()
+    for fn in _all_three(http):
+        out = fn()
+        assert out["ok"] is False and out["reason_code"] == "CORE_NOT_CONFIGURED"
+        assert out["audience"] == "operator"
+    assert http.calls == []
+
+
+def test_reserved_port_refusal_explains_the_reason(monkeypatch):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
+    out = motahai.tenant_status("shop.myshopify.com", http_call=FakeHttp())
+    assert "8000" in out["detail"] and "reserved" in out["detail"]
+    assert "127.0.0.1" not in out["detail"]
+
+
+@pytest.mark.parametrize("ok_url", ["http://127.0.0.1:8080", "https://core.example.com"])
+def test_allowed_core_url_makes_call(monkeypatch, ok_url):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", ok_url)
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
+    http = FakeHttp(status=200, body={"tenant_key": "shop.myshopify.com"})
+    out = motahai.tenant_status("shop.myshopify.com", http_call=http)
+    assert out["ok"] is True
+    assert len(http.calls) == 1
+    assert http.calls[0]["url"] == f"{ok_url}/v1/tenants/shop.myshopify.com/status"
+
+
+def test_real_core_401_still_maps_to_auth_failed(core_env):
+    http = FakeHttp(status=401, body={"detail": "Unauthorized"})
+    out = motahai.tenant_status("shop.myshopify.com", http_call=http)
+    assert out["reason_code"] == "CORE_AUTH_FAILED"
+    assert len(http.calls) == 1
+
+
+def test_default_core_url_constant_is_gone():
+    assert hasattr(motahai, "DEFAULT_CORE_URL") is False
+
+
+def test_missing_key_detail_never_contains_key_value(monkeypatch):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", "http://core.test:8080/")
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", "   ")
+    out = motahai.tenant_status("shop.myshopify.com", http_call=FakeHttp())
+    assert out["reason_code"] == "CORE_NOT_CONFIGURED"
+    assert "MOTAHAI_TENANT_API_KEY" in out["detail"]
+
+
+def test_missing_url_detail_never_contains_key_value(monkeypatch):
+    monkeypatch.delenv("MOTAHAI_CORE_URL", raising=False)
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", "secret-xyz")
+    out = motahai.tenant_status("shop.myshopify.com", http_call=FakeHttp())
+    assert out["reason_code"] == "CORE_NOT_CONFIGURED"
+    assert "secret-xyz" not in json.dumps(out)
 
 
 def test_tenant_status_200_passes_core_contract_unchanged(core_env):
@@ -167,7 +277,7 @@ def test_tenant_status_200_passes_core_contract_unchanged(core_env):
     assert len(http.calls) == 1
     call = http.calls[0]
     assert call["method"] == "GET"
-    assert call["url"] == "http://127.0.0.1:8000/v1/tenants/epxsmk-y0.myshopify.com/status"
+    assert call["url"] == "http://core.test:8080/v1/tenants/epxsmk-y0.myshopify.com/status"
     assert call["headers"]["Authorization"] == f"Bearer {API_KEY}"
     assert call["timeout_s"] == 15.0
 
@@ -186,7 +296,7 @@ def test_signal_health_200_passes_core_contract_unchanged(core_env):
     http = FakeHttp(status=200, body=core_body)
     out = motahai.signal_health("epxsmk-y0.myshopify.com", window_days=14, http_call=http)
     assert out == {"ok": True, **core_body}
-    assert http.calls[0]["url"] == "http://127.0.0.1:8000/v1/tenants/epxsmk-y0.myshopify.com/signal-health?window_days=14"
+    assert http.calls[0]["url"] == "http://core.test:8080/v1/tenants/epxsmk-y0.myshopify.com/signal-health?window_days=14"
 
 
 def test_promote_live_200_and_missing_token_handling(core_env):
@@ -206,7 +316,7 @@ def test_promote_live_200_and_missing_token_handling(core_env):
         "promoted_live_at": "2026-10-11T04:00:00Z",
     }
     assert http.calls[0]["method"] == "POST"
-    assert http.calls[0]["url"] == "http://127.0.0.1:8000/v1/tenants/epxsmk-y0.myshopify.com/promote-live"
+    assert http.calls[0]["url"] == "http://core.test:8080/v1/tenants/epxsmk-y0.myshopify.com/promote-live"
     assert http.calls[0]["body"] == {"approval_token": APPROVAL_TOKEN}
 
 
