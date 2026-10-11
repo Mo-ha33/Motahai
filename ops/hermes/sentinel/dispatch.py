@@ -4,12 +4,14 @@
 ``flow_stalled`` incident, the client emails. Every message text comes from ``templates`` (C3).
 No LLM, no Core package import. Stdlib + httpx only.
 
+Events: "open", "reminder", "recovered", "client_holding", "client_followup". See ``dispatch()``.
+
 Routing:
 - Admin, CRIT (open / reminder / recovered): Telegram AND email.
 - Admin, WARN: Telegram only; email only when Telegram did not send (failed or not configured).
 - budget_80 recovered: nothing.
-- Client (flow_stalled CRIT only): holding email on "open", follow-up on "recovered", never on
-  "reminder"; only when the contacts file has an entry for the incident's container_id.
+- Client (flow_stalled CRIT only): see ``dispatch()``. Only for contacts with an entry for the
+  incident's container_id, and only inside the contact's send window (09:00 to 20:00 local time).
 
 Logging: only incident_key, channel and outcome, plus the exception TYPE name on a failed attempt.
 Never a token, a password, an address, a URL or a message body. The function never raises.
@@ -22,10 +24,12 @@ import os
 import re
 import smtplib
 import ssl
-import time
+import time as _time_module
 from dataclasses import dataclass
+from datetime import datetime, time, timezone
 from email.message import EmailMessage
 from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -42,15 +46,22 @@ SENT = "sent"
 FAILED = "failed"
 NOT_CONFIGURED = "skipped:not_configured"
 NO_CONTACT = "skipped:no_contact"
+OUTSIDE_HOURS = "skipped:outside_hours"
 
 CH_TELEGRAM = "telegram"
 CH_ADMIN_EMAIL = "admin_email"
 CH_CLIENT_EMAIL = "client_email"
 
-EVENTS = ("open", "reminder", "recovered")
+EVENTS = ("open", "reminder", "recovered", "client_holding", "client_followup")
+CLIENT_ONLY_EVENTS = ("client_holding", "client_followup")
 DEFAULT_LANG = "ar"
 
+DEFAULT_TZ = "Asia/Riyadh"
+WINDOW_START = time(9, 0)
+WINDOW_END = time(20, 0)  # exclusive
+
 _warned_not_configured: set = set()
+_warned_tz: set = set()
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +212,7 @@ class _Deps:
     sleep: Callable[[float], None]
     http_transport: Optional[httpx.BaseTransport]
     smtp_factory: Callable[..., Any]
+    now: datetime  # aware instant for this call; drives the client send window
 
 
 def _send_admin(key: str, incident: dict, recovered: bool, crit: bool, deps: _Deps, results: list) -> None:
@@ -237,30 +249,59 @@ def _client_contact(incident: dict, contacts) -> Optional[dict]:
     return entry
 
 
-def _send_client(key: str, incident: dict, event: str, contacts, deps: _Deps, results: list) -> bool:
-    """Send the client holding (open) or follow-up (recovered) email. Returns client_notified."""
+def _contact_zone(key: str, entry: dict) -> ZoneInfo:
+    """The contact's IANA timezone, default Asia/Riyadh. An invalid name falls back to the default."""
+    name = entry.get("tz")
+    if name is None or (isinstance(name, str) and not name.strip()):
+        return ZoneInfo(DEFAULT_TZ)
+    if isinstance(name, str):
+        try:
+            return ZoneInfo(name.strip())
+        except Exception:
+            pass
+    if key not in _warned_tz:
+        _warned_tz.add(key)
+        logger.warning("incident=%s contact timezone is invalid; using %s", key, DEFAULT_TZ)
+    return ZoneInfo(DEFAULT_TZ)
+
+
+def _in_send_window(instant: datetime, zone: ZoneInfo) -> bool:
+    local = instant.astimezone(zone).time()
+    return WINDOW_START <= local < WINDOW_END
+
+
+def _send_client(key: str, incident: dict, purpose: str, contacts, deps: _Deps, results: list):
+    """Send the client holding ("holding") or follow-up ("followup") email.
+
+    Returns the tri-state client_notified value for the admin text: True (sent), False (no contact
+    on file), or "failed" (contact exists but the send failed or SMTP is not configured). Returns
+    None when the send window is closed (nothing sent; the detector re-offers it later).
+    """
     entry = _client_contact(incident, contacts)
     if entry is None:
         _record(results, key, CH_CLIENT_EMAIL, NO_CONTACT)
         return False
+    if not _in_send_window(deps.now, _contact_zone(key, entry)):
+        _record(results, key, CH_CLIENT_EMAIL, OUTSIDE_HOURS)
+        return None
     smtp = _smtp_config()
     if smtp is None:
         _not_configured(CH_CLIENT_EMAIL, "MOTAHAI_SMTP_HOST or MOTAHAI_SMTP_FROM unset")
         _record(results, key, CH_CLIENT_EMAIL, NOT_CONFIGURED)
-        return False
+        return "failed"
 
     lang = entry.get("lang")
     lang = lang if isinstance(lang, str) and lang.strip() else DEFAULT_LANG
     store = entry.get("store_name")
     store = store if isinstance(store, str) else None
-    if event == "open":
+    if purpose == "holding":
         subject, body = T.client_holding_email(lang=lang, store_name=store)
     else:
         subject, body = T.client_followup_email(lang=lang, store_name=store)
 
     status = _deliver_email(key, CH_CLIENT_EMAIL, smtp, entry["email"].strip(), subject, body, deps)
     _record(results, key, CH_CLIENT_EMAIL, status)
-    return status == SENT
+    return True if status == SENT else "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +315,9 @@ def _key_of(notification) -> str:
     return "unknown"
 
 
+_UNSET = object()
+
+
 def _process(notification: dict, contacts, deps: _Deps, results: list) -> None:
     event = notification.get("event")
     incident = dict(notification.get("incident") or {})
@@ -285,33 +329,82 @@ def _process(notification: dict, contacts, deps: _Deps, results: list) -> None:
     kind = incident.get("kind")
     crit = str(incident.get("severity") or "").upper() == "CRIT"
     recovered = event == "recovered"
+    client_only = event in CLIENT_ONLY_EVENTS
 
     if kind == "budget_80" and recovered:
         return
 
-    if kind == "flow_stalled" and crit and event in ("open", "recovered"):
-        incident["client_notified"] = _send_client(key, incident, event, contacts, deps, results)
+    # Client emails: flow_stalled and CRIT only, never for any other kind.
+    if kind == "flow_stalled" and crit:
+        notified: Any = _UNSET
+        if event in ("open", "client_holding"):
+            notified = _send_client(key, incident, "holding", contacts, deps, results)
+        elif event in ("recovered", "client_followup") and incident.get("client_holding_sent") is True:
+            notified = _send_client(key, incident, "followup", contacts, deps, results)
+        if notified is not _UNSET and not client_only:
+            if notified is None:
+                incident.pop("client_notified", None)  # window closed: the admin text says nothing yet
+            else:
+                incident["client_notified"] = notified
 
+    if client_only:
+        return  # the client-only events never produce admin rows or messages
     _send_admin(key, incident, recovered, crit, deps, results)
+
+
+def _as_aware(now) -> datetime:
+    if isinstance(now, datetime):
+        return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
 
 
 def dispatch(
     notifications,
     contacts,
     *,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] = _time_module.sleep,
     http_transport: Optional[httpx.BaseTransport] = None,
     smtp_factory: Optional[Callable[..., Any]] = None,
+    now: Optional[datetime] = None,
 ) -> List[Dict[str, str]]:
     """Send the notifications. Returns one {"incident_key", "channel", "status"} per attempted channel.
 
-    ``sleep``, ``http_transport`` and ``smtp_factory`` exist for tests (no real waits, no network).
-    Never raises. Caller's incident dicts are not mutated.
+    Statuses: sent | failed | skipped:not_configured | skipped:no_contact | skipped:outside_hours.
+
+    ``sleep``, ``http_transport``, ``smtp_factory`` and ``now`` exist for tests (no real waits, no
+    network, fixed clock). ``now`` is an aware datetime (naive is taken as UTC); the default is the
+    real UTC time. Never raises. Caller's incident dicts are not mutated (a copy is rendered).
+
+    Events:
+    - "open": admin routing as usual (CRIT: Telegram and email; WARN: Telegram, email on failure).
+      For a CRIT flow_stalled incident the client holding email is attempted and the admin text gets
+      client_notified.
+    - "reminder": admin only. Never a client email.
+    - "recovered": admin RECOVERED message. For a CRIT flow_stalled incident the client follow-up is
+      sent ONLY when the incident has client_holding_sent == True. The detector (T2) sets that flag on
+      the persisted incident from this call's open-event rows (a client_email row with status "sent").
+      Without the flag no follow-up is attempted and no client_email row is returned.
+    - "client_holding": client holding email only (same rules as the open-event client send).
+      No admin rows, no admin messages. The detector emits it on a later pass after an open-event
+      client row was skipped:outside_hours or failed.
+    - "client_followup": client follow-up only. Requires client_holding_sent == True. No admin rows,
+      no admin messages.
+
+    Client rules, for every client send: only flow_stalled with severity CRIT; only when the contacts
+    have an entry for the incident's container_id with an email; only inside the contact's send window,
+    09:00 to 20:00 (20:00 exclusive) in the contact's "tz" (IANA name, default Asia/Riyadh; an invalid
+    name falls back to the default). Outside the window nothing is sent, the row is
+    skipped:outside_hours, and client_notified is left unset. This function never sets
+    client_holding_sent; the detector derives it from the open-event rows.
+
+    client_notified (admin text, tri-state): True = sent, False = no contact on file,
+    "failed" = contact exists but the send failed or SMTP is not configured.
     """
     deps = _Deps(
         sleep=sleep,
         http_transport=http_transport,
         smtp_factory=smtp_factory or smtplib.SMTP,
+        now=_as_aware(now),
     )
     results: List[Dict[str, str]] = []
     for notification in notifications or []:
