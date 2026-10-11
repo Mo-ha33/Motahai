@@ -35,6 +35,8 @@ SupplementaryGroups=systemd-journal
 EnvironmentFile=/home/deploy/.hermes/.env
 
 Environment=HERMES_SENTINEL_DIR=/home/deploy/.hermes/sentinel
+# Optional: ROUTER_URL. The sentinel defaults to http://127.0.0.1:47311, the port in
+# hermes-llm-router.service. Set it in .env only if that port changes.
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 

@@ -11,14 +11,14 @@ values into the repository, a chat, a ticket or a screenshot.
 ## 1. What it watches and why
 
 The sentinel tells you when AI capacity is running out or stalling, while you are away from
-the screen. It sends a Telegram message to the admin, and an email when configured. It runs
-once a minute on its own timer.
+the screen. It sends alerts to the admin on Telegram, and by email for critical alerts when email
+is configured. It runs once a minute on its own timer.
 
 It watches two LLM layers, and it sees them in different ways:
 
 | Layer | What it is | How the sentinel knows |
 |---|---|---|
-| Wesam's model (the agent) | The agent that talks to clients and works through flows | **Inferred from silence.** The sentinel reads flow-state files that hermes-mcp writes. If an agent owes a step and the deadline passes (300 s by default), that is a `flow_stalled` alert. The sentinel never calls the model itself. |
+| Wesam's model (the agent) | The agent that talks to clients and works through flows | **Inferred from silence.** The sentinel reads one flow-state file per GTM container, written by hermes-mcp. If an agent owes a step and its deadline passes (300 s by default), that is a `flow_stalled` alert. The sentinel never calls the model itself. |
 | Hermes LLM router | The local router in front of the NVIDIA, OpenRouter and Gemini tiers | **Observed directly.** The sentinel reads the router's journal lines and its `/healthz` status page. |
 
 The sentinel does **not** call any LLM. It keeps working when every model balance is $0,
@@ -29,7 +29,7 @@ Names used in this runbook:
 - `SENTINEL_HOME` = `/home/deploy/hermes-sentinel` (the code)
 - `HERMES_SENTINEL_DIR` = `/home/deploy/.hermes/sentinel` (state: `flow/`, `contacts.json`, `silence.json`)
 - The secrets file = `/home/deploy/.hermes/.env` (permissions `0600`)
-- The router's loopback address = `http://localhost:47311`
+- `ROUTER_URL` = the router's address. The default is `http://127.0.0.1:47311`, the port in `hermes-llm-router.service`.
 
 ---
 
@@ -43,16 +43,19 @@ Put these lines in `/home/deploy/.hermes/.env`. Do not add quotes unless a value
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | yes | Token of the alert bot. Ask the developer; it is shown once by BotFather. |
 | `ADMIN_TELEGRAM_CHAT_ID` | yes | The admin's chat id. See 2.2. |
+| `ADMIN_ALERT_EMAIL` | for email | Where admin email alerts go, `<ADMIN_ALERT_EMAIL>` |
 | `MOTAHAI_SMTP_HOST` | for email | Mail server name, `<SMTP_HOST>` |
 | `MOTAHAI_SMTP_PORT` | for email | Usually `587` (STARTTLS) or `465` (TLS), `<SMTP_PORT>` |
 | `MOTAHAI_SMTP_USER` | for email | Mail account name, `<SMTP_USER>` |
 | `MOTAHAI_SMTP_PASSWORD` | for email | Mail password. Many providers need an app-specific password. `<SMTP_PASSWORD>` |
 | `MOTAHAI_SMTP_FROM` | for email | Sender address, `<SMTP_FROM_ADDRESS>` |
-| `ADMIN_ALERT_EMAIL` | for email | Where admin email alerts go, `<ADMIN_ALERT_EMAIL>` |
 | `ROUTER_API_KEY` | yes | The same key Hermes uses for the router. The sentinel uses it to read `/healthz`. It is the same value as in the router's own env file. |
+| `ROUTER_URL` | no | The router's address. Default `http://127.0.0.1:47311`. Set it only if the router port changes. |
 | `HERMES_SENTINEL_DIR` | no | Defaults to `/home/deploy/.hermes/sentinel`. If you change it, change the `ReadWritePaths=` line in the service file too. |
 | `SENTINEL_FLOW_DEADLINE_S` | no | Seconds an agent may owe a step before `flow_stalled`. Default `300`. |
 | `SENTINEL_HEARTBEAT_URL` | no | Ping URL of a free healthchecks.io check, `<HEARTBEAT_URL>`. Treat it as a secret. See 2.6. |
+
+If SMTP is not configured, email is skipped and the journal says so. Telegram still works.
 
 To see which names are set, without showing any value, run:
 
@@ -108,8 +111,8 @@ or nothing at all, the host or port is wrong, or the VPS cannot reach the mail s
 
 ### 2.4 Create `contacts.json` (client emails)
 
-Only clients listed in this file can receive email from the sentinel. Anyone not listed never gets
-mail from it. Create the file in the state directory:
+Client emails are sent only to contacts listed in this file. Each entry is keyed by the client's
+GTM container ID (`GTM-XXXXXXX`). Create the file in the state directory:
 
 ```bash
 install -d -m 0700 /home/deploy/.hermes/sentinel
@@ -121,21 +124,27 @@ Format (JSON, double quotes, no trailing commas):
 
 ```json
 {
-  "<CONTACT_KEY>": {
-    "name": "<CLIENT_NAME>",
-    "email": "<CLIENT_EMAIL>"
+  "GTM-XXXXXXX": {
+    "email": "<CLIENT_EMAIL>",
+    "store_name": "<STORE_NAME>",
+    "lang": "ar"
   }
 }
 ```
 
-Check that it is valid JSON before you rely on it:
+- `email` is the address that receives client messages.
+- `store_name` is the store's display name.
+- `lang` is the language code for the client message, for example `ar`.
+
+If a GTM container has no entry, no client email is sent. The admin alert says
+`client not notified: no contact on file`. That is the correct behaviour, not an error. Add the entry
+if the client should be notified.
+
+Check that the file is valid JSON before you rely on it:
 
 ```bash
 python3 -m json.tool /home/deploy/.hermes/sentinel/contacts.json >/dev/null && echo "valid JSON"
 ```
-
-Note: the shape above is the documented format for this runbook. If the journal reports an
-unexpected format for `contacts.json`, the sentinel code is the source of truth. Ask the developer.
 
 ### 2.5 Install the code and the timer
 
@@ -187,11 +196,12 @@ journalctl -u hermes-sentinel -n 30 --no-pager
 After the first pass you should see a line for the pass and no error. A pass with no open incidents
 is silent. No message in Telegram is the correct result when everything is healthy.
 
-Check the router status page from the sentinel's environment:
+Check the router status page:
 
 ```bash
 set -a; . /home/deploy/.hermes/.env; set +a
-curl -s -H "Authorization: Bearer $ROUTER_API_KEY" http://localhost:47311/healthz
+ROUTER="${ROUTER_URL:-http://127.0.0.1:47311}"
+curl -s -H "Authorization: Bearer $ROUTER_API_KEY" "$ROUTER/healthz"
 ```
 
 You should see one entry per provider, with `"key_present": true` and `"cooling_down_s": 0`.
@@ -200,36 +210,49 @@ You should see one entry per provider, with `"key_present": true` and `"cooling_
 
 ## 3. Alert reference
 
+Severity decides the channels:
+
+- **CRIT**: Telegram **and** email when opened, every 6 hours while it stays open, and on RECOVERED.
+- **WARN**: Telegram only. Email is used only if Telegram fails.
+
 | Kind | Severity | What it means | First action |
 |---|---|---|---|
 | `router_exhausted` | CRIT | The router has no tier left that can answer. Every provider is cooling down, over its daily budget, or failing. Requests get `503` with `router_exhausted`. | Run the status check in 2.7. Look at `cooldown_kind`, `requests_today` against `daily_request_budget`, and `last_error` for each provider. If the cause is a daily quota, nothing needs fixing until the quota resets at Pacific midnight. Do not change keys in a panic. |
-| `router_unreachable` | WARN or CRIT, see the message | The sentinel could not reach the router's `/healthz`. The service is down, restarting, or the key is wrong. | Run `systemctl status hermes-llm-router --no-pager`. If it is stopped, run `sudo systemctl restart hermes-llm-router`. If it keeps stopping, send the last 50 journal lines to the developer: `journalctl -u hermes-llm-router -n 50 --no-pager`. |
-| `provider_degraded` | WARN or CRIT, see the message | One provider is failing: authentication errors (`401`/`403`), server errors, or timeouts. | Look at the journal for that provider's name: `journalctl -u hermes-llm-router -n 200 --no-pager \| grep <PROVIDER_NAME>`. A `401` or `403` means the key is wrong or expired, so ask the developer to rotate it. Server errors and timeouts usually clear by themselves. |
+| `router_unreachable` | CRIT | The sentinel could not reach the router's `/healthz` on two passes in a row. The service is down, restarting, or the key is wrong. A single failed pass does not alert. | Run `systemctl status hermes-llm-router --no-pager`. If it is stopped, run `sudo systemctl restart hermes-llm-router`. If it keeps stopping, send the last 50 journal lines to the developer: `journalctl -u hermes-llm-router -n 50 --no-pager`. |
+| `provider_degraded` | CRIT | One provider is failing: authentication errors (`401`/`403`), server errors, or timeouts. | Look at the journal for that provider's name: `journalctl -u hermes-llm-router -n 200 --no-pager \| grep <PROVIDER_NAME>`. A `401` or `403` means the key is wrong or expired, so ask the developer to rotate it. Server errors and timeouts usually clear by themselves. |
+| `flow_stalled` | CRIT | An agent owes a step and has missed its deadline (300 s by default). The client may be waiting. The incident key is `flow:<GTM-ID>:<seq>`. | Open the flow file `HERMES_SENTINEL_DIR/flow/<GTM-ID>.json` named in the message. Check that Wesam's agent and hermes-mcp are running: `systemctl status hermes-mcp --no-pager`. If the message says `client not notified: no contact on file`, see 2.4. |
 | `budget_80` | WARN | A provider has used 80% of its daily request budget. It is a warning only. There is no RECOVERED message for this kind. | Nothing is urgent. The budget stops traffic before the provider's own `429`. Plan heavy work for after the Pacific-midnight reset. |
-| `flow_stalled` | CRIT | An agent owes a step and has missed its deadline (300 s by default). The client may be waiting. | Open the flow file named in the message (under `HERMES_SENTINEL_DIR/flow/`). Check that Wesam's agent and hermes-mcp are running: `systemctl status hermes-mcp --no-pager`. |
-| `sentinel_error` | WARN or CRIT, see the message | The sentinel itself failed a pass, for example it could not read the journal or a state file. | Run `journalctl -u hermes-sentinel -n 100 --no-pager`. See section 6 for the common causes. |
-| RECOVERED | none | An open incident has cleared. Its kind is named in the message. | No action. It is not a new problem. |
+| `sentinel_error` | WARN | The sentinel itself failed a pass, for example it could not read the journal or a state file. | Run `journalctl -u hermes-sentinel -n 100 --no-pager`. See section 6 for the common causes. |
+| RECOVERED | follows the kind | An open incident has cleared. Its kind is named in the message. CRIT RECOVERED goes to Telegram and email. | No action. It is not a new problem. |
 
 Open CRIT incidents repeat every 6 hours until they clear. A repeat means the problem is still open, not that it happened again.
+
+If Telegram fails, the sentinel retries once after 5 seconds. If that fails too, it sends the alert by
+email. If both fail, the failure is written to the journal and the pass still succeeds. A failed
+channel does not produce a `sentinel_error`, so check the journal if you expected a message and
+got nothing.
 
 ---
 
 ## 4. Silencing and un-silencing
 
-Silencing stops the messages for an incident. The sentinel keeps detecting and logging it. Use
-silencing only for planned work or a known issue, and always with an end time.
+Silencing stops the messages for an incident. Detection keeps running, so the incident is still
+tracked. Use silencing only for planned work or a known issue, and always with an end time.
 
-The silence file is `/home/deploy/.hermes/sentinel/silence.json`. The keys are incident keys, or
-prefixes of them. A prefix silences every incident that starts with it. The value is the end time
-in UTC, in ISO 8601 format, ending with `Z`.
+The silence file is `/home/deploy/.hermes/sentinel/silence.json`. Each key is an incident key, or a
+prefix of one. An incident matches a key when its incident key is equal to the key, or starts with the
+key. So `provider_degraded` silences every provider incident, and `flow:GTM-7K2Q9XM` silences every
+stall for that GTM container, whatever its seq. The value is the end time in UTC, in ISO 8601 format,
+ending with `Z`.
 
-Example: silence all `budget_80` warnings until 18:00 UTC on 12 October 2026, and one provider's
-degradation until 06:00 UTC the same day.
+Example: silence all `budget_80` warnings until 18:00 UTC on 12 October 2026, all provider
+degradation until 06:00 UTC the same day, and one container's flow stall until 09:00 UTC the same day.
 
 ```json
 {
   "budget_80": "2026-10-12T18:00:00Z",
-  "provider_degraded": "2026-10-12T06:00:00Z"
+  "provider_degraded": "2026-10-12T06:00:00Z",
+  "flow:GTM-7K2Q9XM": "2026-10-12T09:00:00Z"
 }
 ```
 
@@ -245,9 +268,6 @@ that the file is still valid JSON:
 ```bash
 python3 -m json.tool /home/deploy/.hermes/sentinel/silence.json >/dev/null && echo "valid JSON"
 ```
-
-A silence only suppresses messages. Detection keeps running, so the incident is still tracked. If an
-incident is still open when the silence ends, expect it to be announced again. Check the journal to confirm.
 
 ---
 
@@ -266,7 +286,7 @@ Before any drill, load the router key into your shell, and keep the terminal ope
 
 ```bash
 set -a; . /home/deploy/.hermes/.env; set +a
-ROUTER=http://localhost:47311
+ROUTER="${ROUTER_URL:-http://127.0.0.1:47311}"
 ```
 
 Ping the router (this sends one request; a successful one reaches a real provider):
@@ -277,8 +297,8 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST "$ROUTER/v1/chat/completions" \
   -d '{"model":"hermes-auto","messages":[{"role":"user","content":"drill ping"}]}'
 ```
 
-The router's health check is the same as in 2.7. The provider names are whatever `/healthz` lists,
-for example `nvidia`, `openrouter`, `gemini`. Use the names your build shows, not the ones in this runbook.
+The provider names are whatever `/healthz` lists, for example `nvidia`, `openrouter`, `gemini`. Use the
+names your build shows, not the ones in this runbook.
 
 ### Drill (a): every tier exhausted (expect 1 CRIT, then 1 RECOVERED)
 
@@ -307,8 +327,8 @@ for example `nvidia`, `openrouter`, `gemini`. Use the names your build shows, no
 3. Send three pings with the command above. Each should print `503`.
 4. Wait 2 minutes.
 
-**Expected:** exactly **one** CRIT `router_exhausted` message in the admin Telegram chat. The
-three pings and later passes add no new message.
+**Expected:** exactly **one** CRIT `router_exhausted` message in Telegram and **one** email to
+`ADMIN_ALERT_EMAIL`. The three pings and later passes add no new message.
 
 **Cleanup:**
 
@@ -333,9 +353,10 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST "$ROUTER/v1/chat/completions" \
 Note: `state.json` also holds the daily counters. Delete it only at the end of a drill. Never delete it
 on a production router outside a drill.
 
-Wait 2 minutes. **Expected:** exactly **one** RECOVERED message for `router_exhausted`.
+Wait 2 minutes. **Expected:** exactly **one** RECOVERED message for `router_exhausted` in Telegram
+and one email.
 
-### Drill (b): router stopped (expect 1 router_unreachable after about 2 passes)
+### Drill (b): router stopped (expect 1 router_unreachable after two failed passes)
 
 **Precondition:** drill (a) cleanup is finished and the router is healthy.
 
@@ -345,10 +366,10 @@ Wait 2 minutes. **Expected:** exactly **one** RECOVERED message for `router_exha
    sudo systemctl stop hermes-llm-router
    ```
 
-2. Wait about 3 minutes. Hermes now falls back to its direct Gemini path, so keep the drill short.
+2. Wait about 3 minutes. Hermes falls back to its own direct Gemini path, so keep the drill short.
 
-**Expected:** no message after the first pass. About 2 minutes after the stop, one
-`router_unreachable` alert arrives.
+**Expected:** no message after the first failed pass. After the second failed pass, about 2 minutes
+after the stop, one CRIT `router_unreachable` arrives in Telegram and by email.
 
 **Cleanup:**
 
@@ -357,47 +378,63 @@ sudo systemctl start hermes-llm-router
 curl -s -H "Authorization: Bearer $ROUTER_API_KEY" "$ROUTER/healthz" >/dev/null && echo "router up"
 ```
 
-Wait 2 minutes. **Expected:** one RECOVERED message for `router_unreachable`.
+Wait 2 minutes. **Expected:** one RECOVERED message for `router_unreachable` in Telegram and by email.
 
 ### Drill (c): flow stall (expect 1 CRIT flow_stalled, then RECOVERED)
 
-**Precondition:** none beyond the normal setup.
+**Precondition:** none beyond the normal setup. The drill uses the made-up GTM ID `GTM-DRL0001`, so no
+real client is involved.
 
-1. Create a sample flow file. The name starts with `drill-` so nobody mistakes it for a real flow:
+1. Create the flow file. It is named after the GTM ID and has the documented fields. `owed_by` is
+   `agent` and `deadline` is in the past, so the step is overdue as soon as the file exists:
 
    ```bash
-   cat > /home/deploy/.hermes/sentinel/flow/drill-flow-001.json <<'EOF'
+   cat > /home/deploy/.hermes/sentinel/flow/GTM-DRL0001.json <<'EOF'
    {
-     "flow_id": "drill-flow-001",
-     "seq": 1,
+     "container": "GTM-DRL0001",
+     "step": "drill-step-1",
+     "outcome": "pending",
      "owed_by": "agent",
-     "deadline_utc": "2026-10-10T12:00:00Z"
+     "deadline": "2026-10-10T12:00:00Z",
+     "updated_at": "2026-10-10T11:50:00Z",
+     "seq": 1
    }
    EOF
-   chmod 600 /home/deploy/.hermes/sentinel/flow/drill-flow-001.json
+   chmod 600 /home/deploy/.hermes/sentinel/flow/GTM-DRL0001.json
    ```
 
-   The deadline is in the past, so it is overdue as soon as the file exists. Field names are the
-   documented ones; if the journal says a field is missing, ask the developer.
+   `deadline` is written only when `owed_by` is `agent`. The date is an example in the past. Use any
+   past UTC time.
 
 2. Wait 2 minutes.
 
-**Expected:** exactly **one** CRIT `flow_stalled` message that names `drill-flow-001`.
+**Expected:** exactly **one** CRIT `flow_stalled` message in Telegram and by email. Its incident key is
+`flow:GTM-DRL0001:1`.
 
-3. Show the agent is moving again. Increase `seq` (it must go up, not down):
+3. Show the agent has moved on. Write the file again with `seq` set to 2, `owed_by` set to `none`,
+   and no `deadline` (a deadline is only written for `agent`):
 
    ```bash
-   sed -i 's/"seq": 1/"seq": 2/' /home/deploy/.hermes/sentinel/flow/drill-flow-001.json
+   cat > /home/deploy/.hermes/sentinel/flow/GTM-DRL0001.json <<'EOF'
+   {
+     "container": "GTM-DRL0001",
+     "step": "drill-step-2",
+     "outcome": "done",
+     "owed_by": "none",
+     "updated_at": "2026-10-10T12:30:00Z",
+     "seq": 2
+   }
+   EOF
    ```
 
 4. Wait 2 minutes.
 
-**Expected:** one RECOVERED message for `flow_stalled`.
+**Expected:** one RECOVERED message for `flow_stalled` in Telegram and by email, and no new CRIT.
 
 **Cleanup:**
 
 ```bash
-rm -f /home/deploy/.hermes/sentinel/flow/drill-flow-001.json
+rm -f /home/deploy/.hermes/sentinel/flow/GTM-DRL0001.json
 ```
 
 ### Drill (d): Telegram blocked, email instead
@@ -421,11 +458,11 @@ This drill needs a trigger, so it stops the router, and it needs SMTP to be conf
    sudo systemctl stop hermes-llm-router
    ```
 
-3. Wait 3 minutes.
+3. Wait about 3 minutes, long enough for the second failed pass.
 
-**Expected:** no Telegram message. The journal shows a Telegram send error:
-`journalctl -u hermes-sentinel -n 50 --no-pager`. A `router_unreachable` alert arrives by **email** at
-`ADMIN_ALERT_EMAIL`. If no email arrives, see section 6.
+**Expected:** no Telegram message. The journal shows the Telegram failure, one retry, and the email
+fallback: `journalctl -u hermes-sentinel -n 50 --no-pager`. The `router_unreachable` CRIT arrives by
+**email** at `ADMIN_ALERT_EMAIL`. The pass itself succeeds. If no email arrives, see section 6.
 
 **Cleanup:**
 
@@ -442,7 +479,7 @@ This drill needs a trigger, so it stops the router, and it needs SMTP to be conf
    sudo systemctl start hermes-llm-router
    ```
 
-3. Wait 2 minutes. **Expected:** a RECOVERED message arrives in Telegram again.
+3. Wait 2 minutes. **Expected:** the RECOVERED message arrives by email and in Telegram again.
 
 ---
 
@@ -510,6 +547,13 @@ or `Failed to open journal`.
 3. Start one pass through systemd and read its log:
    `sudo systemctl start hermes-sentinel.service && journalctl -u hermes-sentinel -n 20 --no-pager`.
 
+### Telegram alerts not arriving
+
+1. Check the journal for the retry and the email fallback lines:
+   `journalctl -u hermes-sentinel -n 100 --no-pager`. A failed channel is logged, and does not show as `sentinel_error`.
+2. Check `ADMIN_TELEGRAM_CHAT_ID` against section 2.2. Check `TELEGRAM_BOT_TOKEN` is set (`cut -d= -f1`).
+3. A CRIT should still reach you by email if Telegram fails. If neither arrives, check SMTP below.
+
 ### SMTP not configured
 
 Telegram still works, but no email arrives. Check:
@@ -537,19 +581,20 @@ If you ever see something that breaks it, tell the developer at once.
 
 - the incident kind, its severity and the time it started
 - the provider name (for example `nvidia`) and counts such as `requests_today` against the budget
-- for a stalled flow, the flow id (for example `drill-flow-001`)
+- for a stalled flow, the GTM container ID and the seq (for example `flow:GTM-DRL0001:1`)
 - the end time of a silence, when one applies
+- the line `client not notified: no contact on file`, when a container has no entry in `contacts.json`
 
 **An alert never contains:**
 
 - API keys, bot tokens, SMTP passwords, the heartbeat URL, or any value from `.env`
 - the text of a prompt, a reply, or any client message
-- client names or client email addresses in a Telegram alert
+- a client's email address or store name in a Telegram message
 - IP addresses, SSH ports or server hostnames
 - the full journal lines of the router, unless you read them yourself on the VPS
 
-**Client emails** are sent only to addresses listed in `contacts.json`. Nothing else sends mail to clients.
-Keep the state directory at `0700` and the files in it at `0600`.
+**Client emails** are sent only to the `email` in an entry of `contacts.json`, for the matching GTM
+container. Nothing else sends mail to clients. Keep the state directory at `0700` and the files in it at `0600`.
 
 **Do not share screenshots or pasted output** of `getUpdates`, the contents of `.env`, or journal output
 without first checking it for tokens, passwords, chat ids and addresses.
