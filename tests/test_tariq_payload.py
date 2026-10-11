@@ -125,8 +125,9 @@ def test_deploy_only_in_prohibited_lists_and_skill_execute_nowhere(outer, prompt
 
 def test_allowed_tools_are_registered_in_hermes():
     registered = set(re.findall(r'name="(hermes_[a-z_]+)"', CONSULTATION.read_text(encoding="utf-8")))
-    missing = ALLOWED_TOOLS - registered
+    missing = (ALLOWED_TOOLS | MOTAHAI_TOOLS) - registered
     assert not missing, f"payload references tools not registered in ops/hermes/consultation.py: {sorted(missing)}"
+
 
 
 def test_event_id_templates_have_no_timestamp(prompt):
@@ -363,3 +364,55 @@ def test_build_refuses_cod_flag_on_default_payload(builder):
     proc = _run_cli("--with-cod-workflows", "--out", str(builder.PAYLOAD_PATH))
     assert proc.returncode != 0
     assert PAYLOAD_FILE.read_bytes() == before
+
+
+# --- S3-9 / G2: Tariq prompt hardening (conversation_rules + intent_map) ---
+
+REQUIRED_CONVERSATION_RULES = {
+    "no_tool_result_no_claim",
+    "one_store_per_conversation",
+    "resume_dont_restart",
+    "waiting_message",
+    "language_and_pace",
+    "claims_list",
+}
+
+
+def test_g2_conversation_rules_present_in_both_modes(prompt, cod_prompt):
+    for p, is_cod in ((prompt, False), (cod_prompt, True)):
+        rules = p["strict_guardrails"]["conversation_rules"]
+        assert set(rules) == REQUIRED_CONVERSATION_RULES
+        assert "Never simulate tool output" in rules["no_tool_result_no_claim"]
+        assert "fixed at W1" in rules["one_store_per_conversation"]
+        assert "hermes_gtm_verify_access" in rules["resume_dont_restart"]
+        if is_cod:
+            assert "hermes_motahai_tenant_status" in rules["resume_dont_restart"]
+            assert "W6_COD_SIGNAL_ACTIVATION" in rules["resume_dont_restart"]
+        else:
+            assert "hermes_motahai_" not in rules["resume_dont_restart"]
+            assert "W6_" not in rules["resume_dont_restart"]
+        assert "30 s" in rules["waiting_message"] and "no fake progress" in rules["waiting_message"]
+        assert "one question per message" in rules["language_and_pace"]
+        assert "Google Ads delivered-revenue sync is NOT available" in rules["claims_list"]
+        assert "saved budget" in rules["claims_list"]
+
+
+def test_g2_intent_map_cues_and_mode_valid_workflows(prompt, cod_prompt):
+    for p, is_cod in ((prompt, False), (cod_prompt, True)):
+        imap = p["strict_guardrails"]["intent_map"]
+        assert isinstance(imap, list) and len(imap) == 3
+        workflows = set(p["workflows"])
+        for entry in imap:
+            route = entry["route"]
+            if route.startswith("W"):
+                assert route in workflows, f"intent_map routes to unknown workflow {route} in mode cod={is_cod}"
+            else:
+                assert route == "escalate via hermes_consult"
+
+        by_cue = {cue: entry["route"] for entry in imap for cue in entry["cues"]}
+        assert by_cue["tracking setup"] == "W1_INTAKE" and by_cue["GTM"] == "W1_INTAKE"
+        for cue in ("الطلبات المرتجعة", "مبيعات وهمية", "الدفع عند الاستلام", "COD"):
+            assert by_cue[cue] == ("W6_COD_SIGNAL_ACTIVATION" if is_cod else "escalate via hermes_consult")
+        for cue in ("هل التتبع شغال", "health"):
+            assert by_cue[cue] == ("W7_SIGNAL_HEALTH_CHECK" if is_cod else "W5_VERIFY")
+

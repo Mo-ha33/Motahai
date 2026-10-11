@@ -136,3 +136,68 @@ def test_gtm_provisioning_tools_are_scoped(guard, monkeypatch):
     assert "hermes_gtm_verify_access" in lim and "hermes_gtm_workspace_apply" in lim
     assert "approval_required" not in lim["hermes_gtm_verify_access"] and "approval_required" not in lim["hermes_gtm_workspace_apply"]
     assert "approval_required" in lim["hermes_gtm_cloud_publish"]
+
+
+def test_motahai_tenant_tools_are_scoped(guard, monkeypatch):
+    arch = guard.authenticate("Bearer arch-token", True, 10)
+    aud = guard.authenticate("Bearer aud-token", True, 10)
+    human = guard.authenticate("Bearer human-token", False, 10)
+    # read-only tenant_status and signal_health: operator agents yes, advisors no
+    for tool in ("hermes_motahai_tenant_status", "hermes_motahai_signal_health"):
+        guard.authorize(aud, tool, {"tenant_key": "shop.myshopify.com"})
+        deny(lambda t=tool: guard.authorize(arch, t, {"tenant_key": "shop.myshopify.com"}), 403)
+    # promote_live is intentionally in no role (D-003 gated)
+    for principal in (arch, aud, human):
+        deny(
+            lambda p=principal: guard.authorize(
+                p,
+                "hermes_motahai_promote_live",
+                {"tenant_key": "shop.myshopify.com", "hitl_approval_token": "secret-tok-123"},
+            ),
+            403,
+        )
+    # audit log never contains the raw approval token
+    audit_text = (guard.tmp / "audit.jsonl").read_text(encoding="utf-8")
+    assert "secret-tok-123" not in audit_text
+
+    # tariq-provisioner inherits operator_agent so it gets the read-only tools, but not promote_live
+    monkeypatch.setenv("MCP_TOK_TARIQ", hashlib.sha256(b"tariq-token").hexdigest())
+    pol = yaml.safe_load((HERE.parent / "tool-policy.yaml").read_text(encoding="utf-8"))
+    g2 = PolicyGuard(pol)
+    tariq = g2.authenticate("Bearer tariq-token", True, 10)
+    g2.authorize(tariq, "hermes_motahai_tenant_status", {"tenant_key": "shop.myshopify.com"})
+    g2.authorize(tariq, "hermes_motahai_signal_health", {"tenant_key": "shop.myshopify.com", "window_days": 7})
+    deny(lambda: g2.authorize(tariq, "hermes_motahai_promote_live", {}), 403)
+
+    lim = pol["tools"]
+    for tool in ("hermes_motahai_tenant_status", "hermes_motahai_signal_health"):
+        assert lim[tool] == {"rate": 20, "concurrency": 2, "global_concurrency": 4, "timeout_s": 60}
+        assert "approval_required" not in lim[tool]
+    assert lim["hermes_motahai_promote_live"] == {
+        "rate": 2,
+        "concurrency": 1,
+        "global_concurrency": 1,
+        "timeout_s": 120,
+        "approval_required": {
+            "gate": "D-003",
+            "mechanism": "signed_single_use_token",
+            "arg": "hitl_approval_token",
+            "issuer": "POST /approvals/promote-live",
+        },
+    }
+
+
+def test_storefront_probe_policy(guard):
+    arch = guard.authenticate("Bearer arch-token", True, 10)
+    aud = guard.authenticate("Bearer aud-token", True, 10)
+    guard.authorize(aud, "hermes_storefront_probe", {"store_url": "https://epxsmk-y0.myshopify.com/ar"})
+    deny(lambda: guard.authorize(arch, "hermes_storefront_probe", {"store_url": "https://epxsmk-y0.myshopify.com/ar"}), 403)
+    pol = yaml.safe_load((HERE.parent / "tool-policy.yaml").read_text(encoding="utf-8"))
+    assert pol["tools"]["hermes_storefront_probe"] == {
+        "rate": 6,
+        "concurrency": 1,
+        "global_concurrency": 2,
+        "timeout_s": 90,
+    }
+
+

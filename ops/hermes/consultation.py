@@ -151,6 +151,46 @@ def _gtm_api():
         return module
 
 
+def _motahai_api():
+    """Loads the sibling motahai_api module (package import on the VPS, file-path fallback when this file is
+    loaded standalone, e.g. under the test stub package)."""
+    try:
+        from . import motahai_api
+        return motahai_api
+    except ImportError:
+        import importlib.util
+        import sys
+        cached = sys.modules.get("hermes_motahai_api")
+        if cached is not None:
+            return cached
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motahai_api.py")
+        spec = importlib.util.spec_from_file_location("hermes_motahai_api", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_motahai_api"] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+def _storefront_probe():
+    """Loads the sibling storefront_probe module (package import on the VPS, file-path fallback when this file is
+    loaded standalone, e.g. under the test stub package)."""
+    try:
+        from . import storefront_probe
+        return storefront_probe
+    except ImportError:
+        import importlib.util
+        import sys
+        cached = sys.modules.get("hermes_storefront_probe_mod")
+        if cached is not None:
+            return cached
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storefront_probe.py")
+        spec = importlib.util.spec_from_file_location("hermes_storefront_probe_mod", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_storefront_probe_mod"] = module
+        spec.loader.exec_module(module)
+        return module
+
+
 def _gtm_json(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
@@ -493,3 +533,131 @@ def register_consultation_tools(server):
         if failure:
             return failure
         return _gtm_json(api.create_and_publish_version(service, account_id, container_id, workspace_id, version_name))
+
+    @server.tool(
+        name="hermes_motahai_tenant_status",
+        description=(
+            "READ-ONLY. Returns PII-free onboarding and COD signal status for a tenant from Motahai Core "
+            "(GET /v1/tenants/{tenant_key}/status): mode (shadow/live), active, has_meta_credentials, "
+            "webhooks_verified, checklist_ready, onboarded, missing_required_steps, test_event_code_set, "
+            "last_webhook_at, webhook_failures_7d, last_capi_event_at. No approval token needed."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tenant_key": {
+                    "type": "string",
+                    "description": "Tenant key: lowercase store domain (e.g. store.myshopify.com) or numeric Salla merchant ID"
+                }
+            },
+            "required": ["tenant_key"]
+        }
+    )
+    def hermes_motahai_tenant_status(tenant_key: str) -> str:
+        api = _motahai_api()
+        return _gtm_json(api.tenant_status(tenant_key))
+
+    @server.tool(
+        name="hermes_motahai_signal_health",
+        description=(
+            "READ-ONLY. Returns PII-free COD signal health and delivery cohort counters for a tenant from Motahai Core "
+            "(GET /v1/tenants/{tenant_key}/signal-health?window_days=N): orders (placed, cod, confirmed), "
+            "cohort (orders, delivered, refused), capi_events (sent, shadow, failed, stale, late_delivery), "
+            "would_have_sent, and open_incidents. No approval token needed."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tenant_key": {
+                    "type": "string",
+                    "description": "Tenant key: lowercase store domain (e.g. store.myshopify.com) or numeric Salla merchant ID"
+                },
+                "window_days": {
+                    "type": "integer",
+                    "description": "Rolling window in days (1..28, default 7)",
+                    "default": 7
+                }
+            },
+            "required": ["tenant_key"]
+        }
+    )
+    def hermes_motahai_signal_health(tenant_key: str, window_days: int = 7) -> str:
+        api = _motahai_api()
+        return _gtm_json(api.signal_health(tenant_key, window_days=window_days))
+
+    @server.tool(
+        name="hermes_motahai_promote_live",
+        description=(
+            "Promotes a tenant from shadow mode to live DeliveredPurchase CAPI dispatch via Motahai Core "
+            "(POST /v1/tenants/{tenant_key}/promote-live). Requires a human-issued, single-use D-003 approval token "
+            "bound to this tenant_key (minted via POST /approvals/promote-live). Core enforces all 6 readiness "
+            "preconditions before consuming the token."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tenant_key": {
+                    "type": "string",
+                    "description": "Tenant key: lowercase store domain (e.g. store.myshopify.com) or numeric Salla merchant ID"
+                },
+                "hitl_approval_token": {
+                    "type": "string",
+                    "description": "Signed single-use D-003 promote_live approval token issued by a human operator for this tenant_key"
+                }
+            },
+            "required": ["tenant_key", "hitl_approval_token"]
+        }
+    )
+    def hermes_motahai_promote_live(tenant_key: str, hitl_approval_token: Optional[str] = None) -> str:
+        api = _motahai_api()
+        return _gtm_json(api.promote_live(tenant_key, hitl_approval_token or ""))
+
+    @server.tool(
+        name="hermes_storefront_probe",
+        description=(
+            "READ-ONLY. Deterministic headless storefront probe for Gate 2 and Drift Sentinel. Loads the merchant's "
+            "public https storefront home page and one product page, captures network request URLs only (with all "
+            "non-allowlisted query strings stripped for Zero-PII), and reports gtm_ids_seen, ga4_ids_seen, "
+            "meta_pixel_ids_seen, other_pixels, expected (gtm_loaded, ga4_seen, pixel_seen), duplicates, and "
+            "consent_signals_seen. Returns status='UNKNOWN' with reason code on load/TLS/timeout/bot/SSRF failure."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "store_url": {
+                    "type": "string",
+                    "description": "Public https storefront URL, e.g. https://epxsmk-y0.myshopify.com/ar"
+                },
+                "gtm_public_id": {
+                    "type": "string",
+                    "description": "Optional expected GTM public ID (e.g. GTM-T443M78T)"
+                },
+                "ga4_measurement_id": {
+                    "type": "string",
+                    "description": "Optional expected GA4 measurement ID (e.g. G-ABC123XYZ9)"
+                },
+                "meta_pixel_id": {
+                    "type": "string",
+                    "description": "Optional expected Meta Pixel / Dataset ID (digits)"
+                }
+            },
+            "required": ["store_url"]
+        }
+    )
+    def hermes_storefront_probe(
+        store_url: str,
+        gtm_public_id: Optional[str] = None,
+        ga4_measurement_id: Optional[str] = None,
+        meta_pixel_id: Optional[str] = None,
+    ) -> str:
+        probe = _storefront_probe()
+        return _gtm_json(
+            probe.probe_storefront(
+                store_url=store_url,
+                gtm_public_id=gtm_public_id,
+                ga4_measurement_id=ga4_measurement_id,
+                meta_pixel_id=meta_pixel_id,
+            )
+        )
+
+

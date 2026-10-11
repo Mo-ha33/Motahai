@@ -45,6 +45,9 @@ roles:
       - hermes_browser_evaluate
       - hermes_browser_close
       - hermes_gtm_verify_access        # read-only: resolves GTM-XXXXXXX -> numeric ids, checks the invite
+      - hermes_motahai_tenant_status    # read-only: PII-free tenant onboarding & mode status from Core
+      - hermes_motahai_signal_health    # read-only: PII-free COD signal & cohort counters from Core
+      - hermes_storefront_probe         # read-only: deterministic headless storefront beacon & GTM probe
     daily_token_budget: 1500000
 
   # Headless GTM provisioning (Tariq). hermes_gtm_workspace_apply writes to a DRAFT workspace only and is
@@ -123,6 +126,16 @@ tools:
   hermes_gtm_deploy:       {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 60,
                             approval_required: {gate: D-003, mechanism: signed_single_use_token,
                                                 arg: hitl_approval_token, issuer: "POST /approvals/gtm-publish"}}
+  # S3-2 — Motahai Core tenant API tools. tenant_status & signal_health are read-only; promote_live flips
+  # shadow -> live and requires a D-003 single-use token minted via POST /approvals/promote-live (intentionally
+  # not in any role above until the human-approval flow is wired for that role).
+  hermes_motahai_tenant_status: {rate: 20, concurrency: 2, global_concurrency: 4, timeout_s: 60}
+  hermes_motahai_signal_health: {rate: 20, concurrency: 2, global_concurrency: 4, timeout_s: 60}
+  hermes_motahai_promote_live:  {rate: 2, concurrency: 1, global_concurrency: 1, timeout_s: 120,
+                                 approval_required: {gate: D-003, mechanism: signed_single_use_token,
+                                                     arg: hitl_approval_token, issuer: "POST /approvals/promote-live"}}
+  # S3-10 — Deterministic headless storefront probe (Gate 2 & Drift Sentinel). Read-only.
+  hermes_storefront_probe:      {rate: 6, concurrency: 1, global_concurrency: 2, timeout_s: 90}
   "*":                     {rate: 30, concurrency: 2, global_concurrency: 8, timeout_s: 60}
 
 # ── Egress rules for URL-taking tools (SSRF protection) ──────────────────────
