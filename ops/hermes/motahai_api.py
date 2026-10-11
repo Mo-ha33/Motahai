@@ -117,6 +117,18 @@ def _redact_secrets(text: str, secrets: Tuple[str, ...]) -> str:
     return sanitized
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect. urllib would copy the Authorization header to whatever host the Location names, so a
+    compromised or misbehaving Core could walk the bearer key to another service on this shared host. A 3xx surfaces
+    as an HTTPError and maps to CORE_ERROR."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401 - urllib hook
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _default_http_call(
     method: str,
     url: str,
@@ -124,10 +136,10 @@ def _default_http_call(
     body_bytes: Optional[bytes],
     timeout_s: float,
 ) -> Tuple[int, str]:
-    """Executes an HTTP request using stdlib urllib and returns (status_code, response_text)."""
+    """Executes an HTTP request using stdlib urllib (redirects are never followed) and returns (status_code, response_text)."""
     req = urllib.request.Request(url, data=body_bytes, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 - internal Core URL
+        with _OPENER.open(req, timeout=timeout_s) as resp:  # noqa: S310 - internal Core URL
             raw = resp.read()
             text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
             return int(resp.status), text
@@ -140,22 +152,46 @@ def _default_http_call(
 HttpCaller = Callable[[str, str, Dict[str, str], Optional[bytes], float], Tuple[int, str]]
 
 
-def _is_loopback_host(host: str) -> bool:
-    """True for localhost, *.localhost, 127.0.0.0/8, ::1, and the unspecified addresses 0.0.0.0 / ::.
+# Strict shape of the authority: no userinfo, no whitespace, no backslash, no non-ASCII. Anything else is refused, so
+# urlsplit() (used here) and urllib/http.client (used to connect) cannot disagree about which host is meant.
+_NETLOC_RE = re.compile(r"^(?:\[[0-9A-Fa-f:.%A-Za-z0-9_-]+\]|[A-Za-z0-9.-]+)(?::[0-9]{1,5})?$")
+# A last label that is all digits or 0x-hex is read by the resolver as a numeric IPv4 form (2130706433, 0x7f000001,
+# 0177.0.0.1, 127.1 all mean 127.0.0.1), which ipaddress does not parse.
+_NUMERIC_LABEL_RE = re.compile(r"^(?:0[xX][0-9A-Fa-f]*|[0-9]+)$")
 
-    The unspecified addresses are included because on Linux they reach the local host.
-    Brackets are already stripped by urlsplit().hostname.
+
+def _host_problem(host: str) -> Optional[str]:
+    """Returns 'loopback' for a loopback / unspecified host, 'ambiguous' for a numeric form we cannot canonicalise
+    (fail closed), else None.
+
+    Loopback covers localhost, *.localhost, 127.0.0.0/8, ::1 and the unspecified 0.0.0.0 / ::, because on Linux they
+    reach the local host. Brackets are already stripped by urlsplit().hostname; a trailing dot and an IPv6 zone id
+    are ignored.
     """
     name = host.rstrip(".").lower()
     if name == "localhost" or name.endswith(".localhost"):
-        return True
+        return "loopback"
+    name = name.split("%", 1)[0]  # IPv6 zone id (fe80::1%eth0 / ::1%lo)
+    if ":" in name:
+        try:
+            ip = ipaddress.ip_address(name)
+        except ValueError:
+            return "ambiguous"
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        return "loopback" if (ip.is_loopback or ip.is_unspecified) else None
+    last_label = name.rsplit(".", 1)[-1]
+    if not _NUMERIC_LABEL_RE.match(last_label):
+        return None  # a DNS name
     try:
-        ip = ipaddress.ip_address(name)
+        ip = ipaddress.IPv4Address(name)
     except ValueError:
-        return False
-    if ip.version == 6 and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return ip.is_loopback or ip.is_unspecified
+        return "ambiguous"
+    return "loopback" if (ip.is_loopback or ip.is_unspecified) else None
+
+
+def _is_loopback_host(host: str) -> bool:
+    return _host_problem(host) == "loopback"
 
 
 def _validate_core_url(raw: str) -> Optional[str]:
@@ -171,7 +207,12 @@ def _validate_core_url(raw: str) -> Optional[str]:
         return "MOTAHAI_CORE_URL is not a valid URL."
     if parts.scheme.lower() not in ("http", "https") or not host:
         return "MOTAHAI_CORE_URL must be an absolute http or https URL with a host."
-    if port == _RESERVED_LOOPBACK_PORT and _is_loopback_host(host):
+    if not _NETLOC_RE.fullmatch(parts.netloc):
+        return "MOTAHAI_CORE_URL host is not acceptable (no credentials, spaces or unusual characters in the host part)."
+    problem = _host_problem(host)
+    if problem == "ambiguous":
+        return "MOTAHAI_CORE_URL host is a numeric form that cannot be checked safely. Use a plain dotted IPv4 address or a hostname."
+    if port == _RESERVED_LOOPBACK_PORT and problem == "loopback":
         return (
             "MOTAHAI_CORE_URL points at a loopback or unspecified address on port 8000, which is reserved "
             "for another product on this host (SmartCafe). Set it to the Motahai Core address."

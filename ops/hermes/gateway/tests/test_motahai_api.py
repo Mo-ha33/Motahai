@@ -211,6 +211,82 @@ def test_unsafe_or_malformed_core_url_is_refused_without_call(monkeypatch, bad_u
     assert http.calls == []
 
 
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://user@127.0.0.1:8000",
+        "http://user:pw@localhost:8000",
+        "http://localhost.:8000",
+        "http://127.0.0.1.:8000",
+        "http://[::1%25lo]:8000",
+        "http://2130706433:8000",       # decimal IPv4 (glibc resolves it to 127.0.0.1)
+        "http://0x7f000001:8000",
+        "http://0x7f.0.0.1:8000",
+        "http://0177.0.0.1:8000",
+        "http://127.1:8000",
+        "http://127.0.1:8000",
+        "http://0:8000",
+        "http://127.0.0.1 :8000",       # trailing space is accepted by inet_aton on Linux
+        "http://127.0.0.1\\@evil.example:8000",
+        "http://[0:0:0:0:0:0:0:1]:8000",
+        "HTTP://127.0.0.1:8000",
+        "http://127.0.0.1:08000",
+        "http://core.test@evil.example",   # credentials in the URL are never accepted
+    ],
+)
+def test_url_bypass_attempts_are_refused_without_call(monkeypatch, bad_url):
+    monkeypatch.setenv("MOTAHAI_CORE_URL", bad_url)
+    monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
+    http = FakeHttp()
+    out = motahai.tenant_status("shop.myshopify.com", http_call=http)
+    assert out["ok"] is False and out["reason_code"] == "CORE_NOT_CONFIGURED"
+    assert http.calls == []
+    assert API_KEY not in json.dumps(out) and "evil.example" not in json.dumps(out)
+
+
+def test_default_http_call_never_follows_a_redirect_or_forwards_the_key():
+    import http.server
+    import threading
+
+    seen = {}
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["auth"] = self.headers.get("Authorization")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    target = http.server.HTTPServer(("127.0.0.1", 0), Target)
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_address[1]}/steal")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    for srv in (target, redirector):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        status, _ = motahai._default_http_call(
+            "GET", f"http://127.0.0.1:{redirector.server_address[1]}/v1/x",
+            {"Authorization": f"Bearer {API_KEY}"}, None, 5.0)
+    finally:
+        redirector.shutdown()
+        target.shutdown()
+    assert status == 302          # surfaced, not followed
+    assert seen == {}             # the redirect target never received a request, so never the bearer key
+    out = motahai._map_core_response(302, "", (API_KEY,))
+    assert out["reason_code"] == "CORE_ERROR" and API_KEY not in json.dumps(out)
+
+
 def test_reserved_port_refusal_explains_the_reason(monkeypatch):
     monkeypatch.setenv("MOTAHAI_CORE_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
