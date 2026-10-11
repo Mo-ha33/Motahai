@@ -97,6 +97,8 @@ def verify_publish_token(token, container_id, workspace_id, used_nonce_store, no
         except InvalidSignature:
             return False, "bad_signature"
         claims = json.loads(_b64url_decode(payload_b64))
+        if not isinstance(claims, dict) or "act" in claims:  # action tokens (verify_action_token) never publish
+            return False, "token_malformed"
         cid, wid, exp, nonce = claims["cid"], claims["wid"], claims["exp"], claims["nonce"]
         if not (isinstance(cid, str) and isinstance(wid, str) and isinstance(nonce, str)
                 and isinstance(exp, int) and not isinstance(exp, bool) and nonce):

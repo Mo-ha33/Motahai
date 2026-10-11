@@ -167,6 +167,18 @@ def _courier_secret_ok(session: Session, tenant_id: int, courier: str, kinds: se
     return bool(value) and len(value.strip()) >= BOSTA_MIN_SECRET_LENGTH
 
 
+# Owner ruling (S3-4): Shopify and Salla report delivery natively, so a courier webhook secret is optional for them;
+# delivered evidence is enforced at promote-live ([no_delivered_evidence]). Every other platform still needs a courier.
+NATIVE_DELIVERY_DETAIL = {
+    "shopify": ("optional on Shopify: delivery comes from native platform status (fulfillments/update with "
+                "shipment_status=delivered, or a COD order that is paid and fulfilled); delivered evidence is "
+                "enforced at promote-live ([no_delivered_evidence])"),
+    "salla": ("optional on Salla: delivery comes from the native Salla delivered status; delivered evidence is "
+              "enforced at promote-live ([no_delivered_evidence])"),
+}
+NATIVE_DELIVERY_PLATFORMS = frozenset(NATIVE_DELIVERY_DETAIL)
+
+
 def compute_checklist(session: Session, tenant: Tenant) -> dict:
     """
     The onboarding step computation shared by the operator checklist endpoint and the read-only tenant API
@@ -177,15 +189,20 @@ def compute_checklist(session: Session, tenant: Tenant) -> dict:
     bosta = _courier_secret_ok(session, tenant.id, "bosta", kinds)
     oto = _courier_secret_ok(session, tenant.id, "oto", kinds)
     if tenant.platform == "shopify":
-        urls = [f"{_base()}/webhooks/shopify/{t}" for t in ("orders/create", "orders/updated", "orders/paid")]
+        urls = [f"{_base()}/webhooks/shopify/{t}"
+                for t in ("orders/create", "orders/updated", "orders/paid", "fulfillments/update")]
     else:
         urls = [f"{_base()}/webhooks/salla"]
+    courier_detail = f"bosta={'ok' if bosta else 'missing'}, oto={'ok' if oto else 'missing'}"
+    native_delivery = tenant.platform in NATIVE_DELIVERY_PLATFORMS
+    if native_delivery:
+        courier_detail += "; " + NATIVE_DELIVERY_DETAIL[tenant.platform]
     steps = [
         _step("tenant_created", "Tenant created", True),
         _step("meta_dataset", "Meta dataset id stored", bool(tenant.meta_dataset_id)),
         _step("meta_capi_token", "Meta CAPI token stored", "meta_capi_token" in kinds),
         _step("courier_secret", "At least one courier webhook secret (Bosta or OTO)", bosta or oto,
-              detail=f"bosta={'ok' if bosta else 'missing'}, oto={'ok' if oto else 'missing'}"),
+              required=not native_delivery, detail=courier_detail),
         _step("api_key", "Tenant API key issued", _active_key_exists(session, tenant.id)),
         _step("platform_webhooks", f"Register {tenant.platform} webhooks (MANUAL)", False, required=False,
               detail="; ".join(urls), manual=True),

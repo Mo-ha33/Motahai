@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from src.ameen_workforce.credentials import FERNET_KEY_ENV, generate_key, get_credential, store_credential
 from src.ameen_workforce.db import Credential, Tenant, init_db, make_engine
-from src.ameen_workforce.onboarding_routes import router
+from src.ameen_workforce.onboarding_routes import compute_checklist, router
 from src.ameen_workforce.webhook_routes import get_session_factory_dep
 
 OP = {"Authorization": "Bearer op-secret-key"}
@@ -126,14 +126,20 @@ def test_checklist_transitions_to_ready_but_never_goes_live(env):
                   "test_event_code": "missing"}
     assert body["ready_for_live"] is False
     assert body["platform_webhook_urls"][0].endswith("/webhooks/salla")
+    courier = next(s for s in body["steps"] if s["key"] == "courier_secret")
+    assert courier["required"] is False and "promote-live" in courier["detail"]  # Salla exemption
 
     client.post(f"{B}/tenants/{tid}/meta", headers=OP, json=dict(meta_dataset_id="123456789", meta_capi_token=TOKEN))
     body, st = _steps(client, tid)
     assert st["meta_dataset"] == st["meta_capi_token"] == "done"
     assert body["ready_for_live"] is False
 
-    client.post(f"{B}/tenants/{tid}/courier-secrets", headers=OP, json={"couriers": ["oto"]})
     client.post(f"{B}/tenants/{tid}/api-key", headers=OP)
+    body, st = _steps(client, tid)
+    assert st["courier_secret"] == "missing" and st["api_key"] == "done"
+    assert body["ready_for_live"] is True  # Salla needs no courier secret
+
+    client.post(f"{B}/tenants/{tid}/courier-secrets", headers=OP, json={"couriers": ["oto"]})
     body, st = _steps(client, tid)
     assert st["courier_secret"] == "done" and st["api_key"] == "done"
     assert st["platform_webhooks"] == "manual"  # never auto-done, never blocks readiness
@@ -149,3 +155,62 @@ def test_short_bosta_secret_does_not_satisfy_checklist(env):
         store_credential(s, tid, "bosta_webhook_secret", "short")
     _, st = _steps(client, tid)
     assert st["courier_secret"] == "missing"
+
+
+def _courier_required(client, tid):
+    body, st = _steps(client, tid)
+    step = next(s for s in body["steps"] if s["key"] == "courier_secret")
+    return step["required"], body
+
+
+def _complete_everything_but_courier(client, tid):
+    client.post(f"{B}/tenants/{tid}/meta", headers=OP, json=dict(meta_dataset_id="123456789", meta_capi_token=TOKEN))
+    client.post(f"{B}/tenants/{tid}/api-key", headers=OP)
+
+
+@pytest.mark.parametrize("platform", ["shopify", "salla"])
+def test_courier_secret_is_optional_for_shopify_and_salla(env, platform):
+    client, _ = env
+    tid = _create(client, domain="x.myshopify.com" if platform == "shopify" else "99887", platform=platform).json()[
+        "tenant_id"]
+    required, _ = _courier_required(client, tid)
+    assert required is False
+    _complete_everything_but_courier(client, tid)
+    body, st = _steps(client, tid)
+    assert st["courier_secret"] == "missing" and body["ready_for_live"] is True
+    detail = next(s for s in body["steps"] if s["key"] == "courier_secret")["detail"]
+    assert "no_delivered_evidence" in detail and ("fulfillments/update" in detail or "delivered" in detail)
+
+
+def test_courier_secret_required_for_a_platform_the_db_cannot_store_yet(env):
+    """woocommerce is not a valid tenants.platform yet; the exemption must be an allowlist, not 'anything but zid'."""
+    _, factory = env
+    with factory() as s:
+        ghost = Tenant(id=4242, name="Woo", platform="woocommerce", shop_domain="woo.example", country="EG",
+                       currency="EGP", mode="shadow")
+        step = next(x for x in compute_checklist(s, ghost)["steps"] if x["key"] == "courier_secret")
+        assert step["required"] is True
+
+
+def test_courier_secret_still_required_for_zid(env):
+    client, factory = env
+    tid = _create(client).json()["tenant_id"]
+    platform = "zid"
+    with factory() as s:
+        s.get(Tenant, tid).platform = platform
+        s.commit()
+    required, _ = _courier_required(client, tid)
+    assert required is True
+    _complete_everything_but_courier(client, tid)
+    body, _ = _steps(client, tid)
+    assert body["ready_for_live"] is False
+    client.post(f"{B}/tenants/{tid}/courier-secrets", headers=OP, json={"couriers": ["oto"]})
+    assert _steps(client, tid)[0]["ready_for_live"] is True
+
+
+def test_shopify_webhook_urls_include_fulfillments_update(env):
+    client, _ = env
+    tid = _create(client).json()["tenant_id"]
+    urls = _steps(client, tid)[0]["platform_webhook_urls"]
+    assert any(u.endswith("/webhooks/shopify/fulfillments/update") for u in urls)
+    assert any(u.endswith("/webhooks/shopify/orders/paid") for u in urls)

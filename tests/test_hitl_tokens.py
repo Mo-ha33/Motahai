@@ -568,3 +568,121 @@ async def test_approvals_validation_and_missing_private_key(operator_env, monkey
     res = await post_approval(headers=headers)
     assert res.status_code == 503
     assert "approval_token" not in res.text
+
+
+# =========================================================================================================
+# S3-4 action tokens (promote_live)
+# =========================================================================================================
+def forge_action(act="promote_live", sub="shop.myshopify.com", exp=None, nonce="n-act-1", key=None, **extra) -> str:
+    key = key or ISSUER_KEY["key"]
+    claims = {"act": act, "sub": sub, "exp": int(time.time()) + 600 if exp is None else exp, "nonce": nonce, **extra}
+    payload = b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    return f"{payload}.{b64(key.sign(payload.encode('ascii')))}"
+
+
+def test_action_token_roundtrip_is_single_use(env):
+    token = hitl_tokens.issue_action_token("promote_live", "Shop.MyShopify.com ")
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env) == (True, "ok")
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env) == (
+        False, "nonce_reused_or_store_unavailable")
+    claims = json.loads(base64.urlsafe_b64decode(token.split(".")[0] + "=="))
+    assert set(claims) == {"act", "sub", "exp", "nonce"} and claims["sub"] == "shop.myshopify.com"
+
+
+def test_action_token_subject_is_normalized_on_verify(env):
+    token = hitl_tokens.issue_action_token("promote_live", "shop.myshopify.com")
+    assert hitl_tokens.verify_action_token(token, "promote_live", "  SHOP.myshopify.com", env)[0] is True
+
+
+def test_action_token_rejections(env):
+    sub = "shop.myshopify.com"
+    ok = lambda t, a="promote_live", s=sub, **kw: hitl_tokens.verify_action_token(t, a, s, env, **kw)  # noqa: E731
+    assert ok(forge_action(act="other"))[1] == "action_mismatch"
+    assert ok(forge_action(sub="other.myshopify.com"))[1] == "subject_mismatch"
+    assert ok(forge_action(exp=int(time.time()) - 1))[1] == "token_expired"
+    assert ok(forge_action(key=Ed25519PrivateKey.generate()))[1] == "bad_signature"
+    assert ok(forge_action(), a="not_allowed")[1] == "action_not_allowed"
+    assert ok("")[1] == "token_missing" and ok(None)[1] == "token_missing"
+    assert ok("garbage")[1] == "token_malformed"
+    assert ok(forge_action(exp="soon"))[1] == "token_malformed"
+    assert ok(forge_action(exp=True))[1] == "token_malformed"
+    assert ok(forge_action(nonce=""))[1] == "token_malformed"
+    assert not env.exists()  # nothing above burned a nonce
+
+
+def test_action_token_requires_act_claim(env):
+    # a token without `act` (even one carrying a sub) is not an action token
+    claims = {"sub": "shop.myshopify.com", "exp": int(time.time()) + 600, "nonce": "n-noact"}
+    payload = b64(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    token = f"{payload}.{b64(ISSUER_KEY['key'].sign(payload.encode('ascii')))}"
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env)[0] is False
+
+
+def test_issue_action_token_validates_input(env):
+    with pytest.raises(ValueError):
+        hitl_tokens.issue_action_token("publish_gtm", "shop.myshopify.com")
+    for bad in ("", "   ", None, 5, "x" * 256, "a\nb"):
+        with pytest.raises(ValueError):
+            hitl_tokens.issue_action_token("promote_live", bad)
+    for bad in (0, -1, True, 1.5, hitl_tokens.MAX_TTL_SECONDS + 1):
+        with pytest.raises(ValueError):
+            hitl_tokens.issue_action_token("promote_live", "shop.myshopify.com", ttl_seconds=bad)
+
+
+def test_issue_action_token_without_private_key_fails_closed(env, monkeypatch):
+    monkeypatch.delenv("HITL_SIGNING_PRIVATE_KEY_PATH")
+    with pytest.raises(RuntimeError):
+        hitl_tokens.issue_action_token("promote_live", "shop.myshopify.com")
+
+
+def test_publish_and_action_tokens_do_not_cross(env):
+    publish = hitl_tokens.issue_publish_token(CONTAINER, WORKSPACE)
+    action = hitl_tokens.issue_action_token("promote_live", "shop.myshopify.com")
+    assert hitl_tokens.verify_action_token(publish, "promote_live", CONTAINER, env)[0] is False
+    assert hitl_tokens.verify_action_token(publish, "promote_live", "shop.myshopify.com", env)[0] is False
+    # even an action token whose claims also happen to carry cid/wid never verifies as a publish token
+    hybrid = forge_action(cid=CONTAINER, wid=WORKSPACE)
+    for tok in (action, hybrid):
+        assert hitl_tokens.verify_publish_token(tok, CONTAINER, WORKSPACE, env) == (False, "token_malformed")
+    assert not env.exists()
+    assert hitl_tokens.verify_publish_token(publish, CONTAINER, WORKSPACE, env)[0] is True  # publish tokens still work
+
+
+def test_action_token_consume_false_does_not_burn(env):
+    token = hitl_tokens.issue_action_token("promote_live", "shop.myshopify.com")
+    for _ in range(3):
+        assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env, consume=False) == (
+            True, "ok")
+    assert not env.exists()
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env)[0] is True
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env, consume=False)[0] is False
+
+
+def test_action_token_verify_without_public_key_fails_closed(env, monkeypatch):
+    token = hitl_tokens.issue_action_token("promote_live", "shop.myshopify.com")
+    monkeypatch.delenv("HITL_VERIFY_PUBLIC_KEY")
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env) == (
+        False, "verify_key_not_configured")
+
+
+def test_cli_issue_action_prints_only_the_token(env, capsys):
+    assert hitl_tokens.main(["issue-action", "--action", "promote_live", "--subject", "Shop.myshopify.com"]) == 0
+    out = capsys.readouterr()
+    token = out.out.strip()
+    assert token.count(".") == 1 and "\n" not in token
+    assert "PRIVATE" not in out.out + out.err
+    assert hitl_tokens.verify_action_token(token, "promote_live", "shop.myshopify.com", env)[0] is True
+    assert hitl_tokens.main(["issue-action", "--action", "promote_live", "--subject", "x.myshopify.com", "--ttl", "0"]) == 1
+
+
+def test_cli_issue_action_rejects_unknown_action_and_missing_key(env, monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        hitl_tokens.main(["issue-action", "--action", "delete_everything", "--subject", "x"])
+    monkeypatch.delenv("HITL_SIGNING_PRIVATE_KEY_PATH")
+    assert hitl_tokens.main(["issue-action", "--action", "promote_live", "--subject", "x.myshopify.com"]) == 1
+    assert capsys.readouterr().out.strip() == ""
+
+
+def test_consultation_verifier_rejects_tokens_with_act(env, consultation):
+    token = forge_action(cid=CONTAINER, wid=WORKSPACE)
+    assert consultation.verify_publish_token(token, CONTAINER, WORKSPACE, env) == (False, "token_malformed")

@@ -11,6 +11,7 @@ import hmac
 import os
 import time
 import logging
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, HTTPException, Request, Response, status, Header, Depends
@@ -24,9 +25,9 @@ from .models import TaskItem, TaskStatus, AgentRole, EscalationNotice
 from .hitl_escalation import hitl_manager
 from .workflow_engine import workforce_engine
 from .hermes_bridge import hermes_bridge
-from .hitl_tokens import issue_publish_token, DEFAULT_TTL_SECONDS
-from .db import init_db
-from .webhook_routes import router as webhook_router
+from .hitl_tokens import issue_publish_token, issue_action_token, normalize_action_subject, DEFAULT_TTL_SECONDS
+from .db import get_tenant_by_shop_domain, init_db
+from .webhook_routes import router as webhook_router, get_session_factory_dep
 from .capture_routes import router as capture_router
 from .operator_routes import router as operator_router
 from .tenant_key_routes import router as tenant_key_router
@@ -121,6 +122,9 @@ class ResolveEscalationRequest(BaseModel):
 class GtmPublishApprovalRequest(BaseModel):
     container_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
     workspace_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+class PromoteLiveApprovalRequest(BaseModel):
+    tenant_key: str = Field(..., min_length=1, max_length=255)
 
 # -----------------------------------------------------------------------------
 # Endpoints
@@ -223,6 +227,36 @@ async def approve_gtm_publish(req: GtmPublishApprovalRequest, _operator: None = 
         "gate": "D-003",
         "container_id": req.container_id,
         "workspace_id": req.workspace_id,
+        "expires_in_seconds": DEFAULT_TTL_SECONDS,
+        "single_use": True
+    }
+
+@app.post("/approvals/promote-live")
+async def approve_promote_live(req: PromoteLiveApprovalRequest, _operator: None = Depends(require_operator),
+                               factory=Depends(get_session_factory_dep)):
+    """
+    S3-4: a human operator mints a signed, single-use approval token to promote ONE tenant shadow -> live. The token is
+    then handed to the Tariq agent, which presents it to POST /v1/tenants/{tenant_key}/promote-live. Operator bearer key
+    required (the Hermes tenant-API key does not work here). 404 for an unknown tenant.
+    """
+    try:
+        tenant_key = normalize_action_subject(req.tenant_key)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+    with factory() as session:
+        if get_tenant_by_shop_domain(session, tenant_key) is None:
+            raise HTTPException(status_code=404, detail="Not found")
+    try:
+        token = issue_action_token("promote_live", tenant_key, ttl_seconds=DEFAULT_TTL_SECONDS)
+    except RuntimeError as exc:
+        logger.error("Cannot issue approval token: %s", exc)
+        raise HTTPException(status_code=503, detail="Approval signing is not configured")
+    logger.info("promote-live approval issued for tenant_key=%s", tenant_key)
+    return {
+        "approval_token": token,
+        "gate": "promote_live",
+        "tenant_key": tenant_key,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=DEFAULT_TTL_SECONDS)).isoformat(),
         "expires_in_seconds": DEFAULT_TTL_SECONDS,
         "single_use": True
     }

@@ -243,7 +243,8 @@ def test_status_tenant_b_is_independent(client):
     assert body["platform"] == "salla" and body["mode"] == "shadow"
     assert body["has_meta_credentials"] is False
     assert body["checklist_ready"] is False and body["onboarded"] is False
-    assert body["missing_required_steps"] == ["meta_dataset", "meta_capi_token", "courier_secret", "api_key"]
+    # Salla: the courier secret is optional (native delivered status; evidence is enforced at promote-live)
+    assert body["missing_required_steps"] == ["meta_dataset", "meta_capi_token", "api_key"]
     assert body["webhooks_verified"] is True  # one signature_ok row (processing failed, but the signature verified)
     assert body["webhook_failures_7d"] == 1
 
@@ -266,9 +267,8 @@ def test_status_reflects_checklist_progress_and_test_event_code(db_session, clie
     db_session.commit()
     store_credential(db_session, b.id, "meta_capi_token", SECRET_TOKEN)
     body = client.get(path, headers=AUTH).json()
-    assert body["missing_required_steps"] == ["courier_secret", "api_key"]
+    assert body["missing_required_steps"] == ["api_key"]
     assert body["test_event_code_set"] is True and SECRET_TEST_CODE not in json.dumps(body)
-    store_credential(db_session, b.id, "oto_webhook_secret", SECRET_COURIER)
     create_tenant_key(db_session, b.id, "initial")
     body = client.get(path, headers=AUTH).json()
     assert body["missing_required_steps"] == [] and body["checklist_ready"] is True and body["onboarded"] is True

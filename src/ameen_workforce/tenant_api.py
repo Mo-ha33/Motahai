@@ -1,8 +1,10 @@
 """
-tenant_api.py — Read-only Core API the Tariq agent (via Hermes) calls to see one store's COD-engine state (S3-1).
+tenant_api.py — Core API the Tariq agent (via Hermes) calls to see one store's COD-engine state (S3-1) and, with a
+human-minted approval token, to switch it live (S3-4).
 
-  GET /v1/tenants/{tenant_key}/status
-  GET /v1/tenants/{tenant_key}/signal-health?window_days=7      (1..28)
+  GET  /v1/tenants/{tenant_key}/status
+  GET  /v1/tenants/{tenant_key}/signal-health?window_days=7      (1..28)
+  POST /v1/tenants/{tenant_key}/promote-live                     body {"approval_token": "..."}   (see below)
 
 tenant_key = tenants.shop_domain (Shopify *.myshopify.com domain / Salla merchant id), the same convention as
 capture_routes.py; it is looked up with db.get_tenant_by_shop_domain (which normalizes case/whitespace).
@@ -15,7 +17,7 @@ before path/query validation (a bad window_days with no token is 401, not 422). 
 Known risk: HERMES_TENANT_API_KEY can read ANY tenant's counts. The caller (the Hermes tool, S3-2) must bind
 tenant_key to the onboarded store of the current conversation before calling; this module does not enforce that.
 
-Read-only and PII-free: counts, flags and timestamps only. No emails, phones, names, IPs, user agents, order ids,
+Everything except promote-live is read-only and PII-free: counts, flags and timestamps only. No emails, phones, names, IPs, user agents, order ids,
 addresses, credentials/ciphertext or webhook payloads are ever selected or returned; logs carry only the numeric
 tenant id. No CAPI calls, no writes.
 
@@ -55,14 +57,19 @@ import hmac
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from sqlalchemy import and_, func, or_, select
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from .db import CapiEvent, Tenant, WebhookDelivery, get_session_factory, get_tenant_by_shop_domain
+from .db import (
+    CapiEvent, Order, OrderStatusEvent, Tenant, WebhookDelivery, get_session_factory, get_tenant_by_shop_domain
+)
 from .digest import SIGNAL_EVENT_NAMES, q_incidents
+from .hitl_tokens import ACTION_PROMOTE_LIVE, normalize_action_subject, used_nonces_path, verify_action_token
 from .onboarding_routes import compute_checklist
 from .stats_routes import cohort_window, compute_section, default_window, window_iso
 
@@ -75,6 +82,8 @@ MAX_WINDOW_DAYS = 28
 WEBHOOK_FAILURE_DAYS = 7
 IGNORED_TOPIC_ERROR = "topic_not_handled"
 MAX_INCIDENTS = 20
+DELIVERED_EVIDENCE_DAYS = 14
+SHADOW_EVIDENCE_DAYS = 7
 
 router = APIRouter(prefix="/v1/tenants/{tenant_key}")
 
@@ -202,6 +211,58 @@ def _build_signal_health(session: Session, tenant: Tenant, window_days: int, now
     }
 
 
+class PromoteLiveRequest(BaseModel):
+    approval_token: str = Field(..., max_length=4096, repr=False)
+
+
+def _error(status_code: int, error: str, **extra: Any) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"error": error, **extra})
+
+
+def _has_delivered_evidence(session: Session, tenant_id: int, now: datetime) -> bool:
+    """
+    At least one order of this tenant reached `delivered` in the last 14 days, from ANY source (platform webhook,
+    Bosta/OTO courier webhook, sweep). Evidence is either an order_status_events row (status 'delivered', received_at in
+    the window; written by the pipeline for every webhook source whenever an order's status changes) or an orders row
+    that is currently 'delivered' with orders.delivered_at in the window (the first time the pipeline saw it delivered).
+    `paid` alone is not delivery evidence.
+    """
+    cutoff = now - timedelta(days=DELIVERED_EVIDENCE_DAYS)
+    via_event = session.scalar(
+        select(OrderStatusEvent.id).join(Order, Order.id == OrderStatusEvent.order_id).where(
+            Order.tenant_id == tenant_id, OrderStatusEvent.status == "delivered",
+            OrderStatusEvent.received_at >= cutoff).limit(1))
+    if via_event is not None:
+        return True
+    return session.scalar(select(Order.id).where(
+        Order.tenant_id == tenant_id, Order.current_status == "delivered", Order.delivered_at >= cutoff).limit(1)
+    ) is not None
+
+
+def _has_recent_shadow_event(session: Session, tenant_id: int, now: datetime) -> bool:
+    cutoff = now - timedelta(days=SHADOW_EVIDENCE_DAYS)
+    return session.scalar(select(CapiEvent.id).where(
+        CapiEvent.tenant_id == tenant_id, CapiEvent.status == "shadow",
+        func.coalesce(CapiEvent.sent_at, CapiEvent.created_at) >= cutoff).limit(1)) is not None
+
+
+def _failed_preconditions(session: Session, tenant: Tenant, now: datetime) -> List[str]:
+    failed: List[str] = []
+    if not tenant.active:
+        failed.append("inactive")
+    if not compute_checklist(session, tenant)["ready_for_live"]:
+        failed.append("checklist_not_ready")
+    if tenant.test_event_verified_at is None:
+        failed.append("test_event_not_verified")
+    if tenant.meta_test_event_code is not None:
+        failed.append("test_event_code_still_set")
+    if not _has_delivered_evidence(session, tenant.id, now):
+        failed.append("no_delivered_evidence")
+    if not _has_recent_shadow_event(session, tenant.id, now):
+        failed.append("no_shadow_events")
+    return failed
+
+
 @router.get("/status")
 def tenant_status(tenant_key: str, _auth: None = Depends(require_tenant_api_key),
                   factory: sessionmaker = Depends(get_tenant_api_session_factory)) -> Dict[str, Any]:
@@ -223,3 +284,72 @@ def tenant_signal_health(
         tenant = _get_tenant_or_404(session, tenant_key)
         logger.info("tenant signal-health read for tenant %s (%dd)", tenant.id, window_days)
         return _build_signal_health(session, tenant, window_days, _now())
+
+
+@router.post("/promote-live")
+def tenant_promote_live(
+    tenant_key: str, req: PromoteLiveRequest, _auth: None = Depends(require_tenant_api_key),
+    factory: sessionmaker = Depends(get_tenant_api_session_factory)
+):
+    """
+    Switch one tenant from shadow to live with a human-minted, single-use `promote_live` approval token (S3-4).
+
+    The token is minted by a human operator (POST /approvals/promote-live, or the hitl_tokens CLI `issue-action`), is
+    bound to this tenant_key, expires (default 30 min) and can be used once. Checks run in this order:
+      1. bearer HERMES_TENANT_API_KEY                                   -> 401
+      2. tenant lookup                                                  -> 404 {"detail": "Not found"}
+      3. already live                                                   -> 409 {"error": "already_live"}
+      4. token valid for (promote_live, this tenant), NOT consumed yet  -> 403 {"error": "token_rejected"}
+      5. preconditions                                                  -> 409 {"error": "precondition_failed", "failed": [ids]}
+         ids: inactive, checklist_not_ready, test_event_not_verified, test_event_code_still_set (the stored Meta test
+         code must be cleared first or live events would only land in Test Events), no_delivered_evidence (an order
+         delivered in the last 14 days from any source), no_shadow_events (a `shadow` CapiEvent in the last 7 days)
+      6. flip mode='live' + promoted_live_at and consume the token in one transaction; losing the token race -> 403,
+         nothing flipped.
+    A 409 never consumes the token, so the same token works once the preconditions are met. -> 200
+    {"tenant_key", "mode": "live", "promoted_live_at": ISO}.
+
+    Shadow events are final: they are NOT backfilled or resent on promotion. Only decisions made after promotion are
+    sent live. The token is never echoed or logged; logs carry the numeric tenant id and the outcome only.
+    """
+    try:
+        subject = normalize_action_subject(tenant_key)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+    nonce_store = used_nonces_path()
+    with factory() as session:
+        tenant = _get_tenant_or_404(session, tenant_key)
+        tenant_id = tenant.id
+        if tenant.mode == "live":
+            logger.info("promote-live tenant %s: already_live", tenant_id)
+            return _error(409, "already_live")
+        ok, reason = verify_action_token(req.approval_token, ACTION_PROMOTE_LIVE, subject, nonce_store, consume=False)
+        if not ok:
+            logger.warning("promote-live tenant %s: token_rejected (%s)", tenant_id, reason)
+            return _error(403, "token_rejected")
+        now = _now()
+        failed = _failed_preconditions(session, tenant, now)
+        if failed:
+            logger.info("promote-live tenant %s: precondition_failed %s", tenant_id, ",".join(failed))
+            return _error(409, "precondition_failed", failed=failed)
+        try:
+            flipped = session.execute(
+                update(Tenant).where(Tenant.id == tenant_id, Tenant.mode != "live")
+                .values(mode="live", promoted_live_at=now)).rowcount
+            if flipped != 1:
+                session.rollback()
+                logger.info("promote-live tenant %s: already_live (race)", tenant_id)
+                return _error(409, "already_live")
+            ok, reason = verify_action_token(req.approval_token, ACTION_PROMOTE_LIVE, subject, nonce_store)
+            if not ok:
+                session.rollback()
+                logger.warning("promote-live tenant %s: token_rejected at consume (%s)", tenant_id, reason)
+                return _error(403, "token_rejected")
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("promote-live tenant %s: failed", tenant_id)
+            raise
+        session.refresh(tenant)
+        logger.info("promote-live tenant %s: promoted", tenant_id)
+        return {"tenant_key": tenant.shop_domain, "mode": tenant.mode, "promoted_live_at": _iso(tenant.promoted_live_at)}

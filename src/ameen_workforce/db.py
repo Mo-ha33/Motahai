@@ -17,6 +17,8 @@ storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source, S1
 tenants.language, tenants.meta_test_event_code) and the new checkout_context and staged_webhooks tables need an Alembic
 migration before any non-empty database is upgraded. S3-3 adds tenants.test_event_verified_at (nullable); an existing
 database needs: ALTER TABLE tenants ADD COLUMN test_event_verified_at TIMESTAMP WITH TIME ZONE;  (SQLite: DATETIME).
+S3-4 adds tenants.promoted_live_at (nullable); an existing database needs:
+ALTER TABLE tenants ADD COLUMN promoted_live_at TIMESTAMP WITH TIME ZONE;  (SQLite: DATETIME).
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
@@ -107,6 +109,8 @@ class Tenant(Base):
     # S3-3: when order_pipeline.verify_test_event last got an HTTP success from Meta for this code (NULL = never, or the
     # code changed since). Not a secret, but the code itself is never logged at INFO.
     test_event_verified_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    # S3-4: when POST /v1/tenants/{key}/promote-live flipped this tenant shadow -> live (NULL = never promoted that way).
+    promoted_live_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:

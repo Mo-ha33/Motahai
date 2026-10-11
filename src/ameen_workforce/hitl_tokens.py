@@ -19,7 +19,14 @@ An approval is therefore a token the LLM cannot mint:
 * Short-lived: `exp` (unix seconds), default TTL 30 minutes.
 * Single-use:  `nonce` is recorded in a JSON file (env HITL_USED_NONCES_PATH) when it is consumed.
 
-Issuance: POST /approvals/gtm-publish in service.py (operator bearer key only).
+Action tokens (S3-4) use the same keys, nonce store and single-use semantics but bind (action, subject) instead of
+(container, workspace): {act, sub, exp, nonce}. The only action today is `promote_live` with the normalized tenant_key
+as subject (POST /v1/tenants/{tenant_key}/promote-live). A publish token never verifies as an action token (no `act`)
+and an action token never verifies as a publish token (verify_publish_token rejects any token carrying `act`).
+verify_action_token lives OUTSIDE the inlined verifier block: only Core consumes action tokens.
+
+Issuance: POST /approvals/gtm-publish and POST /approvals/promote-live in service.py (operator bearer key only), or the
+CLI `python -m ameen_workforce.hitl_tokens issue-action --action promote_live --subject <tenant_key>`.
 Verification: the verifier block below is duplicated INLINE in the deployed consultation.py
 (a VPS snapshot that cannot import this package; it needs only `cryptography` installed).
 tests/test_hitl_tokens.py asserts the two copies stay byte-for-byte identical, so edit both together.
@@ -50,6 +57,11 @@ PRIVATE_KEY_FILENAME = "hitl_private.pem"
 PUBLIC_KEY_FILENAME = "hitl_public.pem"
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Allowlist of action-token actions (S3-4). Anything else is refused at issue and at verify time.
+ACTION_PROMOTE_LIVE = "promote_live"
+ALLOWED_ACTIONS = frozenset({ACTION_PROMOTE_LIVE})
+MAX_SUBJECT_LENGTH = 255
 
 
 # --- BEGIN VERIFIER (must stay identical to the copy inlined in consultation.py) ---
@@ -125,6 +137,8 @@ def verify_publish_token(token, container_id, workspace_id, used_nonce_store, no
         except InvalidSignature:
             return False, "bad_signature"
         claims = json.loads(_b64url_decode(payload_b64))
+        if not isinstance(claims, dict) or "act" in claims:  # action tokens (verify_action_token) never publish
+            return False, "token_malformed"
         cid, wid, exp, nonce = claims["cid"], claims["wid"], claims["exp"], claims["nonce"]
         if not (isinstance(cid, str) and isinstance(wid, str) and isinstance(nonce, str)
                 and isinstance(exp, int) and not isinstance(exp, bool) and nonce):
@@ -195,6 +209,88 @@ def issue_publish_token(container_id: str, workspace_id: str, ttl_seconds: int =
     return f"{payload_b64}.{_b64url_encode(signature)}"
 
 
+def normalize_action_subject(subject) -> str:
+    """Canonical form of an action-token subject: stripped + lower-cased, the same normalization as
+    db.get_tenant_by_shop_domain (tenant_key = tenants.shop_domain). Raises ValueError for empty/oversized/non-str."""
+    if not isinstance(subject, str):
+        raise ValueError("subject must be a string")
+    normalized = subject.strip().lower()
+    if not normalized or len(normalized) > MAX_SUBJECT_LENGTH or any(ord(ch) < 32 for ch in normalized):
+        raise ValueError(f"subject must be 1..{MAX_SUBJECT_LENGTH} printable characters")
+    return normalized
+
+
+def issue_action_token(action: str, subject: str, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> str:
+    """
+    Mints a single-use approval token for exactly one (action, subject) pair, e.g. ("promote_live", tenant_key).
+    Must only be called on behalf of an authenticated human operator. Raises ValueError for bad input (unknown action,
+    bad subject/ttl) and RuntimeError if the Ed25519 private key is missing/invalid.
+    """
+    key = _load_signing_key()
+    if not isinstance(action, str) or action not in ALLOWED_ACTIONS:
+        raise ValueError(f"action must be one of {sorted(ALLOWED_ACTIONS)}")
+    subject = normalize_action_subject(subject)
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or not 1 <= ttl_seconds <= MAX_TTL_SECONDS:
+        raise ValueError(f"ttl_seconds must be an integer between 1 and {MAX_TTL_SECONDS}")
+
+    claims = {
+        "act": action,
+        "sub": subject,
+        "exp": int(time.time()) + ttl_seconds,
+        "nonce": secrets.token_urlsafe(16),
+    }
+    payload_b64 = _b64url_encode(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    signature = key.sign(payload_b64.encode("ascii"))
+    return f"{payload_b64}.{_b64url_encode(signature)}"
+
+
+def verify_action_token(token, action, subject, used_nonce_store, now=None, consume=True):
+    """
+    Returns (ok, reason) for an action token (see issue_action_token). With consume=True (default) an ok token's nonce
+    is spent (single use); consume=False validates everything without spending it, so a caller can check preconditions
+    first and consume later with a second call (the nonce check is repeated at consume time, which is the race guard).
+    Rejects tokens without `act`, with another `act`/`sub`, publish tokens, bad signatures, expired and reused tokens.
+    Reasons are for logs only; callers must not echo them (or the token) to the client.
+    """
+    public_key = _verify_key()
+    if public_key is None:
+        return False, "verify_key_not_configured"
+    if not isinstance(token, str) or not token.strip():
+        return False, "token_missing"
+    if not isinstance(action, str) or action not in ALLOWED_ACTIONS:
+        return False, "action_not_allowed"
+    try:
+        expected_sub = normalize_action_subject(subject)
+    except ValueError:
+        return False, "subject_invalid"
+    now = time.time() if now is None else now
+    try:
+        from cryptography.exceptions import InvalidSignature
+        payload_b64, sig_b64 = token.strip().split(".")
+        try:
+            public_key.verify(_b64url_decode(sig_b64), payload_b64.encode("ascii"))
+        except InvalidSignature:
+            return False, "bad_signature"
+        claims = json.loads(_b64url_decode(payload_b64))
+        if not isinstance(claims, dict):
+            return False, "token_malformed"
+        act, sub, exp, nonce = claims["act"], claims["sub"], claims["exp"], claims["nonce"]
+        if not (isinstance(act, str) and isinstance(sub, str) and isinstance(nonce, str)
+                and isinstance(exp, int) and not isinstance(exp, bool) and nonce):
+            return False, "token_malformed"
+    except (ValueError, KeyError, TypeError):
+        return False, "token_malformed"
+    if now >= exp:
+        return False, "token_expired"
+    if act != action:
+        return False, "action_mismatch"
+    if sub != expected_sub:
+        return False, "subject_mismatch"
+    if not _consume_nonce(used_nonce_store, nonce, exp, now, record=consume):
+        return False, "nonce_reused_or_store_unavailable"
+    return True, "ok"
+
+
 def used_nonces_path() -> str:
     """Where consumed nonces are recorded (env HITL_USED_NONCES_PATH, VPS default otherwise)."""
     return os.environ.get(HITL_USED_NONCES_PATH_ENV) or DEFAULT_USED_NONCES_PATH
@@ -237,7 +333,21 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     gen = sub.add_parser("generate-keypair", help="create an Ed25519 keypair; prints only the public key")
     gen.add_argument("--out", required=True, help="directory for hitl_private.pem (0600) and hitl_public.pem")
+    act = sub.add_parser("issue-action", help="mint a single-use action token; prints only the token (stdout)")
+    act.add_argument("--action", required=True, choices=sorted(ALLOWED_ACTIONS))
+    act.add_argument("--subject", required=True, help="promote_live: the tenant_key (tenants.shop_domain)")
+    act.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="seconds (default 1800, max 86400)")
     args = parser.parse_args(argv)
+    if args.command == "issue-action":
+        try:
+            token = issue_action_token(args.action, args.subject, ttl_seconds=args.ttl)
+        except (RuntimeError, ValueError) as exc:
+            print(f"cannot issue token: {exc}", file=sys.stderr)
+            return 1
+        print(token)
+        print(f"single-use {args.action} token for {normalize_action_subject(args.subject)}, "
+              f"valid {args.ttl}s; treat it like a password", file=sys.stderr)
+        return 0
     if args.command == "generate-keypair":
         try:
             public_b64 = generate_keypair(args.out)
