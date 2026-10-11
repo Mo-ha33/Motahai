@@ -13,19 +13,32 @@ all query parameters except the allowlisted tracking/consent keys (`id`, `tid`, 
 Any load failure, timeout, TLS error, bot challenge or SSRF-blocked host returns `status: "UNKNOWN"` with a
 reason code (`FETCH_FAILED`, `TIMEOUT`, `BOT_CHALLENGE`, `TLS_ERROR`, `BLOCKED_HOST`) and never reports `false`
 for unobserved signals.
+
+Security model (the probed page is arbitrary and possibly hostile; the host also serves loopback services):
+  * every request Chromium makes (start URL, each redirect hop, every subresource) passes through a Playwright route
+    handler that aborts non-http(s) schemes, non-global IP literals, localhost/.local/.internal names, and any host
+    whose DNS answer contains a non-global address; aborted requests are counted in `blocked_requests`;
+  * the Playwright runner always executes in a dedicated worker thread (never on a running asyncio loop thread) under
+    an overall timeout, so an asyncio-hosted MCP server cannot break the sync Playwright API.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import functools
 import ipaddress
 import re
 import socket
 import ssl
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 PAGE_TIMEOUT_MS = 20_000
+# Overall wall-clock budget for one probe (home + product page); slightly under the 90 s tool-policy timeout.
+OVERALL_TIMEOUT_S = 85.0
+MAX_WORKERS = 2
 ALLOWED_QUERY_KEYS = frozenset({"id", "tid", "gcs", "gcd"})
 
 # Vendor / platform domains that must never be probed as a merchant storefront
@@ -61,10 +74,11 @@ _BOT_MARKERS = (
 class ProbeFailure(Exception):
     """Raised when a page load or SSRF check fails with a classified reason code."""
 
-    def __init__(self, reason: str, detail: str = ""):
+    def __init__(self, reason: str, detail: str = "", blocked: Optional[Dict[str, Any]] = None):
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail
+        self.blocked = blocked
 
 
 @dataclass
@@ -74,6 +88,8 @@ class PageCapture:
     requests: List[str] = field(default_factory=list)
     links: List[str] = field(default_factory=list)
     title: str = ""
+    blocked_count: int = 0
+    blocked_reasons: Dict[str, int] = field(default_factory=dict)
 
 
 ResolverFn = Callable[[str, int], Sequence[Tuple[Any, ...]]]
@@ -82,6 +98,22 @@ PageRunnerFn = Callable[[str, int], PageCapture]
 
 def _default_resolver(host: str, port: int) -> Sequence[Tuple[Any, ...]]:
     return socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+
+
+def _is_non_global_ip(ip: Any) -> bool:
+    """True for any address that is not a plain globally routable unicast address."""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
 
 
 def sanitize_url(url: str) -> str:
@@ -159,15 +191,7 @@ def validate_and_resolve_store_url(
             ip = ipaddress.ip_address(ip_str)
         except ValueError as exc:
             raise ProbeFailure("BLOCKED_HOST", "Invalid IP address in DNS response.") from exc
-        if (
-            not ip.is_global
-            or ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
+        if _is_non_global_ip(ip):
             raise ProbeFailure("BLOCKED_HOST", f"Host '{host}' resolved to non-public IP.")
 
     return sanitize_url(url)
@@ -222,7 +246,15 @@ def find_product_url(home_url: str, links: Iterable[str]) -> Optional[str]:
     return None
 
 
-def _unknown_result(reason: str, pages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _blocked_summary(count: int = 0, reasons: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    return {"count": int(count), "reasons": dict(sorted((reasons or {}).items()))}
+
+
+def _unknown_result(
+    reason: str,
+    pages: Optional[List[Dict[str, Any]]] = None,
+    blocked: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return {
         "status": "UNKNOWN",
         "reason": reason,
@@ -243,6 +275,7 @@ def _unknown_result(reason: str, pages: Optional[List[Dict[str, Any]]] = None) -
         },
         "consent_signals_seen": None,
         "hit_before_consent": None,
+        "blocked_requests": blocked if blocked is not None else _blocked_summary(),
     }
 
 
@@ -390,11 +423,19 @@ def analyze_captures(
             }
         )
 
+    blocked_total = 0
+    blocked_reasons: Dict[str, int] = {}
+    for cap in captures:
+        blocked_total += int(cap.blocked_count or 0)
+        for code, n in (cap.blocked_reasons or {}).items():
+            blocked_reasons[code] = blocked_reasons.get(code, 0) + int(n)
+    blocked = _blocked_summary(blocked_total, blocked_reasons)
+
     first = captures[0]
     if _is_bot_challenge(first):
-        return _unknown_result("BOT_CHALLENGE", pages=pages_out)
+        return _unknown_result("BOT_CHALLENGE", pages=pages_out, blocked=blocked)
     if first.http_status is None or first.http_status >= 400:
-        return _unknown_result("FETCH_FAILED", pages=pages_out)
+        return _unknown_result("FETCH_FAILED", pages=pages_out, blocked=blocked)
 
     all_gtm: List[str] = []
     all_ga4: List[str] = []
@@ -480,6 +521,7 @@ def analyze_captures(
         },
         "consent_signals_seen": any_consent_seen,
         "hit_before_consent": combined_hit_before_consent,
+        "blocked_requests": blocked,
     }
 
 
@@ -494,27 +536,174 @@ def _classify_exception(exc: Exception) -> str:
     return "FETCH_FAILED"
 
 
-def _playwright_runner(url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> PageCapture:
-    """Thin headless Chromium runner using Playwright with TLS verification enabled and no cookie persistence."""
+_LOCAL_HOST_SUFFIXES = (".localhost", ".local", ".internal")
+
+
+def _parse_ip_literal(host: str) -> Optional[Any]:
+    """Returns an ip_address for IP-literal hosts, including legacy forms (decimal/hex/octal/short IPv4)."""
+    bare = host.strip("[]")
+    try:
+        return ipaddress.ip_address(bare)
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9a-fx.]+", bare):
+        try:
+            return ipaddress.IPv4Address(socket.inet_aton(bare))
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def classify_request(
+    url: str,
+    resolver: Optional[ResolverFn] = None,
+    resolve_cache: Optional[Dict[str, Optional[str]]] = None,
+) -> Optional[str]:
+    """Returns a block reason code for a browser request URL, or None when the request may proceed.
+
+    Reason codes: NON_HTTP_SCHEME, NO_HOST, NON_GLOBAL_IP, DENIED_HOSTNAME, RESOLVES_NON_GLOBAL.
+    DNS_FAILED is also returned (the request is aborted, but callers do not count it as an SSRF block).
+    """
+    try:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return "NO_HOST"
+    if scheme not in ("http", "https"):
+        return "NON_HTTP_SCHEME"
+    if not host:
+        return "NO_HOST"
+
+    ip = _parse_ip_literal(host)
+    if ip is not None:
+        return "NON_GLOBAL_IP" if _is_non_global_ip(ip) else None
+
+    if "." not in host or host == "localhost" or host.endswith(_LOCAL_HOST_SUFFIXES):
+        return "DENIED_HOSTNAME"
+
+    cache = resolve_cache if resolve_cache is not None else {}
+    if host not in cache:
+        res_fn = resolver or _default_resolver
+        verdict: Optional[str] = None
+        try:
+            infos = res_fn(host, 443)
+            if not infos:
+                verdict = "DNS_FAILED"
+            for info in infos or []:
+                try:
+                    addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+                except (ValueError, IndexError, TypeError):
+                    verdict = "RESOLVES_NON_GLOBAL"
+                    break
+                if _is_non_global_ip(addr):
+                    verdict = "RESOLVES_NON_GLOBAL"
+                    break
+        except Exception:  # noqa: BLE001 - resolver failures fail closed (abort), never raise into Playwright
+            verdict = "DNS_FAILED"
+        cache[host] = verdict
+    return cache[host]
+
+
+class RequestGuard:
+    """Playwright route handler enforcing the SSRF policy on every request the browser makes."""
+
+    def __init__(self, resolver: Optional[ResolverFn] = None):
+        self.resolver = resolver
+        self.requests: List[str] = []
+        self.blocked_reasons: Dict[str, int] = {}
+        self.main_frame_blocked = False
+        self._resolve_cache: Dict[str, Optional[str]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def blocked_count(self) -> int:
+        return sum(self.blocked_reasons.values())
+
+    @staticmethod
+    def _is_main_frame_navigation(request: Any) -> bool:
+        try:
+            if not request.is_navigation_request():
+                return False
+            return request.frame.parent_frame is None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def handle(self, route: Any) -> None:
+        request = route.request
+        try:
+            reason = classify_request(request.url, self.resolver, self._resolve_cache)
+        except Exception:  # noqa: BLE001
+            reason = "GUARD_ERROR"
+        if reason is None:
+            self.requests.append(sanitize_url(request.url))
+            try:
+                route.continue_()
+            except Exception:  # noqa: BLE001 - page/context already closed
+                pass
+            return
+        with self._lock:
+            # A DNS failure is aborted but is not an SSRF block (the resource simply could not be loaded).
+            if reason != "DNS_FAILED":
+                self.blocked_reasons[reason] = self.blocked_reasons.get(reason, 0) + 1
+                if self._is_main_frame_navigation(request):
+                    self.main_frame_blocked = True
+        try:
+            route.abort("blockedbyclient")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def summary(self) -> Dict[str, Any]:
+        return _blocked_summary(self.blocked_count, self.blocked_reasons)
+
+
+def _playwright_runner(
+    url: str,
+    timeout_ms: int = PAGE_TIMEOUT_MS,
+    resolver: Optional[ResolverFn] = None,
+) -> PageCapture:
+    """Thin headless Chromium runner using Playwright with TLS verification enabled and no cookie persistence.
+
+    Must run on a thread with no running asyncio loop (probe_storefront guarantees this via a worker thread).
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise ProbeFailure("FETCH_FAILED", "Playwright is not installed on this host.") from exc
 
-    requests_seen: List[str] = []
+    guard = RequestGuard(resolver)
     links: List[str] = []
     status_code: Optional[int] = None
     final_url = url
     title = ""
 
+    def _blocked_main_frame() -> ProbeFailure:
+        return ProbeFailure(
+            "BLOCKED_HOST", "Main-frame navigation blocked by request guard.", blocked=guard.summary()
+        )
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         try:
-            # ignore_https_errors=False keeps TLS verification strictly ON
-            context = browser.new_context(ignore_https_errors=False)
+            # ignore_https_errors=False keeps TLS verification strictly ON; no permissions are granted.
+            context = browser.new_context(
+                ignore_https_errors=False,
+                service_workers="block",
+                accept_downloads=False,
+            )
+            context.route("**/*", guard.handle)
+            route_ws = getattr(context, "route_web_socket", None)
+            if callable(route_ws):
+                route_ws("**/*", lambda ws: ws.close())
             page = context.new_page()
-            page.on("request", lambda req: requests_seen.append(sanitize_url(req.url)))
-            resp = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            try:
+                resp = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            except Exception as exc:  # noqa: BLE001
+                if guard.main_frame_blocked:
+                    raise _blocked_main_frame() from exc
+                raise
+            if guard.main_frame_blocked:
+                raise _blocked_main_frame()
             if resp is not None:
                 status_code = resp.status
             final_url = page.url or url
@@ -535,38 +724,50 @@ def _playwright_runner(url: str, timeout_ms: int = PAGE_TIMEOUT_MS) -> PageCaptu
     return PageCapture(
         url=final_url,
         http_status=status_code,
-        requests=[r for r in requests_seen if r],
+        requests=[r for r in guard.requests if r],
         links=links,
         title=title,
+        blocked_count=guard.blocked_count,
+        blocked_reasons=dict(guard.blocked_reasons),
     )
 
 
-def probe_storefront(
+# Dedicated worker threads: sync Playwright refuses to run on a thread that has a running asyncio loop.
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="storefront-probe")
+
+
+def _merge_reasons(a: Optional[Dict[str, int]], b: Optional[Dict[str, int]]) -> Dict[str, int]:
+    out: Dict[str, int] = dict(a or {})
+    for code, n in (b or {}).items():
+        out[code] = out.get(code, 0) + int(n)
+    return out
+
+
+def _probe_storefront_sync(
     store_url: str,
-    gtm_public_id: Optional[str] = None,
-    ga4_measurement_id: Optional[str] = None,
-    meta_pixel_id: Optional[str] = None,
-    runner: Optional[PageRunnerFn] = None,
-    resolver: Optional[ResolverFn] = None,
+    gtm_public_id: Optional[str],
+    ga4_measurement_id: Optional[str],
+    meta_pixel_id: Optional[str],
+    runner: Optional[PageRunnerFn],
+    resolver: Optional[ResolverFn],
 ) -> Dict[str, Any]:
-    """Entry point for `hermes_storefront_probe`."""
     try:
         clean_home = validate_and_resolve_store_url(store_url, resolver=resolver)
     except Exception as exc:  # noqa: BLE001
         return _unknown_result(_classify_exception(exc))
 
-    run_page = runner or _playwright_runner
+    run_page: PageRunnerFn = runner or functools.partial(_playwright_runner, resolver=resolver)
     captures: List[PageCapture] = []
 
     try:
         home_cap = run_page(clean_home, PAGE_TIMEOUT_MS)
-        # Re-validate final URL after any redirects (SSRF redirect guard)
+        # Re-validate final URL after any redirects (defense in depth; the request guard already vetted each hop)
         validate_and_resolve_store_url(home_cap.url, resolver=resolver)
         home_cap.url = sanitize_url(home_cap.url)
         home_cap.requests = [sanitize_url(r) for r in home_cap.requests if sanitize_url(r)]
         captures.append(home_cap)
     except Exception as exc:  # noqa: BLE001
-        return _unknown_result(_classify_exception(exc))
+        return _unknown_result(_classify_exception(exc), blocked=getattr(exc, "blocked", None))
 
     # If home page succeeded and is not a bot challenge, also probe the first product page if found
     if home_cap.http_status and 200 <= home_cap.http_status < 400 and not _is_bot_challenge(home_cap):
@@ -581,7 +782,12 @@ def probe_storefront(
                 captures.append(prod_cap)
             except ProbeFailure as exc:
                 if exc.reason == "BLOCKED_HOST":
-                    return _unknown_result("BLOCKED_HOST", pages=[{"url": home_cap.url, "http_status": home_cap.http_status}])
+                    merged = _merge_reasons(home_cap.blocked_reasons, (exc.blocked or {}).get("reasons"))
+                    return _unknown_result(
+                        "BLOCKED_HOST",
+                        pages=[{"url": home_cap.url, "http_status": home_cap.http_status}],
+                        blocked=_blocked_summary(sum(merged.values()), merged),
+                    )
             except Exception:  # noqa: BLE001
                 # Home page loaded fine; product page load failure does not invalidate home page observations
                 pass
@@ -592,3 +798,37 @@ def probe_storefront(
         ga4_measurement_id=ga4_measurement_id,
         meta_pixel_id=meta_pixel_id,
     )
+
+
+def probe_storefront(
+    store_url: str,
+    gtm_public_id: Optional[str] = None,
+    ga4_measurement_id: Optional[str] = None,
+    meta_pixel_id: Optional[str] = None,
+    runner: Optional[PageRunnerFn] = None,
+    resolver: Optional[ResolverFn] = None,
+) -> Dict[str, Any]:
+    """Entry point for `hermes_storefront_probe`.
+
+    Always executes on a dedicated worker thread so it is safe to call from a thread running an asyncio loop, and
+    enforces an overall timeout (OVERALL_TIMEOUT_S) after which it returns UNKNOWN/TIMEOUT.
+    """
+    try:
+        future = _EXECUTOR.submit(
+            _probe_storefront_sync,
+            store_url,
+            gtm_public_id,
+            ga4_measurement_id,
+            meta_pixel_id,
+            runner,
+            resolver,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _unknown_result(_classify_exception(exc))
+    try:
+        return future.result(timeout=OVERALL_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        return _unknown_result("TIMEOUT")
+    except Exception as exc:  # noqa: BLE001
+        return _unknown_result(_classify_exception(exc))
