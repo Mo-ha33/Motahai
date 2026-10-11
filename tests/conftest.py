@@ -18,6 +18,12 @@ def _isolate_audience_export_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("AUDIENCE_EXPORT_DIR", str(tmp_path / "audiences"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sentinel_dir(tmp_path, monkeypatch):
+    """Keep sentinel flow-state writes (GTM tool hooks) out of /home/deploy for every test."""
+    monkeypatch.setenv("HERMES_SENTINEL_DIR", str(tmp_path / "sentinel"))
+
+
 @pytest.fixture
 def db_session():
     engine = make_engine("sqlite://")

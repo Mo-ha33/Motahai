@@ -75,8 +75,11 @@ client_followup_email(lang: str = "ar", store_name: str | None = None) -> tuple[
 ```
 
 **C4 — client contacts** (`$HERMES_SENTINEL_DIR/contacts.json`, 0600, maintained by the operator, never in git):
-`{"GTM-XXXXXXX": {"email": "...", "store_name": "...", "lang": "ar"}}`. Missing entry → no client email; the admin
-alert says "client not notified: no contact on file".
+`{"GTM-XXXXXXX": {"email": "...", "store_name": "...", "lang": "ar", "tz": "Asia/Riyadh"}}`. `tz` is an IANA name,
+optional, default `Asia/Riyadh`; an invalid name falls back to the default. Client emails are sent only between 09:00 and
+20:00 (20:00 exclusive) in that timezone; outside it the row is `skipped:outside_hours` and the detector retries later.
+Missing entry → no client email; the admin alert says "client not notified: no contact on file". Send failure or SMTP not
+configured → the admin alert says "Client holding email FAILED to send — contact the client manually."
 
 ---
 
@@ -94,7 +97,7 @@ edits in the shared checkout — keep the hook small and isolated so merges stay
 | verify_access | NOT_INVITED, PERMISSION_MISSING, CONTAINER_NOT_FOUND, INVALID_ID, WORKSPACE_LIMIT | client | null |
 | verify_access / workspace_apply / cloud_publish | operator-side error codes (e.g. API_DISABLED, quota) | operator | null |
 | verify_access / workspace_apply | RETRYABLE errors | agent | now + 300 s |
-| workspace_apply | applied | agent | now + 300 s |
+| workspace_apply | applied | human | null (next GTM call needs the operator's D-003 token; consult/report steps are not tracked) |
 | workspace_apply | LINT_FAILED | agent | now + 300 s |
 | cloud_publish | awaiting / missing / rejected approval token | human | null |
 | cloud_publish | published | none | null |

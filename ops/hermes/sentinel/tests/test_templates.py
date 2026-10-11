@@ -120,6 +120,28 @@ def test_flow_stalled_client_notified_none_says_nothing_about_client():
     assert "Client" not in T.admin_telegram(inc)
 
 
+def test_flow_stalled_client_notified_failed_says_send_failed_not_no_contact():
+    inc = _incident(KIND_CASES[9], recovered=False)
+    inc["client_notified"] = "failed"
+    text = T.admin_telegram(inc)
+    assert "Client holding email FAILED to send — contact the client manually." in text
+    assert "no contact on file" not in text
+    assert "Client holding email sent." not in text
+
+    subject, body = T.admin_email(inc)
+    assert "Client holding email FAILED to send — contact the client manually." in body
+    assert "no contact on file" not in body
+
+
+def test_flow_stalled_client_notified_tristate_texts_are_distinct():
+    base = _incident(KIND_CASES[9], recovered=False)
+    texts = set()
+    for value in (True, False, "failed"):
+        inc = dict(base, client_notified=value)
+        texts.add(T.admin_telegram(inc))
+    assert len(texts) == 3
+
+
 def test_provider_degraded_action_by_exhaustion():
     inc = _incident(KIND_CASES[7], recovered=False)
     text = T.admin_telegram(inc)
@@ -332,3 +354,17 @@ def test_no_contact_or_url_in_admin_facts_from_templates_themselves():
         text = T.admin_telegram(inc)
         assert "http" not in text
         assert "@" not in text
+
+
+def test_admin_messages_have_no_stack_traces_reason_codes_or_tool_names():
+    upper_code = re.compile(r"\b[A-Z]{2,}_[A-Z_]+\b")
+    tool_name = re.compile(r"\b(hermes_[a-z_]+|gtm_[a-z_]+|cloud_publish|workspace_apply|verify_access)\b")
+    for base in KIND_CASES:
+        for recovered in (False, True):
+            inc = _incident(base, recovered=recovered)
+            for text in (T.admin_telegram(inc, recovered=recovered), T.admin_email(inc, recovered=recovered)[1]):
+                assert "Traceback" not in text
+                assert 'File "' not in text
+                assert "Exception" not in text
+                assert not upper_code.search(text), text
+                assert not tool_name.search(text), text

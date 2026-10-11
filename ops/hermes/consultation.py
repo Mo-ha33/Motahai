@@ -195,6 +195,56 @@ def _gtm_json(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+# In-process map numeric container id -> public GTM-ID, filled by verify/apply. Publish takes only the numeric id,
+# so this is how its flow record is named. Bounded, never persisted, never invalidated (the resolve cache is dropped
+# on apply, which would lose the mapping before publish runs).
+_CONTAINER_IDS: Dict[str, str] = {}
+_CONTAINER_IDS_LOCK = threading.Lock()
+_CONTAINER_IDS_MAX = 500
+
+
+def _remember_container(numeric_id: Any, public_id: str) -> None:
+    with _CONTAINER_IDS_LOCK:
+        _CONTAINER_IDS.pop(str(numeric_id), None)
+        _CONTAINER_IDS[str(numeric_id)] = public_id
+        while len(_CONTAINER_IDS) > _CONTAINER_IDS_MAX:
+            del _CONTAINER_IDS[next(iter(_CONTAINER_IDS))]
+
+
+def _public_id_for(numeric_id: Any) -> Optional[str]:
+    """Public GTM-ID for a numeric container id seen by verify/apply in this process (None otherwise)."""
+    with _CONTAINER_IDS_LOCK:
+        return _CONTAINER_IDS.get(str(numeric_id))
+
+
+def _flow_record(step: str, public_id: Any, out: str) -> str:
+    """Best-effort sentinel flow-state record (T1). Never raises and returns `out` unchanged."""
+    try:
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict) and data.get("status") in ("CONNECTED", "applied") \
+                    and data.get("container_id") and isinstance(public_id, str):
+                _remember_container(data["container_id"], public_id)
+        except ValueError:
+            pass
+        try:
+            from .sentinel import flow_state
+        except ImportError:  # standalone load: same file-path fallback as _gtm_api()
+            import importlib.util
+            import sys
+            flow_state = sys.modules.get("hermes_sentinel_flow_state")
+            if flow_state is None:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel", "flow_state.py")
+                spec = importlib.util.spec_from_file_location("hermes_sentinel_flow_state", path)
+                flow_state = importlib.util.module_from_spec(spec)
+                sys.modules["hermes_sentinel_flow_state"] = flow_state
+                spec.loader.exec_module(flow_state)
+        flow_state.record_result(public_id, step, out)
+    except Exception:  # noqa: BLE001 - recording must never change a tool's result
+        pass
+    return out
+
+
 def _gtm_service(scopes: List[str]):
     """Returns (service, None), or (None, JSON error string) if the key file is missing / unusable."""
     if not os.path.exists(GTM_SERVICE_ACCOUNT_PATH):
@@ -429,11 +479,11 @@ def register_consultation_tools(server):
         api = _gtm_api()
         bad = api.validate_public_id(public_container_id)
         if bad:
-            return _gtm_json(bad)
+            return _flow_record("verify_access", public_container_id, _gtm_json(bad))
         service, failure = _gtm_service([api.SCOPE_READONLY])
         if failure:
-            return failure
-        return _gtm_json(api.verify_access(service, public_container_id))
+            return _flow_record("verify_access", public_container_id, failure)
+        return _flow_record("verify_access", public_container_id, _gtm_json(api.verify_access(service, public_container_id)))
 
     @server.tool(
         name="hermes_gtm_workspace_apply",
@@ -470,11 +520,12 @@ def register_consultation_tools(server):
         api = _gtm_api()
         bad = api.validate_public_id(public_container_id)
         if bad:
-            return _gtm_json(bad)
+            return _flow_record("workspace_apply", public_container_id, _gtm_json(bad))
         service, failure = _gtm_service([api.SCOPE_EDIT_CONTAINERS, api.SCOPE_READONLY])
         if failure:
-            return failure
-        return _gtm_json(api.apply_container_spec(service, public_container_id, container_spec))
+            return _flow_record("workspace_apply", public_container_id, failure)
+        return _flow_record("workspace_apply", public_container_id,
+                            _gtm_json(api.apply_container_spec(service, public_container_id, container_spec)))
 
     @server.tool(
         name="hermes_gtm_cloud_publish",
@@ -518,16 +569,18 @@ def register_consultation_tools(server):
         # Credentials are checked inside the gate, BEFORE the nonce is consumed, so a missing
         # service-account file does not burn a human-issued token.
         secrets_path = GTM_SERVICE_ACCOUNT_PATH
+        public_id = _public_id_for(container_id)     # publish takes the numeric id; flow state is keyed by GTM-ID
         refusal = _hitl_gate("hermes_gtm_cloud_publish", container_id, workspace_id, version_name, hitl_approval_token,
                              precheck=lambda: None if os.path.exists(secrets_path) else _PENDING_CREDENTIALS)
         if refusal:
-            return refusal
+            return _flow_record("cloud_publish", public_id, refusal)
 
         api = _gtm_api()
         service, failure = _gtm_service([api.SCOPE_EDIT_VERSIONS, api.SCOPE_PUBLISH])
         if failure:
-            return failure
-        return _gtm_json(api.create_and_publish_version(service, account_id, container_id, workspace_id, version_name))
+            return _flow_record("cloud_publish", public_id, failure)
+        return _flow_record("cloud_publish", public_id,
+                            _gtm_json(api.create_and_publish_version(service, account_id, container_id, workspace_id, version_name)))
 
     @server.tool(
         name="hermes_motahai_tenant_status",
