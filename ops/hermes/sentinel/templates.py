@@ -172,11 +172,15 @@ def _explain(inc: dict, kind, exhaustion) -> list[str]:
             f"Tariq was owed the next step{where}{after} and has been silent for over 5 minutes. "
             "Likely cause: Wesam's own model is failing. Action: check the Wesam conversation."
         ]
+        # client_notified is tri-state: True = sent, False = no contact on file,
+        # "failed" = contact exists but the send failed or SMTP is not configured.
         notified = inc.get("client_notified")
         if notified is False:
             lines.append("Client not notified: no contact on file.")
         elif notified is True:
             lines.append("Client holding email sent.")
+        elif notified == "failed":
+            lines.append("Client holding email FAILED to send — contact the client manually.")
         return lines
     if kind == "sentinel_error":
         return ["The sentinel itself could not read its inputs. Action: check the sentinel logs and its input files."]

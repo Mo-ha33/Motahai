@@ -75,8 +75,11 @@ client_followup_email(lang: str = "ar", store_name: str | None = None) -> tuple[
 ```
 
 **C4 — client contacts** (`$HERMES_SENTINEL_DIR/contacts.json`, 0600, maintained by the operator, never in git):
-`{"GTM-XXXXXXX": {"email": "...", "store_name": "...", "lang": "ar"}}`. Missing entry → no client email; the admin
-alert says "client not notified: no contact on file".
+`{"GTM-XXXXXXX": {"email": "...", "store_name": "...", "lang": "ar", "tz": "Asia/Riyadh"}}`. `tz` is an IANA name,
+optional, default `Asia/Riyadh`; an invalid name falls back to the default. Client emails are sent only between 09:00 and
+20:00 (20:00 exclusive) in that timezone; outside it the row is `skipped:outside_hours` and the detector retries later.
+Missing entry → no client email; the admin alert says "client not notified: no contact on file". Send failure or SMTP not
+configured → the admin alert says "Client holding email FAILED to send — contact the client manually."
 
 ---
 

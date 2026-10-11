@@ -9,6 +9,7 @@ import json
 import logging
 import smtplib
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -148,7 +149,11 @@ class _FakeSMTP:
         state.messages.append(message)
 
 
-def run(notifications, contacts=CONTACTS, *, tg=None, smtp=None):
+# 06:30 UTC is 09:30 in Asia/Riyadh (UTC+3, no DST): inside the client send window by default.
+NOW_IN_WINDOW = datetime(2026, 10, 11, 6, 30, tzinfo=timezone.utc)
+
+
+def run(notifications, contacts=CONTACTS, *, tg=None, smtp=None, now=NOW_IN_WINDOW):
     tg = tg or FakeTelegram()
     smtp = smtp or SMTPState()
     sleeps = []
@@ -158,6 +163,7 @@ def run(notifications, contacts=CONTACTS, *, tg=None, smtp=None):
         sleep=sleeps.append,
         http_transport=tg.transport,
         smtp_factory=smtp.factory,
+        now=now,
     )
     return results, tg, smtp, sleeps
 
@@ -322,7 +328,9 @@ def test_client_holding_on_open_then_followup_on_recovered():
     assert T.ARABIC_HOLDING_TEXT in client_msgs[0].get_content()
     assert "Client holding email sent." in tg.texts[0]
 
-    results2, tg2, smtp2, _ = run([note(recovered_of(FLOW_CRIT), "recovered")])
+    recovered_with_flag = recovered_of(FLOW_CRIT)
+    recovered_with_flag["client_holding_sent"] = True
+    results2, tg2, smtp2, _ = run([note(recovered_with_flag, "recovered")])
     assert ("client_email", "sent") in key_results(results2)
     followup_subject, _ = T.client_followup_email(lang="ar", store_name="Store X")
     client_msgs2 = [m for m in smtp2.messages if to_of(m) == CLIENT_EMAIL]
@@ -364,11 +372,13 @@ def test_contact_without_email_is_no_contact():
     assert all(to_of(m) != CLIENT_EMAIL for m in smtp.messages)
 
 
-def test_client_send_failure_is_reported_as_not_notified():
+def test_client_send_failure_is_reported_as_failed_not_no_contact():
     smtp = SMTPState(fail_to={CLIENT_EMAIL})
     results, tg, _, sleeps = run([note(FLOW_CRIT, "open")], smtp=smtp)
     assert ("client_email", "failed") in key_results(results)
     assert "Client holding email sent." not in tg.texts[0]
+    assert "Client holding email FAILED to send — contact the client manually." in tg.texts[0]
+    assert "no contact on file" not in tg.texts[0].lower()
     assert sleeps == [5.0]  # client email retried once; Telegram and admin email went out first try
 
 
@@ -423,11 +433,12 @@ def test_no_admin_email_address_skips_admin_email(monkeypatch):
     assert smtp.attempts == 0
 
 
-def test_no_smtp_env_skips_client_email(monkeypatch):
+def test_no_smtp_env_skips_client_email_and_marks_failed(monkeypatch):
     _clear_smtp(monkeypatch)
-    results, _, smtp, _ = run([note(FLOW_CRIT, "open")])
+    results, tg, smtp, _ = run([note(FLOW_CRIT, "open")])
     assert ("client_email", "skipped:not_configured") in key_results(results)
     assert smtp.attempts == 0
+    assert "Client holding email FAILED to send" in tg.texts[0]
 
 
 def test_invalid_smtp_port_is_treated_as_not_configured(monkeypatch):
@@ -494,6 +505,47 @@ def test_client_notified_flag_reflected_in_admin_text():
     assert "Client holding email sent." in tg_yes.texts[0]
     _, tg_no, _, _ = run([note(FLOW_CRIT, "open")], contacts={})
     assert "client not notified: no contact on file" in tg_no.texts[0].lower()
+    _, tg_failed, _, _ = run([note(FLOW_CRIT, "open")], smtp=SMTPState(fail_to={CLIENT_EMAIL}))
+    assert "FAILED to send" in tg_failed.texts[0]
+    assert "no contact on file" not in tg_failed.texts[0].lower()
+
+
+# ---------------------------------------------------------------------------
+# recovered follow-up gating (client_holding_sent)
+# ---------------------------------------------------------------------------
+
+def test_recovered_without_holding_sent_flag_sends_no_followup():
+    results, _, smtp, _ = run([note(recovered_of(FLOW_CRIT), "recovered")])
+    assert all(r["channel"] != "client_email" for r in results)
+    assert all(to_of(m) != CLIENT_EMAIL for m in smtp.messages)
+
+
+def test_recovered_with_holding_sent_flag_false_sends_no_followup():
+    inc = recovered_of(FLOW_CRIT)
+    inc["client_holding_sent"] = False
+    results, _, smtp, _ = run([note(inc, "recovered")])
+    assert all(r["channel"] != "client_email" for r in results)
+    assert all(to_of(m) != CLIENT_EMAIL for m in smtp.messages)
+
+
+def test_recovered_with_holding_sent_flag_true_sends_followup_once():
+    inc = recovered_of(FLOW_CRIT)
+    inc["client_holding_sent"] = True
+    results, tg, smtp, _ = run([note(inc, "recovered")])
+    assert ("client_email", "sent") in key_results(results)
+    client_msgs = [m for m in smtp.messages if to_of(m) == CLIENT_EMAIL]
+    assert len(client_msgs) == 1
+    followup_subject, _ = T.client_followup_email(lang="ar", store_name="Store X")
+    assert client_msgs[0]["Subject"] == followup_subject
+    assert "Client holding email sent." in tg.texts[0]
+
+
+def test_recovered_with_flag_true_but_no_contact_records_no_contact():
+    inc = recovered_of(FLOW_CRIT)
+    inc["client_holding_sent"] = True
+    results, tg, _, _ = run([note(inc, "recovered")], contacts={})
+    assert ("client_email", "skipped:no_contact") in key_results(results)
+    assert "client not notified: no contact on file" in tg.texts[0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -525,3 +577,144 @@ def test_failure_logs_carry_type_names_only(caplog):
     assert "SMTPServerDisconnected" in caplog.text
     assert "could not connect" not in caplog.text
     assert "auth failed" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# events: the five documented names
+# ---------------------------------------------------------------------------
+
+def test_documented_events_are_exactly_five():
+    assert set(D.EVENTS) == {"open", "reminder", "recovered", "client_holding", "client_followup"}
+    assert set(D.CLIENT_ONLY_EVENTS) == {"client_holding", "client_followup"}
+
+
+# ---------------------------------------------------------------------------
+# send window: 09:00 to 20:00 (20:00 exclusive) in the contact's tz, default Asia/Riyadh
+# ---------------------------------------------------------------------------
+
+def _utc(hour, minute=0):
+    return datetime(2026, 10, 11, hour, minute, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("utc_hour, utc_minute, sends", [
+    (5, 59, False),  # 08:59 Riyadh
+    (6, 0, True),    # 09:00 Riyadh, window opens
+    (16, 59, True),  # 19:59 Riyadh
+    (17, 0, False),  # 20:00 Riyadh, exclusive
+])
+def test_default_tz_send_window_edges(utc_hour, utc_minute, sends):
+    results, _, smtp, _ = run([note(FLOW_CRIT, "open")], now=_utc(utc_hour, utc_minute))
+    client_rows = [r for r in results if r["channel"] == "client_email"]
+    assert len(client_rows) == 1
+    if sends:
+        assert client_rows[0]["status"] == "sent"
+        assert any(to_of(m) == CLIENT_EMAIL for m in smtp.messages)
+    else:
+        assert client_rows[0]["status"] == "skipped:outside_hours"
+        assert all(to_of(m) != CLIENT_EMAIL for m in smtp.messages)
+
+
+def test_contact_without_tz_uses_default_riyadh():
+    contacts = {"GTM-1234567": {"email": CLIENT_EMAIL, "store_name": "Store X", "lang": "ar"}}
+    results, _, _, _ = run([note(FLOW_CRIT, "open")], contacts=contacts, now=_utc(18, 0))  # 21:00 Riyadh
+    assert ("client_email", "skipped:outside_hours") in key_results(results)
+
+
+def test_contact_tz_overrides_default():
+    london = {"GTM-1234567": {"email": CLIENT_EMAIL, "store_name": "Store X", "lang": "ar", "tz": "Europe/London"}}
+    results, _, smtp, _ = run([note(FLOW_CRIT, "open")], contacts=london, now=_utc(18, 0))  # 19:00 London
+    assert ("client_email", "sent") in key_results(results)
+    assert any(to_of(m) == CLIENT_EMAIL for m in smtp.messages)
+
+
+@pytest.mark.parametrize("tz_value", ["Mars/Olympus", "", "   "])
+def test_invalid_or_blank_tz_falls_back_to_default(tz_value):
+    contacts = {"GTM-1234567": {"email": CLIENT_EMAIL, "store_name": "Store X", "lang": "ar", "tz": tz_value}}
+    inside, _, _, _ = run([note(FLOW_CRIT, "open")], contacts=contacts, now=_utc(6, 30))  # 09:30 Riyadh
+    outside, _, _, _ = run([note(FLOW_CRIT, "open")], contacts=contacts, now=_utc(18, 0))  # 21:00 Riyadh
+    assert ("client_email", "sent") in key_results(inside)
+    assert ("client_email", "skipped:outside_hours") in key_results(outside)
+
+
+def test_naive_now_is_treated_as_utc():
+    results, _, _, _ = run([note(FLOW_CRIT, "open")], now=datetime(2026, 10, 11, 6, 30))
+    assert ("client_email", "sent") in key_results(results)
+
+
+def test_outside_window_sends_nothing_and_admin_text_says_nothing_about_client():
+    results, tg, smtp, _ = run([note(FLOW_CRIT, "open")], now=_utc(18, 0))
+    assert ("client_email", "skipped:outside_hours") in key_results(results)
+    assert ("telegram", "sent") in key_results(results)
+    text = tg.texts[0].lower()
+    assert "client holding" not in text
+    assert "client not notified" not in text
+    assert all(to_of(m) != CLIENT_EMAIL for m in smtp.messages)
+
+
+def test_outside_window_followup_is_skipped_and_retried_later_via_client_followup():
+    inc = dict(FLOW_CRIT, client_holding_sent=True)
+    outside, _, smtp_out, _ = run([note(inc, "client_followup")], now=_utc(18, 0))
+    assert key_results(outside) == [("client_email", "skipped:outside_hours")]
+    assert smtp_out.attempts == 0
+    inside, _, smtp_in, _ = run([note(inc, "client_followup")], now=_utc(6, 30))
+    assert key_results(inside) == [("client_email", "sent")]
+
+
+# ---------------------------------------------------------------------------
+# client-only events: no admin rows, no admin messages
+# ---------------------------------------------------------------------------
+
+def test_client_holding_event_sends_only_the_client_email():
+    results, tg, smtp, _ = run([note(FLOW_CRIT, "client_holding")])
+    assert key_results(results) == [("client_email", "sent")]
+    assert tg.urls == []
+    assert [to_of(m) for m in smtp.messages] == [CLIENT_EMAIL]
+
+
+def test_client_followup_requires_holding_sent_flag():
+    results, tg, smtp, _ = run([note(FLOW_CRIT, "client_followup")])
+    assert results == []
+    assert tg.urls == []
+    assert smtp.attempts == 0
+
+
+def test_client_followup_with_flag_sends_only_the_followup_email():
+    inc = dict(FLOW_CRIT, client_holding_sent=True)
+    results, tg, smtp, _ = run([note(inc, "client_followup")])
+    assert key_results(results) == [("client_email", "sent")]
+    assert tg.urls == []
+    followup_subject, _ = T.client_followup_email(lang="ar", store_name="Store X")
+    assert [to_of(m) for m in smtp.messages] == [CLIENT_EMAIL]
+    assert smtp.messages[0]["Subject"] == followup_subject
+
+
+def test_client_only_events_need_crit_flow_stalled_and_contact():
+    results, _, _, _ = run([note(FLOW_CRIT, "client_holding")], contacts={})
+    assert key_results(results) == [("client_email", "skipped:no_contact")]
+    warn = dict(FLOW_CRIT, severity="WARN")
+    results_warn, tg_warn, smtp_warn, _ = run([note(warn, "client_holding")])
+    assert results_warn == [] and tg_warn.urls == [] and smtp_warn.attempts == 0
+
+
+# ---------------------------------------------------------------------------
+# only flow_stalled ever produces a client row
+# ---------------------------------------------------------------------------
+
+SENTINEL_CRIT = {
+    "incident_key": "sentinel:error", "severity": "CRIT", "state": "open", "kind": "sentinel_error",
+    "exhaustion_kind": None, "scope": "container", "container_id": "GTM-1234567",
+    "last_successful_step": None, "providers": [], "http_status": None,
+    "opened_at": "2026-10-11T10:00:00Z", "timestamp": "2026-10-11T10:00:00Z", "count": 1,
+}
+
+
+@pytest.mark.parametrize("event", ["open", "reminder", "recovered", "client_holding", "client_followup"])
+@pytest.mark.parametrize("base", [
+    dict(ROUTER_CRIT, container_id="GTM-1234567"),
+    SENTINEL_CRIT,
+])
+def test_non_flow_kinds_never_produce_client_rows(event, base):
+    inc = dict(base, client_holding_sent=True)  # even with the flag and a contact on file
+    results, _, smtp, _ = run([note(inc, event)])
+    assert all(r["channel"] != "client_email" for r in results)
+    assert all(to_of(m) != CLIENT_EMAIL for m in smtp.messages)

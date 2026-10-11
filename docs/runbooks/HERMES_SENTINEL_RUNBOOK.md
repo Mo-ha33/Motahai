@@ -127,7 +127,8 @@ Format (JSON, double quotes, no trailing commas):
   "GTM-XXXXXXX": {
     "email": "<CLIENT_EMAIL>",
     "store_name": "<STORE_NAME>",
-    "lang": "ar"
+    "lang": "ar",
+    "tz": "Asia/Riyadh"
   }
 }
 ```
@@ -135,6 +136,9 @@ Format (JSON, double quotes, no trailing commas):
 - `email` is the address that receives client messages.
 - `store_name` is the store's display name.
 - `lang` is the language code for the client message, for example `ar`.
+- `tz` is the client's timezone as an IANA name. It is optional and defaults to `Asia/Riyadh`. Client
+  messages are sent only between 09:00 and 20:00 in this timezone. Outside those hours the sentinel
+  waits and sends them later, when the window opens. An unknown name falls back to the default.
 
 If a GTM container has no entry, no client email is sent. The admin alert says
 `client not notified: no contact on file`. That is the correct behaviour, not an error. Add the entry
