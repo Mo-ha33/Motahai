@@ -776,6 +776,18 @@ def apply_container_spec(service, public_container_id: str, container_spec: str,
 # ---------------------------------------------------------------------------------------------------------
 # T4 - create a version and publish it
 # ---------------------------------------------------------------------------------------------------------
+def build_version_note(approved_by_token: bool = True) -> str:
+    """Honest GTM container-version note: states only what the code verifies (a human-issued D-003 token was
+    checked) and what it does not (PII and Consent Mode are not checked here). Contains no token, secret or
+    customer data. create_and_publish_version is called only after the D-003 gate in consultation.py has passed,
+    so the approval statement is true. consultation.build_version_note delegates here."""
+    if approved_by_token:
+        return ("Published by Tariq (Motahai) via GTM API v2 after a human operator approved this container and "
+                "workspace (D-003 single-use token). Not independently verified for PII or Consent Mode.")
+    return ("Published by Tariq (Motahai) via GTM API v2. No human approval token was recorded. "
+            "Not independently verified for PII or Consent Mode.")
+
+
 def create_and_publish_version(service, account_id: str, container_id: str, workspace_id: str,
                                version_name: str) -> Dict[str, Any]:
     """create_version -> validate the response -> publish. Never publishes a version with a compiler/merge error."""
@@ -785,7 +797,7 @@ def create_and_publish_version(service, account_id: str, container_id: str, work
         # num_retries=0 on create_version/publish: a 5xx after the server acted is ambiguous; never double-create a version.
         version_res = _execute(service.accounts().containers().workspaces().create_version(
             path=parent_ws,
-            body={"name": version_name, "notes": "Released via Hermes GTM cloud API v2 after human (D-003) approval."},
+            body={"name": version_name, "notes": build_version_note(approved_by_token=True)},
         ), num_retries=0) or {}
     except Exception as exc:  # noqa: BLE001
         return {**classify_gtm_error(exc), **base}
