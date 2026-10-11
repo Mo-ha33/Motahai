@@ -195,9 +195,38 @@ def _gtm_json(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+# In-process map numeric container id -> public GTM-ID, filled by verify/apply. Publish takes only the numeric id,
+# so this is how its flow record is named. Bounded, never persisted, never invalidated (the resolve cache is dropped
+# on apply, which would lose the mapping before publish runs).
+_CONTAINER_IDS: Dict[str, str] = {}
+_CONTAINER_IDS_LOCK = threading.Lock()
+_CONTAINER_IDS_MAX = 500
+
+
+def _remember_container(numeric_id: Any, public_id: str) -> None:
+    with _CONTAINER_IDS_LOCK:
+        _CONTAINER_IDS.pop(str(numeric_id), None)
+        _CONTAINER_IDS[str(numeric_id)] = public_id
+        while len(_CONTAINER_IDS) > _CONTAINER_IDS_MAX:
+            del _CONTAINER_IDS[next(iter(_CONTAINER_IDS))]
+
+
+def _public_id_for(numeric_id: Any) -> Optional[str]:
+    """Public GTM-ID for a numeric container id seen by verify/apply in this process (None otherwise)."""
+    with _CONTAINER_IDS_LOCK:
+        return _CONTAINER_IDS.get(str(numeric_id))
+
+
 def _flow_record(step: str, public_id: Any, out: str) -> str:
     """Best-effort sentinel flow-state record (T1). Never raises and returns `out` unchanged."""
     try:
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict) and data.get("status") in ("CONNECTED", "applied") \
+                    and data.get("container_id") and isinstance(public_id, str):
+                _remember_container(data["container_id"], public_id)
+        except ValueError:
+            pass
         try:
             from .sentinel import flow_state
         except ImportError:  # standalone load: same file-path fallback as _gtm_api()
@@ -214,20 +243,6 @@ def _flow_record(step: str, public_id: Any, out: str) -> str:
     except Exception:  # noqa: BLE001 - recording must never change a tool's result
         pass
     return out
-
-
-def _public_id_for(numeric_id: Any) -> Optional[str]:
-    """Public GTM-ID for a numeric container id, from the verify_access resolve cache (None if not cached)."""
-    try:
-        for path in _gtm_api()._cache_dir().glob("GTM-*.json"):
-            try:
-                if str(json.loads(path.read_text(encoding="utf-8"))["result"].get("container_id")) == str(numeric_id):
-                    return path.stem
-            except Exception:  # noqa: BLE001 - one unreadable cache file is a miss
-                continue
-    except Exception:  # noqa: BLE001
-        pass
-    return None
 
 
 def _gtm_service(scopes: List[str]):

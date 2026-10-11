@@ -61,7 +61,7 @@ FULL_TABLE = [
     ("verify_access", "SCOPE_INSUFFICIENT", "operator"),
     ("verify_access", "UNKNOWN", "operator"),
     # workspace_apply
-    ("workspace_apply", "applied", "agent"),
+    ("workspace_apply", "applied", "human"),
     ("workspace_apply", "LINT_FAILED", "agent"),
     ("workspace_apply", "RETRYABLE", "agent"),
     ("workspace_apply", "RETRYABLE_QUOTA", "operator"),
@@ -150,7 +150,7 @@ def test_deadline_default_is_300_seconds(tmp_path):
 
 def test_deadline_env_override(tmp_path, monkeypatch):
     monkeypatch.setenv("SENTINEL_FLOW_DEADLINE_S", "60")
-    F.record(GTM, "workspace_apply", "applied", now=NOW)
+    F.record(GTM, "workspace_apply", "LINT_FAILED", now=NOW)
     assert _read(tmp_path)["deadline"] == "2026-10-11T12:01:00Z"
 
 
@@ -169,10 +169,24 @@ def test_seq_increments_per_container(tmp_path):
     assert _read(tmp_path)["seq"] == 3
 
 
-def test_seq_restarts_safely_when_file_is_corrupt(tmp_path):
+def test_corrupt_flow_file_takes_time_based_seq(tmp_path, monkeypatch):
     _flow_file(tmp_path).parent.mkdir(parents=True)
     _flow_file(tmp_path).write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(F.time, "time", lambda: 1800000000.9)
+    assert F.record(GTM, "verify_access", "CONNECTED", now=NOW)["seq"] == 1800000000
+    assert _read(tmp_path)["seq"] == 1800000000
+
+
+def test_missing_flow_file_starts_at_one_not_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(F.time, "time", lambda: 1800000000.9)
     assert F.record(GTM, "verify_access", "CONNECTED", now=NOW)["seq"] == 1
+
+
+def test_file_without_seq_counts_as_corrupt(tmp_path, monkeypatch):
+    _flow_file(tmp_path).parent.mkdir(parents=True)
+    _flow_file(tmp_path).write_text('{"container": "GTM-ABC1234"}', encoding="utf-8")
+    monkeypatch.setattr(F.time, "time", lambda: 1800000000.0)
+    assert F.record(GTM, "verify_access", "CONNECTED", now=NOW)["seq"] == 1800000000
 
 
 def test_stored_fields_are_only_the_contract(tmp_path):
@@ -335,14 +349,6 @@ def verify_key(monkeypatch):
     monkeypatch.setenv("HITL_VERIFY_PUBLIC_KEY", base64.urlsafe_b64encode(pub).rstrip(b"=").decode())
 
 
-def _write_resolve_cache(tmp_path, public_id, numeric):
-    cache = tmp_path / "gtm-cache"
-    cache.mkdir(exist_ok=True)
-    (cache / f"{public_id}.json").write_text(json.dumps(
-        {"ts": time.time(), "result": {"status": "CONNECTED", "public_id": public_id, "container_id": numeric}}),
-        encoding="utf-8")
-
-
 def _patch_verify_ok(monkeypatch, consultation):
     api = consultation._gtm_api()
     monkeypatch.setattr(consultation, "_gtm_service", lambda scopes: (object(), None))
@@ -380,17 +386,19 @@ def test_apply_hook_records_applied_and_lint_failed(tmp_path, monkeypatch, consu
     api = consultation._gtm_api()
     monkeypatch.setattr(api, "apply_container_spec", lambda svc, cid, spec: {"status": "applied", "workspace_id": "7"})
     tools["hermes_gtm_workspace_apply"](public_container_id=GTM, container_spec="{}")
-    assert (_read(tmp_path)["outcome"], _read(tmp_path)["owed_by"]) == ("applied", "agent")
+    assert (_read(tmp_path)["outcome"], _read(tmp_path)["owed_by"]) == ("applied", "human")
 
     monkeypatch.setattr(api, "apply_container_spec", lambda svc, cid, spec: {
         "status": "error", "reason_code": "LINT_FAILED", "audience": "operator", "retryable": False})
     tools["hermes_gtm_workspace_apply"](public_container_id=GTM, container_spec="{}")
     data = _read(tmp_path)
     assert (data["outcome"], data["owed_by"], data["seq"]) == ("LINT_FAILED", "agent", 2)
+    assert data["deadline"] is not None
 
 
-def test_publish_refusal_records_human_when_container_is_cached(tmp_path, consultation, tools, verify_key):
-    _write_resolve_cache(tmp_path, GTM, "555")
+def test_publish_refusal_records_human_after_verify(tmp_path, monkeypatch, consultation, tools, verify_key):
+    _patch_verify_ok(monkeypatch, consultation)
+    tools["hermes_gtm_verify_access"](public_container_id=GTM)
     out = tools["hermes_gtm_cloud_publish"](account_id="111", container_id="555", workspace_id="2")
     assert json.loads(out)["status"] == "AWAITING_HITL_APPROVAL"
     data = _read(tmp_path)
@@ -400,21 +408,46 @@ def test_publish_refusal_records_human_when_container_is_cached(tmp_path, consul
 
 def test_publish_without_key_config_records_operator(tmp_path, consultation, tools, monkeypatch):
     monkeypatch.delenv("HITL_VERIFY_PUBLIC_KEY", raising=False)
-    _write_resolve_cache(tmp_path, GTM, "555")
+    _patch_verify_ok(monkeypatch, consultation)
+    tools["hermes_gtm_verify_access"](public_container_id=GTM)
     out = tools["hermes_gtm_cloud_publish"](account_id="111", container_id="555", workspace_id="2")
     assert json.loads(out)["status"] == "AWAITING_HITL_APPROVAL"
     assert (_read(tmp_path)["outcome"], _read(tmp_path)["owed_by"]) == ("HITL_KEY_NOT_CONFIGURED", "operator")
 
 
-def test_publish_success_records_none(tmp_path, monkeypatch, consultation, tools):
-    _write_resolve_cache(tmp_path, GTM, "555")
-    monkeypatch.setattr(consultation, "_hitl_gate", lambda *a, **k: None)
-    monkeypatch.setattr(consultation, "_gtm_service", lambda scopes: (object(), None))
-    monkeypatch.setattr(consultation._gtm_api(), "create_and_publish_version", lambda *a, **k: {
+def test_verify_apply_publish_chain_ends_none(tmp_path, monkeypatch, consultation, tools):
+    _patch_verify_ok(monkeypatch, consultation)
+    api = consultation._gtm_api()
+    monkeypatch.setattr(api, "apply_container_spec", lambda svc, cid, spec: {
+        "status": "applied", "container_id": "555", "workspace_id": "7"})
+    monkeypatch.setattr(api, "create_and_publish_version", lambda *a, **k: {
         "status": "success", "account_id": "111", "container_id": "555", "live_version_id": "9"})
-    tools["hermes_gtm_cloud_publish"](account_id="111", container_id="555", workspace_id="2")
+    monkeypatch.setattr(consultation, "_hitl_gate", lambda *a, **k: None)
+
+    tools["hermes_gtm_verify_access"](public_container_id=GTM)
+    tools["hermes_gtm_workspace_apply"](public_container_id=GTM, container_spec="{}")
+    applied = _read(tmp_path)
+    assert (applied["outcome"], applied["owed_by"], applied["deadline"]) == ("applied", "human", None)
+
+    tools["hermes_gtm_cloud_publish"](account_id="111", container_id="555", workspace_id="7")
     data = _read(tmp_path)
-    assert (data["outcome"], data["owed_by"], data["deadline"]) == ("published", "none", None)
+    assert (data["step"], data["outcome"], data["owed_by"], data["deadline"], data["seq"]) == (
+        "cloud_publish", "published", "none", None, 3)
+    assert data["container"] == GTM
+
+
+def test_container_map_is_bounded_and_not_persisted(tmp_path, monkeypatch, consultation, tools):
+    for n in range(consultation._CONTAINER_IDS_MAX + 25):
+        consultation._remember_container(str(100000 + n), f"GTM-A{n:06d}")
+    assert len(consultation._CONTAINER_IDS) == consultation._CONTAINER_IDS_MAX
+    assert consultation._public_id_for("100000") is None          # oldest evicted
+    assert consultation._public_id_for(str(100000 + consultation._CONTAINER_IDS_MAX + 24)) is not None
+    _patch_verify_ok(monkeypatch, consultation)
+    tools["hermes_gtm_verify_access"](public_container_id=GTM)
+    assert consultation._public_id_for("555") == GTM
+    root = tmp_path / "sentinel"
+    written = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    assert written == [f"flow/{GTM}.json"]                         # only the flow record, no mapping file
 
 
 def test_publish_without_cached_public_id_writes_nothing(tmp_path, consultation, tools, verify_key):
@@ -427,8 +460,8 @@ def _run_all_tools(monkeypatch, consultation, tools, verify_key_env=True):
     """Calls the three GTM tools with deterministic fakes; returns their raw return values."""
     api = consultation._gtm_api()
     monkeypatch.setattr(consultation, "_gtm_service", lambda scopes: (object(), None))
-    monkeypatch.setattr(api, "verify_access", lambda svc, cid: {"status": "CONNECTED", "public_id": cid})
-    monkeypatch.setattr(api, "apply_container_spec", lambda svc, cid, spec: {"status": "applied"})
+    monkeypatch.setattr(api, "verify_access", lambda svc, cid: {"status": "CONNECTED", "public_id": cid, "container_id": "555"})
+    monkeypatch.setattr(api, "apply_container_spec", lambda svc, cid, spec: {"status": "applied", "container_id": "555"})
     monkeypatch.setattr(api, "create_and_publish_version", lambda *a, **k: {"status": "success"})
     monkeypatch.setattr(consultation, "_hitl_gate", lambda *a, **k: None)
     return [
@@ -440,7 +473,6 @@ def _run_all_tools(monkeypatch, consultation, tools, verify_key_env=True):
 
 
 def test_hook_does_not_change_return_values_when_record_raises(tmp_path, monkeypatch, consultation, tools):
-    _write_resolve_cache(tmp_path, GTM, "555")
     baseline = _run_all_tools(monkeypatch, consultation, tools)
     flow = sys.modules["hermes_sentinel_flow_state"]
 
@@ -455,7 +487,6 @@ def test_hook_does_not_change_return_values_when_record_raises(tmp_path, monkeyp
 
 
 def test_hook_does_not_change_return_values_when_loader_fails(tmp_path, monkeypatch, consultation, tools):
-    _write_resolve_cache(tmp_path, GTM, "555")
     baseline = _run_all_tools(monkeypatch, consultation, tools)
 
     def no_loader(*a, **k):
