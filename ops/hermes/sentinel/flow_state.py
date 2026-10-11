@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -42,7 +43,7 @@ _EXPLICIT: Dict[Tuple[str, str], str] = {
     ("verify_access", "RETRYABLE"): AGENT,               # Google 5xx: transient, the agent may retry
     ("verify_access", "RETRYABLE_QUOTA"): OPERATOR,      # Tag Manager quota: operator-side, not an agent retry
     # workspace_apply (gtm_api.apply_container_spec / hermes_gtm_workspace_apply)
-    ("workspace_apply", "applied"): AGENT,
+    ("workspace_apply", "applied"): HUMAN,               # next GTM call needs the operator's D-003 token; no deadline
     ("workspace_apply", "LINT_FAILED"): AGENT,           # the agent fixes the spec and re-applies
     ("workspace_apply", "RETRYABLE"): AGENT,
     ("workspace_apply", "RETRYABLE_QUOTA"): OPERATOR,
@@ -120,15 +121,19 @@ def _iso(when: datetime) -> str:
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _previous_seq(path: Path) -> int:
+def _next_seq(path: Path) -> int:
+    """Previous seq + 1. A missing file starts at 1. An unreadable or corrupt file gets int(time.time()) instead,
+    so a new flow:<id>:<seq> incident key cannot collide with one written before the corruption."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         seq = data.get("seq") if isinstance(data, dict) else None
         if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0:
-            return seq
+            return seq + 1
+    except FileNotFoundError:
+        return 1
     except (OSError, ValueError):
         pass
-    return 0
+    return int(time.time())
 
 
 def _ensure_private_dir(path: Path) -> None:
@@ -176,7 +181,7 @@ def record(container: Any, step: Any, outcome: Any, now: Optional[datetime] = No
                 "owed_by": owed,
                 "deadline": deadline,
                 "updated_at": _iso(when),
-                "seq": _previous_seq(path) + 1,
+                "seq": _next_seq(path),
             }
             _atomic_write_json(path, payload)
         return payload
