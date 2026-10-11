@@ -141,7 +141,11 @@ HttpCaller = Callable[[str, str, Dict[str, str], Optional[bytes], float], Tuple[
 
 
 def _is_loopback_host(host: str) -> bool:
-    """True for localhost, *.localhost, any 127.0.0.0/8 address, and ::1 (brackets already stripped)."""
+    """True for localhost, *.localhost, 127.0.0.0/8, ::1, and the unspecified addresses 0.0.0.0 / ::.
+
+    The unspecified addresses are included because on Linux they reach the local host.
+    Brackets are already stripped by urlsplit().hostname.
+    """
     name = host.rstrip(".").lower()
     if name == "localhost" or name.endswith(".localhost"):
         return True
@@ -151,7 +155,7 @@ def _is_loopback_host(host: str) -> bool:
         return False
     if ip.version == 6 and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    return ip.is_loopback
+    return ip.is_loopback or ip.is_unspecified
 
 
 def _validate_core_url(raw: str) -> Optional[str]:
@@ -169,7 +173,7 @@ def _validate_core_url(raw: str) -> Optional[str]:
         return "MOTAHAI_CORE_URL must be an absolute http or https URL with a host."
     if port == _RESERVED_LOOPBACK_PORT and _is_loopback_host(host):
         return (
-            "MOTAHAI_CORE_URL points at a loopback address on port 8000, which is reserved "
+            "MOTAHAI_CORE_URL points at a loopback or unspecified address on port 8000, which is reserved "
             "for another product on this host (SmartCafe). Set it to the Motahai Core address."
         )
     return None

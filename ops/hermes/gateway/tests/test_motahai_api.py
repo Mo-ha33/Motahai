@@ -190,6 +190,9 @@ def test_blank_values_are_not_configured_and_make_no_call(monkeypatch, blank):
         "http://localhost:8000/",
         "http://LOCALHOST:8000",
         "http://[::1]:8000",
+        "http://0.0.0.0:8000",
+        "http://[::]:8000",
+        "http://[::ffff:127.0.0.1]:8000",
         "ftp://core.test",
         "not a url",
         "http://core.test:notaport",
@@ -216,7 +219,7 @@ def test_reserved_port_refusal_explains_the_reason(monkeypatch):
     assert "127.0.0.1" not in out["detail"]
 
 
-@pytest.mark.parametrize("ok_url", ["http://127.0.0.1:8080", "https://core.example.com"])
+@pytest.mark.parametrize("ok_url", ["http://127.0.0.1:8080", "http://0.0.0.0:8080", "https://core.example.com"])
 def test_allowed_core_url_makes_call(monkeypatch, ok_url):
     monkeypatch.setenv("MOTAHAI_CORE_URL", ok_url)
     monkeypatch.setenv("MOTAHAI_TENANT_API_KEY", API_KEY)
