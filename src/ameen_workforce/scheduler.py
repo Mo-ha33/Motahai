@@ -9,6 +9,7 @@ Handles periodic maintenance and conversion pipeline duties:
   4. merge_pending_captures(): Merges pending storefront captures into their orders (lazy import from
      `capture`; the job is recorded as skipped when that module is not available).
   5. Heartbeat / health check tracking into the `job_runs` table so operators know the scheduler is alive.
+  6. replay_staged_webhooks(): Replays verified webhooks whose background task was lost or failed (webhook_staging.py).
 
 Execution modes:
   - Standalone daemon (production): `python -m ameen_workforce.scheduler` runs run_daemon(), one
@@ -37,8 +38,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from .capi_service import capi_sender
 from .checkout_context import purge_expired_checkout_context
 from .digest import send_weekly_digests, sender_from_env
-from .db import JobRun, get_session_factory, init_db, session_scope, utcnow
+from .audiences import export_tenant_audiences
+from .db import JobRun, Tenant, get_session_factory, init_db, session_scope, utcnow
 from .order_pipeline import retry_failed_events, send_due_events
+from .webhook_staging import replay_staged_webhooks
 
 logger = logging.getLogger("ameen_workforce.scheduler")
 
@@ -49,6 +52,9 @@ SEND_JOB_NAME = "send_due_events"
 MERGE_JOB_NAME = "merge_pending_captures"
 DIGEST_JOB_NAME = "send_weekly_digests"
 HEARTBEAT_JOB_NAME = "scheduler_heartbeat"
+AUDIENCE_EXPORT_JOB_NAME = "export_weekly_audiences"
+AUDIENCE_EXPORT_INTERVAL = timedelta(days=7)
+REPLAY_JOB_NAME = "replay_staged_webhooks"
 
 
 class SchedulerStale(RuntimeError):
@@ -125,6 +131,8 @@ async def run_scheduler_tick(
 ) -> Dict[str, Any]:
     """
     Executes one full iteration of the background jobs:
+      0. replay_staged_webhooks (webhooks whose background task was lost or failed; first, so a replayed delivery's
+         conversion can be sent by step 1 in the same tick)
       1. send_due_events (dispatches settled conversions)
       2. retry_failed_events (retries failed CAPI requests)
       3. purge_expired_checkout_context (purges encrypted IP/UA older than 14 days)
@@ -146,6 +154,11 @@ async def run_scheduler_tick(
         "jobs": {},
     }
 
+    summary["jobs"][REPLAY_JOB_NAME] = await _run_job(
+        factory, REPLAY_JOB_NAME,
+        lambda s, t: replay_staged_webhooks(s, now=t, sender=sender),
+        now,
+    )
     summary["jobs"][SEND_JOB_NAME] = await _run_job(
         factory, SEND_JOB_NAME,
         lambda s, t: send_due_events(s, now=t, sender=sender, limit=due_limit),
@@ -198,12 +211,47 @@ async def run_scheduler_tick(
         logger.exception("Scheduler job %s failed: %s", HEARTBEAT_JOB_NAME, err_name)
         summary["jobs"][HEARTBEAT_JOB_NAME] = {"ok": False, "error_type": err_name}
 
+    # Weekly audience export (M3-4): runs once per 7 days; added after the heartbeat so it does not change its counts.
+    if _audience_export_due(factory, tick_start):
+        summary["jobs"][AUDIENCE_EXPORT_JOB_NAME] = await _run_job(
+            factory, AUDIENCE_EXPORT_JOB_NAME, lambda s, t: _audience_export_counts(s, t), now)
+
     summary["tick_finished_at"] = (now or utcnow()).isoformat()
     return summary
 
 
 def _purge_counts(session: Session, now: datetime) -> Dict[str, int]:
     return {"purged_count": purge_expired_checkout_context(session, now=now)}
+
+
+def _audience_export_due(factory: sessionmaker, now: datetime) -> bool:
+    with session_scope(factory) as session:
+        last = session.scalar(select(JobRun.finished_at).where(
+            JobRun.job_name == AUDIENCE_EXPORT_JOB_NAME, JobRun.ok.is_(True)).order_by(JobRun.id.desc()).limit(1))
+    if last is None:
+        return True
+    if last.tzinfo is None and now.tzinfo is not None:
+        last = last.replace(tzinfo=now.tzinfo)
+    return now - last >= AUDIENCE_EXPORT_INTERVAL
+
+
+def _audience_export_counts(session: Session, now: datetime) -> Dict[str, Any]:
+    """Exports hashed audiences for every active tenant. Counts only; one tenant's failure does not stop the rest."""
+    from .operator_routes import audience_export_dir
+    out_dir = audience_export_dir()
+    counts: Dict[str, Any] = {"tenants": 0, "failed": 0, "exclude_refusers": 0, "seed_delivered_buyers": 0}
+    for tenant_id in session.scalars(select(Tenant.id).where(Tenant.active.is_(True)).order_by(Tenant.id)).all():
+        try:
+            res = export_tenant_audiences(session, tenant_id, out_dir, now=now)
+        except Exception as exc:
+            session.rollback()
+            logger.error("Audience export failed for tenant %s: %s", tenant_id, type(exc).__name__)
+            counts["failed"] += 1
+            continue
+        counts["tenants"] += 1
+        counts["exclude_refusers"] += res["exclude_refusers_count"]
+        counts["seed_delivered_buyers"] += res["seed_delivered_buyers_count"]
+    return counts
 
 
 def _digest_counts(session: Session, now: datetime, digest_sender) -> Dict[str, Any]:

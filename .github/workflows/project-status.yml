@@ -1,0 +1,44 @@
+# Sets the Status field of issues on the project board
+# https://github.com/users/Mo-ha33/projects/3
+# Requires repo secret ADD_TO_PROJECT_PAT: a classic PAT with `project` and `repo` scopes.
+# Logic lives in .github/scripts/project_status.py; this file only wires up triggers and env.
+name: Project board status
+
+on:
+  workflow_dispatch:
+    inputs:
+      items:
+        description: 'Issue numbers and Status names, e.g. 24=Done,26=In Progress,33=Todo'
+        required: true
+        type: string
+  issues:
+    types: [closed, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  set-status:
+    runs-on: ubuntu-latest
+    env:
+      HAS_PAT: ${{ secrets.ADD_TO_PROJECT_PAT != '' }}
+    steps:
+      - name: Skip when ADD_TO_PROJECT_PAT is not configured
+        if: env.HAS_PAT != 'true'
+        run: echo "::notice::ADD_TO_PROJECT_PAT secret not set; skipping project status update."
+      - name: Check out repository
+        if: env.HAS_PAT == 'true'
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Set project Status
+        if: env.HAS_PAT == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          REPO: ${{ github.repository }}
+          ITEMS: ${{ inputs.items }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: python3 .github/scripts/project_status.py

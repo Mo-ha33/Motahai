@@ -43,5 +43,6 @@ screenshots/
 Thumbs.db
 .claude/
 .antigravity/
-deliverables/*.mp4
-video_build_cache/
+
+# generated exports (audience CSVs etc.)
+out/

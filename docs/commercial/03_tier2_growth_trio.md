@@ -1,16 +1,21 @@
 # 03. Tier 2: "The Core Growth Trio" (باقة فريق التتبع والأداء — 3 AI Employees)
 
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
+
 ## 1. Overview & Strategic Role
 - **Tier Name:** The Core Growth Trio (`باقة فريق التتبع والأداء`)
 - **Assigned AI Employees:**
   1. `Lead GTM Orchestrator` (`LO` / `lead-gtm-orchestrator`) — Supervisor & Workflow Dispatcher.
   2. `Auto-Fix Engineer` (`AF` / `auto-fix-engineer`) — Container Sanitation & Code Injection Specialist.
   3. `Pixel & CAPI Specialist` (`PC` / `pixel-capi-specialist`) — Attribution, Consent Mode & Server-Side Cloud Gateway Specialist.
-- **Core Value Proposition:** End-to-end attribution recovery across both client-side and server-side infrastructures. Fixes signal degradation, optimizes Meta Event Match Quality (EMQ), and prevents double-firing ads through guaranteed deduplication.
+- **Core Value Proposition:** End-to-end attribution recovery across both client-side and server-side infrastructures. Fixes signal degradation, improves Meta match keys (hashed identifiers, `_fbp`/`_fbc`, checkout IP/UA), and sends Meta the COD signal ladder (`ConfirmedOrder`, `DeliveredPurchase`) so ads optimize on orders that are confirmed and delivered.
 - **Positioning Hook (English):**  
-  > *"Stop burning 20% of your ad spend on blind algorithms. Hire a dedicated 3-agent tracking department to restore Meta CAPI, maximize EMQ, and automate server-side attribution."*
+  > *"Stop burning 20% of your ad spend on blind algorithms. Hire a dedicated 3-agent tracking department to restore Meta CAPI and tell Meta which orders were actually confirmed and delivered."*
 - **Positioning Hook (Arabic):**  
-  > *"لا تترك خوارزميات الإعلانات تعمل في الظلام وتفقد 20% من مبيعاتك. وظّف فريقاً مؤلفاً من 3 خبراء ذكاء اصطناعي لإدارة التتبع السحابي (CAPI)، ورفع كفاءة التوفيق الإعلاني (EMQ) وتفادي التكرار نهائياً."*
+  > *"لا تترك خوارزميات الإعلانات تعمل في الظلام وتفقد 20% من مبيعاتك. وظّف فريقاً مؤلفاً من 3 خبراء ذكاء اصطناعي لإدارة التتبع السحابي (CAPI)، وإخبار Meta بالطلبات التي تأكدت وسُلّمت فعلاً."*
 
 ---
 
@@ -56,8 +61,8 @@
 2. **Auto-Fix Engineer:**
    - Cleans browser-side GTM containers, configures standardized dataLayer triggers, removes PII, and applies consent default states.
 3. **Pixel & CAPI Specialist:**
-   - Provisions and configures Server-Side GTM containers (or Cloudflare Worker / AWS Stape gateways).
-   - Generates and enforces unique `event_id` keys shared between browser tags and server payload requests.
+   - Runs the Meta CAPI COD signal ladder from Motahai Core (deterministic `confirmed_<id>` / `delivered_<id>` event ids).
+   - _Not built:_ provisioning server-side GTM containers (Cloudflare Worker / Stape gateways) and browser/server `event_id` binding for the native `Purchase`.
    - Sets up advanced user matching parameters (hashed `em`, `ph`, `fn`, `ln`, `ct`, `zp`, `fbp`, `fbc`).
 
 ---
@@ -66,8 +71,8 @@
 
 | Target Metric | Baseline / Typical Client | Guaranteed Trio Outcome |
 |---|:---:|:---:|
-| **Meta Event Match Quality (EMQ)** | 4.0 – 6.2 / 10 | **8.5+ / 10** |
-| **CAPI vs. Browser Deduplication Rate** | 60% – 80% (or unlinked) | **> 98.5%** |
+| **Meta Event Match Quality (EMQ)** | Measured per client | Reported, not guaranteed (no EMQ measured on a Motahai pilot yet) |
+| **Deduplication** | Varies | One send per order and event (deterministic `event_id`). No browser/server parity figure: Motahai never sends `Purchase` |
 | **Consent Mode v2 Compliance** | Partially missing / Unverified | **100% Certified v2 Integration** |
 | **Signal Recovery (Safari/ITP)** | +0% | **+18% to +26% Tracked Conversions** |
 | **Tracking Health Check Frequency** | Occasional / Never | **Daily Automated Health Check** |

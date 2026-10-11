@@ -445,14 +445,14 @@ def test_cli_verify_ping_with_test_event_code_sends_connection_test(cli_db, monk
 
 
 def test_cli_courier_secret_flags_store_credentials_of_the_right_kinds(cli_db, capsys):
-    assert main(BASE_CLI_ARGS + ["--bosta-webhook-secret", "BOSTA_SECRET_VALUE",
+    assert main(BASE_CLI_ARGS + ["--bosta-webhook-secret", "BOSTA_SECRET_VALUE_long_enough_123",
                                  "--oto-webhook-secret", "OTO_SECRET_VALUE", "--json"]) == 0
 
     tenant = get_tenant_by_shop_domain(cli_db, "cli-store.myshopify.com")
-    assert get_credential(cli_db, tenant.id, "bosta_webhook_secret") == "BOSTA_SECRET_VALUE"
+    assert get_credential(cli_db, tenant.id, "bosta_webhook_secret") == "BOSTA_SECRET_VALUE_long_enough_123"
     assert get_credential(cli_db, tenant.id, "oto_webhook_secret") == "OTO_SECRET_VALUE"
     out = capsys.readouterr().out
-    assert "BOSTA_SECRET_VALUE" not in out and "OTO_SECRET_VALUE" not in out
+    assert "BOSTA_SECRET_VALUE_long_enough_123" not in out and "OTO_SECRET_VALUE" not in out
 
 
 def test_cli_generate_courier_secrets_prints_once_and_never_logs(cli_db, caplog, capsys):
@@ -499,7 +499,7 @@ BASE_NO_TOKEN_ARGS = [
     "--meta-dataset-id", "999888777",
 ]
 FILE_TOKEN = "FILE_META_TOKEN_0001"
-FILE_BOSTA = "FILE_BOSTA_SECRET_0001"
+FILE_BOSTA = "FILE_BOSTA_SECRET_0001_long_enough_xyz"
 FILE_OTO = "FILE_OTO_SECRET_0001"
 FILE_WEBHOOK = "FILE_PLATFORM_WEBHOOK_0001"
 ALL_SECRET_VALUES = (FILE_TOKEN, FILE_BOSTA, FILE_OTO, FILE_WEBHOOK)
@@ -707,9 +707,9 @@ def test_secret_values_never_reach_stdout_stderr_or_logs(cli_db, tmp_path, caplo
     path = write_secrets_file(tmp_path, FULL_FILE)
 
     assert main(BASE_NO_TOKEN_ARGS + ["--secrets-file", path]) == 0  # human-readable summary, not --json
-    assert main(BASE_CLI_ARGS + ["--bosta-webhook-secret", "ARGV_BOSTA_0006", "--json"]) == 0
+    assert main(BASE_CLI_ARGS + ["--bosta-webhook-secret", "ARGV_BOSTA_0006_long_enough_secret", "--json"]) == 0
 
     captured = capsys.readouterr()
     everything = captured.out + captured.err + caplog.text
-    for value in ALL_SECRET_VALUES + ("CLI_SECRET_TOKEN", "ARGV_BOSTA_0006"):
+    for value in ALL_SECRET_VALUES + ("CLI_SECRET_TOKEN", "ARGV_BOSTA_0006_long_enough_secret"):
         assert value not in everything

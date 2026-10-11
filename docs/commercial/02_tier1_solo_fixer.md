@@ -1,5 +1,10 @@
 # 02. Tier 1: "The Solo Fixer" (باقة الموظف المنقذ — 1 AI Employee)
 
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
+
 ## 1. Overview & Positioning Hook
 - **Tier Name:** The Solo Fixer (`باقة الموظف المنقذ`)
 - **Assigned AI Employee:** `Auto-Fix Engineer` (`AF` / `auto-fix-engineer`) operating in **Full-Stack Solo Mode** (supervised directly by Hermes).
@@ -51,8 +56,8 @@
 | **GTM Container Sanitation & Fix** | ✅ Yes (Browser Container) | ✅ Yes |
 | **Consent Mode v2 & Egyptian PDPL** | ✅ Yes (Client-side) | ✅ Yes |
 | **DataLayer Taxonomy Sheet** | ✅ Yes | ✅ Yes |
-| **Server-Side Tracking (GTM-SS / CAPI)** | ❌ No | ✅ Included in Tier 2 |
-| **Event Match Quality (EMQ) Optimization** | ❌ No | ✅ Included in Tier 2 |
+| **Server-Side Tracking (CAPI)** | ❌ No | ✅ Tier 2: Meta CAPI COD signal ladder (server-side GTM _Not built_) |
+| **Match Keys (EMQ inputs)** | ❌ No | ✅ Tier 2: hashed identifiers and click ids; no EMQ score target |
 | **Real-Time Network Sniffing & Alerts** | ❌ No | ✅ Included in Tier 3 |
 | **GA4 Funnel Attribution & BI Analytics** | ❌ No | ✅ Included in Tier 3 |
 | **CRO & A/B Experimentation Design** | ❌ No | ✅ Included in Tier 3 |

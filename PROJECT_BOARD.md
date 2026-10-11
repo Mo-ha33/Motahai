@@ -81,6 +81,33 @@
 
 **Sprint S1 order:** S1-0 / S1-6 / S1-7 → S1-1 → S1-2 + S1-3 → S1-4 + S1-5.
 
+**Sprint S3 (approved 2026-10-11) — W6 COD Signal Activation + W7 Health Check on Tariq:**
+
+| TASK_ID | Title | Assignee | Priority | Status | Notes |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| S3-7 | Lookups: Meta custom-conversion optimization on server-only custom events; Wesam cron triggers | Antigravity (Gemini 3.8) | P0 | DONE (conditional) | Accepted as working hypothesis; no sources cited. Per D-005 the optimization test uses ConfirmedOrder, not DeliveredPurchase; ~50 events/ad set/7d is the gate for the optimization test, not for going live. action_source stays `website`. |
+| S3-1 | Core read-only API: tenant status + signal health (counts only, Hermes-scoped bearer) | Sonnet 5.5 | P0 | APPROVED (unmerged) | Branch worktree-agent-a961d329fe7edd779 (f297b57, 819e3cb, 9c8a064) on origin/main base. Reuses stats_routes windows + shared compute_checklist; onboarded = active AND checklist_ready. 849 pass (2 known Windows symlink failures). |
+| S3-3 | Per-tenant test_event_code + verify path (replay one shadow event to Meta Test Events) | Sonnet 5.5 | P0 | APPROVED (unmerged) | Branch worktree-agent-a0d8a6693a6bd1697 (33cbbb7, 0019668). Reuses meta_test_event_code; adds test_event_verified_at (manual ALTER on existing DBs) + verify_test_event (one-shot, event_id prefixed verify_). Handbook updated. 832 pass (2 known symlink failures). |
+| S3-2 | Hermes tools hermes_motahai_tenant_status / signal_health / promote_live | Gemini 3.8 (Antigravity) | P0 | READY | Spec G1 in docs/sprints/S3_WAVE2_GEMINI_SPECS.md. Start after main reconciliation. |
+| S3-4 | promote_live endpoint + operator mint endpoint, Ed25519 action token (promote_live, tenant) + Shopify/Salla courier exemption | Sonnet 5.5 | P0 | APPROVED (unmerged) | 67e30ef on worktree-agent-ad7073c0d28994b21 (includes S3-1+S3-3). 925 pass (2 known symlink failures). Manual ALTERs: test_event_verified_at, promoted_live_at. Core needs HITL_VERIFY_PUBLIC_KEY + HITL_USED_NONCES_PATH. |
+| S3-5 | W6/W7 in build_tariq_payload.py (behind --with-cod-workflows) + Arabic M6-1..3 | Haiku 5.5 | P0 | DONE (uncommitted) | Flag-on inner 17,506 B; budget raised to 18 KB (Wesam field limit unverified). Default payload unchanged. 701 tests pass. M6 Arabic needs native review. |
+| S3-6 | Drift Sentinel scheduler job (read-only GTM live-version fingerprint → incident → digest) | Haiku 5.5 | P1 | BACKLOG | Core scheduler, not Wesam cron. |
+| S3-9 | Tariq prompt hardening (no-tool-no-claim, one store per conversation, resume, waiting msg, intent map) | Gemini 3.8 (Antigravity) | P1 | READY | Spec G2 in docs/sprints/S3_WAVE2_GEMINI_SPECS.md. |
+| S3-10 | hermes_storefront_probe: deterministic headless network-capture probe (GTM/GA4/Meta ids, duplicates, consent signals; UNKNOWN on load failure) | Gemini 3.8 (Antigravity) | P0 | READY | Spec G3 in docs/sprints/S3_WAVE2_GEMINI_SPECS.md. Needed for Access Gate 2; S3-6 reuses it. |
+| S3-8 | Inject + verify W6/W7 on Wesam via Chrome MCP | Antigravity | P0 | BLOCKED | Inject only after S3-1 + S3-2 are deployed on the VPS (S3-4 for the promotion step); otherwise Tariq calls tools that do not exist. |
+
+**Sentinel (approved 2026-10-11) — token-exhaustion sentinel & dead-man's switch** (spec: docs/sprints/SENTINEL_T1_T5_SPECS.md)
+
+| TASK_ID | Title | Assignee | Priority | Status | Notes |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| T1 | Flow-state writer (ops/hermes/sentinel/flow_state.py + small consultation.py hook) | Gemini 3.8 (Antigravity) | P0 | READY | Contract C1. |
+| T2 | hermes-sentinel detector (journal + /healthz + flow state → incidents) | Gemini 3.8 (Antigravity) | P0 | READY | Contract C2; derives exhaustion kind (router log has none). |
+| T3 | Dispatcher (Telegram primary, SMTP fallback + client holding email) | Gemini 3.8 (Antigravity) | P0 | READY | Contracts C3/C4. |
+| T4 | Static alert/client templates (ar/en) | Haiku 5.5 | P1 | IN_PROGRESS | Dispatched 2026-10-11, worktree. |
+| T5 | systemd service/timer + operator runbook | Haiku 5.5 | P1 | IN_PROGRESS | Dispatched 2026-10-11, worktree. |
+
+**Sprint S3 order:** S3-1 + S3-3 + S3-5 → S3-2 + S3-4 → VPS deploy → S3-8. S3-6 in parallel.
+
 ---
 
 ### 5. Verification Log & Evidence

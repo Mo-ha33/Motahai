@@ -5,18 +5,22 @@ Works on SQLite (dev/tests) and Postgres (prod): only portable column types and 
 Engine URL comes from env DATABASE_URL (default sqlite:///./motahai.db), read lazily.
 
 Privacy: customer email/phone are stored ONLY as SHA-256 hashes (orders.email_hash / phone_hash) and
-webhook payloads are never stored (only their SHA-256). Credentials live encrypted (see credentials.py).
+webhook payloads are never stored in plaintext: webhook_deliveries keeps only their SHA-256, and staged_webhooks keeps
+a Fernet-encrypted copy only until the webhook is processed (see webhook_staging.py). Credentials live encrypted
+(see credentials.py).
 
 All timestamps are timezone-aware UTC. SQLite drops tzinfo on read, so UTCDateTime restores it.
 
 Schema is created with create_all() for now. NOTE: create_all() never ALTERs an existing table, so the S2 columns
 (orders match-key hashes + delivered_at, capi_events due_at/claimed_at + wider status CHECK, tenants settlement_hours/
 storefront_url, FX-3 tenants.confirmation_rules + orders.confirmation_source, S1-4 tenants.digest_email +
-tenants.language) and the new checkout_context table need an Alembic migration before any non-empty database is upgraded.
+tenants.language, tenants.meta_test_event_code) and the new checkout_context and staged_webhooks tables need an Alembic
+migration before any non-empty database is upgraded.
 TODO(follow-up): move to Alembic migrations before the first production schema change.
 """
 
 import os
+import re
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Iterator, Optional
@@ -95,6 +99,10 @@ class Tenant(Base):
     # S1-4: weekly Signal Hygiene digest recipient (NULL = no digest) and its language ('ar' default, or 'en').
     digest_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     language: Mapped[str] = mapped_column(String(8), default="ar")
+    # Meta Events Manager test code. When set, every pipeline CAPI send for this tenant carries `test_event_code`, so a
+    # live tenant's events show in Test Events. Test sends still consume the (tenant, order, event) idempotency claim,
+    # so use it on a test dataset or before launch, then clear it. NULL = normal sends. Set via set_meta_test_event_code.
+    meta_test_event_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     def __repr__(self) -> str:
@@ -291,6 +299,38 @@ class WebhookDelivery(Base):
     payload_sha256: Mapped[str] = mapped_column(String(64))
 
 
+class StagedWebhook(Base):
+    """
+    Durable copy of a verified webhook, written BEFORE the route answers 200 (webhook_staging.py). The payload is
+    Fernet-encrypted (credentials.encrypt_value) and the row is deleted once process_webhook has run, so a background
+    task lost between the 200 and the commit is replayed by the scheduler instead of being dropped. A row that keeps
+    failing ends as status "dead" with its ciphertext wiped (no PII is kept for dead letters).
+    """
+    __tablename__ = "staged_webhooks"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'dead')", name="ck_staged_webhooks_status"),
+        Index("ix_staged_webhooks_due", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(32))
+    topic: Mapped[str] = mapped_column(String(64))
+    delivery_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    # Platform order reference (order id / courier business reference), not PII. Kept on dead letters so an operator
+    # can reconcile the missing update with the merchant after the payload is wiped.
+    order_ref: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    payload_ciphertext: Mapped[str] = mapped_column(Text)
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    next_attempt_at: Mapped[datetime] = mapped_column(UTCDateTime)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    last_error_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"StagedWebhook(id={self.id!r}, platform={self.platform!r}, status={self.status!r})"  # no ciphertext
+
+
 class Incident(Base):
     __tablename__ = "incidents"
 
@@ -325,6 +365,26 @@ class JobRun(Base):
     ok: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     error_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class TenantApiKey(Base):
+    """M3-3: per-tenant scoped API key (`mtk_<prefix>_<secret>`). Only the SHA-256 of the full key is stored; the
+    plaintext is shown once at creation. Use tenant_auth.create_tenant_key / require_tenant_key."""
+    __tablename__ = "tenant_api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    key_prefix: Mapped[str] = mapped_column(String(8), unique=True, index=True)
+    key_hash: Mapped[str] = mapped_column(String(64))
+    label: Mapped[str] = mapped_column(String(100), default="")
+    scopes: Mapped[str] = mapped_column(String(255), default="stats:read")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(UTCDateTime, nullable=True)
+
+    def __repr__(self) -> str:
+        # Deliberately omits key_hash.
+        return f"TenantApiKey(id={self.id!r}, tenant_id={self.tenant_id!r}, key_prefix={self.key_prefix!r})"
 
 
 # --- Engine / session ------------------------------------------------------------------------------------
@@ -399,6 +459,24 @@ def get_tenant_by_shop_domain(session: Session, shop_domain: str) -> Optional[Te
     "1234567"), because Salla webhook payloads identify the store by the top-level `merchant` field, not a domain.
     """
     return session.scalar(select(Tenant).where(Tenant.shop_domain == _norm_domain(shop_domain)))
+
+
+_TEST_EVENT_CODE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def normalize_test_event_code(code: Optional[str]) -> Optional[str]:
+    """Trimmed Meta test_event_code, None for None/blank; raises ValueError for anything that is not a plain code."""
+    cleaned = code.strip() if code else None
+    if cleaned and not _TEST_EVENT_CODE.match(cleaned):
+        raise ValueError("test_event_code must be 1-64 letters, digits, '_' or '-' (e.g. TEST12345)")
+    return cleaned or None
+
+
+def set_meta_test_event_code(session: Session, tenant: Tenant, code: Optional[str]) -> Optional[str]:
+    """Sets (or with None/blank clears) the tenant's Meta test_event_code and commits. Returns the stored value."""
+    tenant.meta_test_event_code = normalize_test_event_code(code)
+    session.commit()
+    return tenant.meta_test_event_code
 
 
 def create_tenant(

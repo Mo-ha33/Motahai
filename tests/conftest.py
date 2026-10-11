@@ -12,6 +12,12 @@ from src.ameen_workforce.credentials import FERNET_KEY_ENV, generate_key, store_
 from src.ameen_workforce.db import create_tenant, init_db, make_engine
 
 
+@pytest.fixture(autouse=True)
+def _isolate_audience_export_dir(tmp_path, monkeypatch):
+    """Keep the weekly audience export out of the repo (default out/audiences) for every test."""
+    monkeypatch.setenv("AUDIENCE_EXPORT_DIR", str(tmp_path / "audiences"))
+
+
 @pytest.fixture
 def db_session():
     engine = make_engine("sqlite://")

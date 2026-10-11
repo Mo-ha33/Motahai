@@ -81,9 +81,10 @@ from src.ameen_workforce.credentials import (
     FERNET_KEY_ENV, CredentialConfigError, encrypt_value, generate_key, store_credential
 )
 from src.ameen_workforce.config import settings
+from src.ameen_workforce.webhook_signatures import BOSTA_MIN_SECRET_LENGTH
 from src.ameen_workforce.db import (
-    PLATFORMS, TENANT_MODES, Tenant, create_tenant, get_session_factory,
-    get_tenant_by_shop_domain, init_db, session_scope
+    PLATFORMS, TENANT_MODES, Tenant, create_tenant, get_session_factory, get_tenant_by_shop_domain, init_db,
+    normalize_test_event_code, session_scope, set_meta_test_event_code
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -92,186 +93,9 @@ logger = logging.getLogger("onboard_store")
 # Connection-test event. A custom name so the ping can never land in the merchant's dataset as a DeliveredPurchase
 # (custom conversion campaigns optimise on that event).
 CAPI_PING_EVENT_NAME = "MotahaiConnectionTest"
-# Courier webhook secret kinds; the courier webhook routes read exactly these credential kinds.
-COURIER_SECRET_KINDS = {"bosta": "bosta_webhook_secret", "oto": "oto_webhook_secret"}
-
-
-def store_courier_secrets(
-    session: Session,
-    tenant_id: int,
-    shop_domain: str,
-    bosta_secret: Optional[str] = None,
-    oto_secret: Optional[str] = None,
-    generate: bool = False,
-) -> Dict[str, Any]:
-    """
-    Stores courier webhook secrets (Fernet-encrypted) for one tenant. With generate=True, strong random secrets are
-    created (secrets.token_urlsafe(32)) and returned in "generated" so the caller can print them ONCE. Secrets are
-    never logged here.
-    """
-    if generate:
-        bosta_secret = secrets.token_urlsafe(32)
-        oto_secret = secrets.token_urlsafe(32)
-    base_url = settings.EMPLOYEES_PORTAL.rstrip("/")
-    status: Dict[str, str] = {}
-    generated: Dict[str, Dict[str, str]] = {}
-    for courier, value in (("bosta", bosta_secret), ("oto", oto_secret)):
-        if value is None:
-            continue
-        kind = COURIER_SECRET_KINDS[courier]
-        store_credential(session, tenant_id, kind, value.strip())
-        status[kind] = "configured (Fernet-encrypted)"
-        if generate:
-            generated[courier] = {"url": f"{base_url}/webhooks/{courier}/{shop_domain}", "secret": value}
-    return {"credentials": status, "generated": generated}
-
-
-def ensure_fernet_key() -> str:
-    """Ensures MOTAHAI_FERNET_KEY is set; auto-provisions one in env if missing."""
-    key = os.environ.get(FERNET_KEY_ENV)
-    if not key:
-        key = generate_key()
-        os.environ[FERNET_KEY_ENV] = key
-        logger.info("Provisioned temporary %s for this session", FERNET_KEY_ENV)
-    return key
-
-
-def onboard_store(
-    session: Session,
-    name: str,
-    platform: str,
-    shop_domain: str,
-    meta_dataset_id: str,
-    meta_capi_token: str,
-    webhook_secret: Optional[str] = None,
-    country: Optional[str] = None,
-    currency: Optional[str] = None,
-    timezone: Optional[str] = None,
-    mode: str = "shadow",
-    settlement_hours: Optional[float] = 12.0,
-    storefront_url: Optional[str] = None,
-    dry_run: bool = False,
-) -> Dict[str, Any]:
-    """
-    Core onboarding engine: validates input, registers/updates the tenant,
-    and stores Fernet-encrypted credentials.
-    """
-    platform_norm = platform.strip().lower()
-    if platform_norm not in PLATFORMS:
-        raise ValueError(f"Invalid platform: {platform}. Must be one of {PLATFORMS}")
-
-    mode_norm = mode.strip().lower()
-    if mode_norm not in TENANT_MODES:
-        raise ValueError(f"Invalid mode: {mode}. Must be one of {TENANT_MODES}")
-
-    domain_norm = shop_domain.strip().lower()
-    if not domain_norm:
-        raise ValueError("shop_domain cannot be empty")
-
-    meta_dataset_id_norm = meta_dataset_id.strip()
-    if not meta_dataset_id_norm:
-        raise ValueError("meta_dataset_id cannot be empty")
-
-    meta_capi_token_norm = meta_capi_token.strip()
-    if not meta_capi_token_norm:
-        raise ValueError("meta_capi_token cannot be empty")
-
-    if settlement_hours is not None and settlement_hours < 0:
-        raise ValueError("settlement_hours must be >= 0")
-
-    storefront_url_clean = storefront_url.strip() if storefront_url else None
-    if storefront_url_clean and not storefront_url_clean.lower().startswith(("http://", "https://")):
-        raise ValueError("storefront_url must start with http:// or https://")
-
-    # Platform-specific sensible defaults
-    if platform_norm == "salla":
-        resolved_country = (country or "SA").strip().upper()
-        resolved_currency = (currency or "SAR").strip().upper()
-        resolved_timezone = timezone.strip() if timezone else "Asia/Riyadh"
-    else:
-        resolved_country = (country or "EG").strip().upper()
-        resolved_currency = (currency or "EGP").strip().upper()
-        resolved_timezone = timezone.strip() if timezone else "Africa/Cairo"
-
-    # Verify Fernet encryption works
-    ensure_fernet_key()
-
-    # Check if tenant already exists
-    existing = get_tenant_by_shop_domain(session, domain_norm)
-    action = "updated" if existing else "created"
-
-    if dry_run:
-        return {
-            "status": "dry_run",
-            "action": action,
-            "tenant_id": existing.id if existing else 0,
-            "name": name.strip(),
-            "platform": platform_norm,
-            "shop_domain": domain_norm,
-            "meta_dataset_id": meta_dataset_id_norm,
-            "country": resolved_country,
-            "currency": resolved_currency,
-            "timezone": resolved_timezone,
-            "mode": mode_norm,
-            "settlement_hours": settlement_hours,
-            "storefront_url": storefront_url_clean,
-            "credentials": {
-                "meta_capi_token": "valid (encryption verified)",
-                "webhook_secret": "valid (encryption verified)" if webhook_secret else "not provided"
-            }
-        }
-
-    if existing:
-        tenant = existing
-        tenant.name = name.strip()
-        tenant.platform = platform_norm
-        tenant.meta_dataset_id = meta_dataset_id_norm
-        tenant.country = resolved_country
-        tenant.currency = resolved_currency
-        tenant.timezone = resolved_timezone
-        tenant.mode = mode_norm
-        tenant.settlement_hours = settlement_hours
-        tenant.storefront_url = storefront_url_clean
-        session.commit()
-    else:
-        tenant = create_tenant(
-            session=session,
-            name=name.strip(),
-            platform=platform_norm,
-            shop_domain=domain_norm,
-            meta_dataset_id=meta_dataset_id_norm,
-            country=resolved_country,
-            currency=resolved_currency,
-            timezone=resolved_timezone,
-            mode=mode_norm,
-            settlement_hours=settlement_hours,
-            storefront_url=storefront_url_clean
-        )
-
-    # Store encrypted credentials
-    store_credential(session, tenant.id, "meta_capi_token", meta_capi_token_norm)
-    if webhook_secret and webhook_secret.strip():
-        store_credential(session, tenant.id, "webhook_secret", webhook_secret.strip())
-
-    return {
-        "status": "success",
-        "action": action,
-        "tenant_id": tenant.id,
-        "name": tenant.name,
-        "platform": tenant.platform,
-        "shop_domain": tenant.shop_domain,
-        "meta_dataset_id": tenant.meta_dataset_id,
-        "country": tenant.country,
-        "currency": tenant.currency,
-        "timezone": tenant.timezone,
-        "mode": tenant.mode,
-        "settlement_hours": tenant.settlement_hours,
-        "storefront_url": tenant.storefront_url,
-        "credentials": {
-            "meta_capi_token": "configured (Fernet-encrypted)",
-            "webhook_secret": "configured (Fernet-encrypted)" if webhook_secret else "not provided"
-        }
-    }
+from src.ameen_workforce.onboarding import (  # noqa: F401  (re-exported: tests and callers import these from here)
+    COURIER_SECRET_KINDS, ensure_fernet_key, onboard_store, store_courier_secrets
+)
 
 
 async def verify_capi_ping(
@@ -486,6 +310,10 @@ def parse_cli_args(args: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-ping", action="store_true", help="Skip the Meta connection ping even if --verify-capi-ping is set")
     parser.add_argument("--test-event-code", default=None,
                         help="Meta test event code (e.g. TEST12345). Required by --verify-capi-ping; keeps the ping out of live data.")
+    parser.add_argument("--pipeline-test-event-code", default=None, metavar="CODE",
+                        help="Send ALL of this tenant's pipeline CAPI events with this Meta test event code, so they show in "
+                             "Test Events. Test sends use up each order's one-time send claim: use on a test dataset or "
+                             "before launch. Pass an empty string ('') to clear it.")
     parser.add_argument("--bosta-webhook-secret", default=None,
                         help="Bosta webhook secret (stored encrypted; use '-' for a hidden prompt)")
     parser.add_argument("--oto-webhook-secret", default=None,
@@ -511,6 +339,10 @@ def validate_cli_args(args: argparse.Namespace) -> Optional[str]:
     for flag, value in (("--bosta-webhook-secret", args.bosta_webhook_secret), ("--oto-webhook-secret", args.oto_webhook_secret)):
         if value is not None and not value.strip():
             return f"{flag} must not be empty"
+    bosta = args.bosta_webhook_secret
+    if bosta is not None and len(bosta.strip()) < BOSTA_MIN_SECRET_LENGTH:
+        return (f"--bosta-webhook-secret must be at least {BOSTA_MIN_SECRET_LENGTH} characters: Bosta sends it back as "
+                "a static header, so it must be unguessable. Use --generate-courier-secrets for a strong one.")
     return None
 
 
@@ -567,7 +399,8 @@ def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
                 mode=args.mode,
                 settlement_hours=args.settlement_hours,
                 storefront_url=args.storefront_url,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                pipeline_test_event_code=args.pipeline_test_event_code,
             )
             if args.dry_run:
                 if courier_flags_given:
@@ -615,6 +448,8 @@ def main(argv: Optional[Sequence[str]] = None, stdin: Any = None) -> int:
             print(f"  Settlement Window:{onboard_result.get('settlement_hours')} hours")
             if onboard_result.get("storefront_url"):
                 print(f"  Storefront URL:   {onboard_result.get('storefront_url')}")
+            if onboard_result.get("pipeline_test_event_code"):
+                print(f"  Test Event Code:  {onboard_result.get('pipeline_test_event_code')} (pipeline sends go to Test Events)")
             print("  Credentials:")
             print(f"    * Meta CAPI Token: {onboard_result['credentials']['meta_capi_token']}")
             print(f"    * Webhook Secret:  {onboard_result['credentials']['webhook_secret']}")

@@ -1,4 +1,9 @@
 # Commercial Pricing & Packaging Playbook: Motahai AI Workforce
+
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
 **Brand:** Motahai AI Workforce (`employees.motahai.com`)  
 **Parent Brand:** Ameen Digital (`agency.motahai.com`)  
 **Host Platform:** Wesam.ai (Per-Employee / Per-Seat Architecture)  
@@ -42,9 +47,9 @@ This Playbook defines the commercial packaging, unit economics, tier matrices, a
 | **GTM Container Sanitation** | ✅ Included (Browser JSON) | ✅ Included (Browser + Server) | ✅ Included (Multi-container Swarm) |
 | **Consent Mode v2 & PDPL 151/2020** | ✅ Client-side Defaults | ✅ Full Dual-Layer Governance | ✅ Automated Regional Compliance Audits |
 | **DataLayer Taxonomy Sheet** | ✅ Notion / Markdown Spec | ✅ Complete Liquid / Theme Spec | ✅ Dynamic Real-time Spec Synchronization |
-| **Server-Side Tracking (GTM-SS/CAPI)** | ❌ No | ✅ Meta, Google, TikTok, Snap | ✅ Omnichannel Cloud Gateways |
-| **Event Match Quality (EMQ)** | — | ✅ Target >8.5 / 10 | ✅ Continuous Real-Time Optimization |
-| **Deduplication Parity Guarantee** | — | ✅ >98.5% Browser vs Server | ✅ 100% Deterministic Event ID Binding |
+| **Server-Side Tracking (CAPI)** | ❌ No | ✅ Meta CAPI COD signal ladder (D-005). Google, TikTok, Snap senders and server-side GTM: _Not built_ | ✅ Same as Tier 2 |
+| **Match Keys (EMQ inputs)** | — | ✅ E.164 phone, SHA-256 identifiers, `_fbp`/`_fbc`, checkout IP/UA. No EMQ score target: none measured yet | ✅ Same as Tier 2 |
+| **Deduplication** | — | ✅ Deterministic `event_id` and one send per order and event. Browser/server parity does not apply: Motahai never sends `Purchase` | ✅ Same as Tier 2 |
 | **Chrome DevTools Network Sniffer** | ❌ No | ❌ No | ✅ 24/7 Automated Beacon Interception |
 | **GA4 BigQuery Funnel Analytics** | ❌ No | ❌ No | ✅ Deep BI & ROAS Attribution |
 | **CRO Experimentation & A/B Tests** | ❌ No | ❌ No | ✅ Statistical Test Blueprints & Variants |
@@ -107,7 +112,7 @@ Motahai deploys 8 specialized autonomous agents orchestrated by Wesam.ai:
 
 1. **`LO` Lead GTM Orchestrator:** Dispatcher, client communication manager, and HITL escalation supervisor. *(Included in Tiers 2 & 3)*
 2. **`AF` Auto-Fix Engineer:** Regex sanitizer, GTM JSON generator, and tracking code troubleshooter. *(Included in Tiers 1, 2, & 3)*
-3. **`PC` Pixel & CAPI Specialist:** Server-side CAPI architect, deduplication regulator, and EMQ optimizer. *(Included in Tiers 2 & 3)*
+3. **`PC` Pixel & CAPI Specialist:** Runs the Meta CAPI COD signal ladder and match-key hygiene (hashed identifiers, `_fbp`/`_fbc`, checkout IP/UA). *(Included in Tiers 2 & 3)*
 4. **`QS` QA Network Sniffer:** Headless browser traffic interceptor, beacon QA auditor. *(Included in Tier 3)*
 5. **`DA` DataLayer Architect:** E-commerce taxonomy architect and Egyptian PDPL 151/2020 privacy gatekeeper. *(Included in Tier 3)*
 6. **`BI` Growth BI Analyst:** GA4 BigQuery export modeler, full-funnel drop-off analyst. *(Included in Tier 3)*

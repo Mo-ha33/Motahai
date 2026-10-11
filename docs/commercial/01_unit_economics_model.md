@@ -1,5 +1,10 @@
 # 01. Motahai AI Workforce — Unit Economics & Cost-to-Serve Model
 
+> **Status (2026-10-10):** this is a sales and packaging draft, not a product spec. Anything marked _Not built_ has
+> no implementation in this repository and must not be promised to a client. Motahai's built server-side product is
+> the Meta CAPI COD signal ladder (Rule D-005: `ConfirmedOrder` and `DeliveredPurchase`). Check
+> `docs/MOTAHAI_CORE_FOUNDATION.md` section 6 before quoting any figure.
+
 ## 1. Executive Summary
 Motahai AI Workforce operates as a managed autonomous AI workforce layer on top of **Wesam.ai** (Seat/Employee orchestration) and **Hermes** (VPS supervisor via Model Context Protocol - MCP). 
 
@@ -56,7 +61,7 @@ To prevent compute abuse and guarantee high availability, each tier enforces sof
 | **Active Monitored Domains** | 1 Domain | 1 Domain (Primary + Subdomains) | 1 Domain (or up to 5 for Agency) |
 | **Automated Browser Audit Runs** | 60 runs / month (~2/day) | 300 runs / month (~10/day) | 1,200 runs / month (~40/day) |
 | **Container Sanitizations / Exports** | 10 releases / month | 40 releases / month | Unlimited (fair use max 200) |
-| **CAPI Event Parity Verifications** | Not Included | Daily Automated Check | Continuous Real-Time Sniffing |
+| **CAPI Event Parity Verifications** (_Not built_) | Not Included | Daily Automated Check | Continuous Real-Time Sniffing |
 | **Max LLM Tokens Allowed** | 15M tokens / month | 45M tokens / month | 150M tokens / month |
 | **Overage Token Pack** | \$15 per 5M tokens | \$15 per 5M tokens | \$10 per 5M tokens |
 
