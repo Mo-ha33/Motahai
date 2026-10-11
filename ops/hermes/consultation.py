@@ -274,6 +274,14 @@ class _TelemetryServer:
         self._server = server
         self.executor = server.executor
 
+    def __getattr__(self, name):
+        # Only called for attributes not found normally (`tool` and `executor` are defined here and win). Anything else
+        # the real server exposes is delegated, so a future use of another server attribute cannot break registration.
+        # Guard `_server` itself so a half-initialised proxy raises AttributeError instead of recursing.
+        if name == "_server":
+            raise AttributeError(name)
+        return getattr(self._server, name)
+
     def tool(self, *args, **kwargs):
         register = self._server.tool(*args, **kwargs)
         name = kwargs.get("name") or (args[0] if args else "")

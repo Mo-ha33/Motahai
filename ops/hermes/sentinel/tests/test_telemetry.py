@@ -414,6 +414,34 @@ def test_tools_still_register_and_work_if_telemetry_cannot_load(tmp_path, consul
     assert read_events(tmp_path) == []
 
 
+def test_proxy_delegates_unknown_attributes_to_the_real_server(consultation):
+    server = _RecordingServer(_Executor())
+    server.settings = {"port": 1234}
+    server.ping = lambda: "pong"
+    proxy = consultation._TelemetryServer(server)
+    assert proxy.settings == {"port": 1234}          # an arbitrary attribute is reachable through the proxy
+    assert proxy.ping() == "pong"
+    assert proxy.executor is server.executor
+    assert proxy.tool != server.tool                  # `.tool` stays overridden (it wraps), it is not delegated
+    with pytest.raises(AttributeError):
+        proxy.does_not_exist
+    bare = consultation._TelemetryServer.__new__(consultation._TelemetryServer)
+    with pytest.raises(AttributeError):               # half-initialised proxy must not recurse
+        bare.anything
+
+
+def test_registration_survives_a_server_with_extra_attributes_when_telemetry_fails(consultation, monkeypatch):
+    def broken():
+        raise ImportError("telemetry.py missing on this host")
+
+    monkeypatch.setattr(consultation, "_telemetry", broken)
+    server = _RecordingServer(_Executor())
+    server.extra = "present"
+    consultation.register_consultation_tools(server)
+    assert sorted(server.tools) == sorted(ALL_TOOLS)
+    assert consultation._TelemetryServer(server).extra == "present"
+
+
 def test_hook_is_negligible_overhead(tmp_path, tools, consultation, monkeypatch):
     monkeypatch.setattr(consultation._storefront_probe(), "probe_storefront", lambda **kw: {"status": "OK"})
     started = time.perf_counter()
