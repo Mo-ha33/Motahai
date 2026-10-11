@@ -1,0 +1,88 @@
+# /etc/systemd/system/hermes-sentinel.service
+# Hermes token-exhaustion sentinel: ONE pass per start. hermes-sentinel.timer starts it
+# every minute. No LLM is called anywhere in this path, so it keeps working at $0 balance.
+#
+# Placeholder paths (replace the two values below if you install elsewhere):
+#   SENTINEL_HOME       = /home/deploy/hermes-sentinel   (code lives in SENTINEL_HOME/sentinel/)
+#   HERMES_SENTINEL_DIR = /home/deploy/.hermes/sentinel  (state, flow/, contacts.json, silence.json)
+# systemd does not expand variables in WorkingDirectory=, so the paths are written out literally.
+#
+# Independence: there is deliberately NO Requires=, BindsTo=, PartOf= or Wants= on
+# hermes-llm-router or hermes-mcp. The sentinel must keep reporting when they are down,
+# so it observes them from outside instead of depending on them.
+#
+# Install (run on the VPS, as an operator with sudo):
+#   sudo install -m 0644 -o root -g root deploy/hermes-sentinel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   (do NOT enable the .service itself; the timer starts it)
+
+[Unit]
+Description=Hermes token-exhaustion sentinel (one pass)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+# Reading the journal (journalctl -u hermes-llm-router) needs membership of systemd-journal.
+# On distros without that group, replace with adm. If the group does not exist the unit
+# fails at start with status 216/GROUP.
+SupplementaryGroups=systemd-journal
+
+# Secrets (TELEGRAM_BOT_TOKEN, SMTP_PASSWORD, ROUTER_API_KEY, ...). systemd, running as root,
+# reads this file BEFORE the sandbox and privilege drop, so the 0600 deploy-owned file is fine.
+EnvironmentFile=/home/deploy/.hermes/.env
+
+Environment=HERMES_SENTINEL_DIR=/home/deploy/.hermes/sentinel
+# Optional: ROUTER_URL. The sentinel defaults to http://127.0.0.1:47311, the port in
+# hermes-llm-router.service. Set it in .env only if that port changes.
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+
+WorkingDirectory=/home/deploy/hermes-sentinel
+ExecStart=/home/deploy/hermes-sentinel/.venv/bin/python -m sentinel --once
+TimeoutStartSec=50
+
+# Resource caps: a pass is a few HTTP calls and a journal read.
+MemoryMax=128M
+TasksMax=32
+CPUQuota=25%
+
+# ---- Hardening ----------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# Filesystem. ProtectSystem=strict makes the whole filesystem read-only for this unit.
+# ProtectHome=read-only makes /home read-only, so the code and .env stay readable while
+# the state directory is opened again for writing with ReadWritePaths=. ProtectHome=yes
+# (or tmpfs) would hide /home/deploy completely and break the code and state paths, so it
+# is not used. Verify on the VPS with: systemd-analyze verify /etc/systemd/system/hermes-sentinel.service
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/deploy/.hermes/sentinel
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Kernel and host surface
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Network: outbound HTTPS (Telegram, healthchecks), SMTP, the router on loopback, and
+# AF_UNIX for journald and the resolver. Nothing else is needed.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

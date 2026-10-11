@@ -1,0 +1,24 @@
+# /etc/systemd/system/hermes-sentinel.timer
+# Starts hermes-sentinel.service about every 60 seconds, two minutes after boot.
+#
+# Install (run on the VPS, as an operator with sudo):
+#   sudo install -m 0644 -o root -g root deploy/hermes-sentinel.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hermes-sentinel.timer
+
+[Unit]
+Description=Run the Hermes token-exhaustion sentinel every minute
+
+[Timer]
+Unit=hermes-sentinel.service
+OnBootSec=2min
+# Measured from the last start of the service. A pass that is still running is not
+# started a second time, so passes never overlap.
+OnUnitActiveSec=60s
+AccuracySec=5s
+# No catch-up runs after downtime: a stale backlog of passes would only re-send old alerts.
+# Outages of the VPS itself are caught by the heartbeat (SENTINEL_HEARTBEAT_URL).
+Persistent=false
+
+[Install]
+WantedBy=timers.target
