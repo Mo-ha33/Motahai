@@ -94,7 +94,7 @@
 | S3-6 | Drift Sentinel scheduler job (read-only GTM live-version fingerprint → incident → digest) | Haiku 5.5 | P1 | BACKLOG | Core scheduler, not Wesam cron. |
 | S3-9 | Tariq prompt hardening (no-tool-no-claim, one store per conversation, resume, waiting msg, intent map) | Gemini 3.8 (Antigravity) | P1 | DONE | G2 by Antigravity (085902e); live on Wesam (default mode). |
 | S3-10 | hermes_storefront_probe: deterministic headless network-capture probe (GTM/GA4/Meta ids, duplicates, consent signals; UNKNOWN on load failure) | Gemini 3.8 (Antigravity) | P0 | DONE | G3 by Antigravity + Sonnet SSRF request guard / worker-thread fix (91161c0). Merged 2026-10-11. |
-| S3-8 | Inject + verify W6/W7 on Wesam via Chrome MCP | Antigravity | P0 | BLOCKED | Inject only after S3-1 + S3-2 are deployed on the VPS (S3-4 for the promotion step); otherwise Tariq calls tools that do not exist. |
+| S3-8 | Inject + verify W6/W7 on Wesam via Chrome MCP | Antigravity | P0 | BLOCKED | Hermes tools are live (ecfd0f5 on VPS), but W6/W7 need Motahai Core deployed (F2); tenant_status currently returns CORE_AUTH_FAILED (no key configured). |
 
 **Sentinel (approved 2026-10-11) — token-exhaustion sentinel & dead-man's switch** (spec: docs/sprints/SENTINEL_T1_T5_SPECS.md)
 
@@ -106,10 +106,24 @@
 | T4 | Static alert/client templates (ar/en) | Haiku 5.5 | P1 | DONE | 21fdf0f; merged to main via integration/release 2026-10-11. |
 | T5 | systemd service/timer + operator runbook | Haiku 5.5 | P1 | DONE | 2c93569; merged to main via integration/release 2026-10-11. |
 
+**Release ecfd0f5 follow-ups (2026-10-11)**
+
+| TASK_ID | Title | Assignee | Priority | Status | Notes |
+| :--- | :--- | :--- | :---: | :---: | :--- |
+| F1 | motahai_api: drop DEFAULT_CORE_URL http://127.0.0.1:8000 (that port is the SmartCafe backend on the shared VPS) and return a distinct CORE_NOT_CONFIGURED code when the key/URL is missing | Gemini 3.8 / Haiku 5.5 | P0 | BACKLOG | Today a missing key returns CORE_AUTH_FAILED with no call; setting only the key would send it to SmartCafe. |
+| F2 | Deploy Motahai Core (Postgres, HERMES_TENANT_API_KEY, OPERATOR_API_KEY, Ed25519 keys under a separate user, manual ALTERs for test_event_verified_at / promoted_live_at) | Sonnet 5.5 + owner | P0 | BACKLOG | Prerequisite for W6/W7 and S3-8. Decide host (not the SmartCafe box by default). |
+| F3 | Owner: send /start to the Hermes Telegram bot; add MOTAHAI_SMTP_* to /home/deploy/.hermes/.env | Owner | P0 | BLOCKED | Sentinel runs every 60 s but has no alert channel until this is done. |
+| F4 | Set HITL_VERIFY_PUBLIC_KEY (+ HITL_USED_NONCES_PATH) on the VPS so hermes_gtm_cloud_publish can verify D-003 tokens | Owner + Sonnet 5.5 | P1 | BACKLOG | Absent on the VPS: publishes refuse today. |
+| F5 | Make the VPS deploy reproducible: hermes_mcp checkout has no git remote; add a scripted deploy from a tagged release | Haiku 5.5 | P1 | BACKLOG | ecfd0f5 was deployed by copy per docs/runbooks/DEPLOY_RELEASE_ecfd0f5.md. |
+| F6 | Small fixes: signal_health tool description says "rolling window" (Core counts full UTC days); admin text for a failed recovered follow-up says "holding email" | Haiku 5.5 | P2 | BACKLOG | |
+| F7 | Storefront probe: pin DNS results to close the rebinding window | Sonnet 5.5 | P2 | BACKLOG | Residual risk noted in 91161c0. |
+| F8 | Extra sentinel checks proposed by Antigravity (webhook_silence, drift_violation, tool_error_spike, verifier_disconnect) | Gemini 3.8 | P2 | BACKLOG | webhook_silence belongs to Core S1-5; drift to S3-6 (reuse hermes_storefront_probe). |
+
 **Sprint S3 order:** S3-1 + S3-3 + S3-5 → S3-2 + S3-4 → VPS deploy → S3-8. S3-6 in parallel.
 
 ---
 
 ### 5. Verification Log & Evidence
+- **Deploy 2026-10-11 (ecfd0f5 → VPS, executed by Antigravity per docs/runbooks/DEPLOY_RELEASE_ecfd0f5.md):** backup at /home/deploy/backups/release-ecfd0f5-20261011_032528/; no drift (live files matched 233d41a); 4 new tools registered; router.py updated (yaml kept); sentinel venv/units installed, systemd-analyze clean; o-w hardening applied. Opus read-only check 09:28 CEST: hermes-mcp, hermes-llm-router, hermes-sentinel.timer active; sentinel passes every 60 s with 0 incidents, 0 errors; no errors in hermes-mcp journal.
 - **TASK-001 Evidence:** Verified via `pytest -q`: `68 passed, 26 warnings in 7.57s`. `httpx` pinned to `0.27.2` in `requirements.txt`.
 - **Review 2026-10-09 (Opus):** TASK-003, TASK-021 and TASK-022 reopened to IN_PROGRESS for defects B1–B4 found in d51dcf0 and the gate code. TASK-031 and TASK-040 retitled and narrowed to the 2026-10-09 scope change. TASK-030 reassigned to Haiku 5.5 because Gemini cannot be dispatched from the Claude Code session. Sprint S1 rows S1-0 to S1-7 added. Board edits only; no code changed and no tests re-run.
